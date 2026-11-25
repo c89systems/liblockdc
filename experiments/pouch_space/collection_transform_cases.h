@@ -16,12 +16,8 @@ static void transform_root_reopen(record_fixture *f, workspace_fault *model,
   f->pouch->crypto = NULL;
   lc_pouch_close(f->pouch);
   ok(ps_root_close(f->root, e), e);
-  if (model) {
-    int fd = open(f->path, O_RDWR | O_CLOEXEC);
-    REQUIRE(fd >= 0 &&
-            pwrite(fd, model->stable, 10 * PS_MIB, 0) == 10 * PS_MIB &&
-            !fdatasync(fd) && !close(fd));
-  }
+  if (model)
+    workspace_fault_restore(model);
   ok(ps_root_open(f->path, 0, &f->options, &f->root, e), e);
   lc_pouch_open_options logical = {0};
   logical.background_compaction_enabled_set =
@@ -204,15 +200,12 @@ static ssize_t transform_parallel_write(void *context, int fd, const void *p,
 }
 static int transform_parallel_sync(void *context, int fd) {
   (void)context;
-  return fdatasync(fd);
+  return ps_native_io.sync(NULL, fd);
 }
 static int transform_parallel_reserve(void *context, int fd, off_t at,
                                       off_t length) {
   (void)context;
-  int rc = posix_fallocate(fd, at, length);
-  if (rc)
-    errno = rc;
-  return rc ? -1 : 0;
+  return ps_native_io.reserve(NULL, fd, at, length);
 }
 static void *transform_parallel_convert(void *context) {
   transform_parallel *state = context;
@@ -319,15 +312,12 @@ static void transform_concurrency(const char *directory, const char *key) {
   printf("native collection controller independent-writer profiles=8\n");
 }
 static size_t transform_fault_trial(const char *directory, const char *key,
-                                    int codec, int sync, int mode, size_t cut,
-                                    int prepare_only) {
+                                    workspace_fault *model, int codec, int sync,
+                                    int mode, size_t cut, int prepare_only) {
   lc_error e;
   lc_error_init(&e);
-  workspace_fault model = {.stable = calloc(1, 10 * PS_MIB),
-                           .dirty = calloc(1, 10 * PS_MIB / PS_PAGE),
-                           .mode = mode};
-  REQUIRE(model.stable && model.dirty);
-  ps_io io = {&model,         workspace_rd,      workspace_wr,
+  workspace_fault_reset(model, mode);
+  ps_io io = {model,          workspace_rd,      workspace_wr,
               workspace_sync, workspace_reserve, NULL};
   record_fixture *f = record_fixture_open_io(directory, key, codec, sync, 3,
                                              65537, &io, !prepare_only, &e);
@@ -340,21 +330,22 @@ static size_t transform_fault_trial(const char *directory, const char *key,
   ps_collection_transform *transform = NULL;
   unit_allocations = 0;
   unit_fail_allocation = mode == 0 ? cut : 0;
-  model.calls = 0;
-  model.fail = mode ? cut : 0;
+  model->calls = 0;
+  model->fail = mode ? cut : 0;
   int rc = ps_collection_transform_open(f->root, f->pouch, f->target, work,
                                         f->id, 16384, &transform, &e);
-  size_t prepare_calls = mode ? model.calls : unit_allocations;
+  size_t prepare_calls = mode ? model->calls : unit_allocations;
   if (prepare_only)
-    unit_fail_allocation = model.fail = 0;
+    unit_fail_allocation = model->fail = 0;
   int done = 0;
   ps_collection_transform_result result;
   while (rc == LC_OK && !done)
     rc = ps_collection_transform_step(transform, 64, &done, &result, &e);
   size_t calls = prepare_only ? prepare_calls
-                 : mode       ? model.calls
+                 : mode       ? model->calls
                               : unit_allocations;
-  unit_fail_allocation = model.fail = 0;
+  unit_fail_allocation = model->fail = 0;
+  REQUIRE(cut == SIZE_MAX || calls >= cut);
   if (rc != LC_OK && rc != LC_ERR_NOMEM && rc != LC_ERR_TRANSPORT)
     fprintf(stderr,
             "transform fault codec=%d sync=%d mode=%d cut=%zu rc=%d %s\n",
@@ -363,7 +354,7 @@ static size_t transform_fault_trial(const char *directory, const char *key,
   clear(&e);
   ps_collection_transform_close(transform);
   ps_collection_conversion_close(work);
-  transform_root_reopen(f, mode ? &model : NULL, &e);
+  transform_root_reopen(f, mode ? model : NULL, &e);
   work = NULL;
   rc = ps_collection_conversion_open(ps_root_space(f->root), 73, f->target, 0,
                                      &work, &e);
@@ -388,8 +379,6 @@ static size_t transform_fault_trial(const char *directory, const char *key,
   transform_root_reopen(f, NULL, &e);
   transform_check(f, &e);
   record_fixture_close(f, &e);
-  free(model.stable);
-  free(model.dirty);
   lc_error_cleanup(&e);
   return calls;
 }
@@ -398,6 +387,11 @@ static void transform_faults(const char *directory, const char *key,
                              int prepare_only) {
   size_t total = 0;
   unsigned int group = 0;
+  /* Keep the same barrier and torn-write model in memory across trials.
+   * The sparse fixture still supplies the inode used by real root opens and
+   * locks. The ordinary transform cases exercise native file I/O. */
+  workspace_fault model = {0};
+  workspace_fault_open(&model);
   for (int codec = 0; codec <= 3; codec += 3)
     for (int sync = 0; sync < 2; ++sync)
       for (int mode = 0; mode < 4; ++mode) {
@@ -406,10 +400,10 @@ static void transform_faults(const char *directory, const char *key,
           continue;
         }
         ++group;
-        size_t calls = transform_fault_trial(directory, key, codec, sync, mode,
-                                             SIZE_MAX, prepare_only);
+        size_t calls = transform_fault_trial(
+            directory, key, &model, codec, sync, mode, SIZE_MAX, prepare_only);
         for (size_t cut = 1; cut <= calls; ++cut) {
-          transform_fault_trial(directory, key, codec, sync, mode, cut,
+          transform_fault_trial(directory, key, &model, codec, sync, mode, cut,
                                 prepare_only);
           ++total;
         }
@@ -419,6 +413,7 @@ static void transform_faults(const char *directory, const char *key,
         fflush(stdout);
       }
   REQUIRE(total);
+  workspace_fault_close(&model);
   printf("native collection transform failure points=%zu\n", total);
 }
 #endif

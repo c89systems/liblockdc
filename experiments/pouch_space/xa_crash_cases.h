@@ -1,5 +1,6 @@
 #ifndef POUCH_SPACE_XA_CRASH_CASES_H
 #define POUCH_SPACE_XA_CRASH_CASES_H
+#include "crash_fixture.h"
 #include "queue_outbox_crash_cases.h"
 #include "xa_managed_cases.h"
 
@@ -52,11 +53,33 @@ static void xa_crash_child(void) {
   xa_crash_execute(path, atoi(sync), atoi(managed), atoi(action), &context, &e);
   _exit(74);
 }
+typedef struct xa_crash_seed {
+  unsigned char *bytes;
+  unsigned char pages[PS_DEFAULT_CAPACITY / PS_PAGE];
+} xa_crash_seed;
+static void xa_crash_seed_capture(xa_crash_seed *seed, const char *path) {
+  int fd = open(path, O_RDWR | O_CLOEXEC);
+  REQUIRE(fd >= 0 && !ps_native_io.sync(NULL, fd) &&
+          pread(fd, seed->bytes, PS_DEFAULT_CAPACITY, 0) ==
+              (ssize_t)PS_DEFAULT_CAPACITY &&
+          !close(fd));
+  crash_fixture_pages(seed->bytes, seed->pages);
+}
+static void xa_crash_seed_restore(const xa_crash_seed *seed, const char *path) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  REQUIRE(fd >= 0 && !ps_native_io.reserve(NULL, fd, 0, PS_DEFAULT_CAPACITY));
+  crash_fixture_write(fd, seed->bytes, seed->pages);
+  /* The crash child starts after the complete seed is installed. Process
+   * exit preserves the page cache, and the child's barriers use native I/O. */
+  REQUIRE(!close(fd));
+}
 static void xa_crashes(const char *directory) {
   static const int actions[2][5] = {{0, 3, 5, 6, 10}, {0, 5, 6, 7, 0}};
   char path[1400], sync_text[16], action_text[16], stop_text[32];
   lc_error e;
   size_t deaths = 0U;
+  xa_crash_seed *seed = malloc(sizeof(*seed));
+  REQUIRE(seed && (seed->bytes = malloc(PS_DEFAULT_CAPACITY)));
   lc_error_init(&e);
   REQUIRE(snprintf(path, sizeof(path), "%s/xa-crash", directory) <
           (int)sizeof(path));
@@ -64,33 +87,34 @@ static void xa_crashes(const char *directory) {
     for (int managed = 0; managed < 2; ++managed)
       for (size_t ordinal = 0; ordinal < (managed ? 4U : 5U); ++ordinal) {
         int action = actions[managed][ordinal];
+        if (!xa_selected("POUCH_XA_CRASH_PROFILE", 2 * sync + managed, 3))
+          continue;
         if (getenv("POUCH_XA_ACTION") &&
             (managed || !xa_selected("POUCH_XA_ACTION", action, 10)))
           continue;
         size_t sites = 0U;
         for (size_t stop = 0U; stop <= sites; ++stop)
           for (int after = 0; after < (stop ? 2 : 1); ++after) {
-            /* No fault occurs during seed construction. Group successful
-             * setup barriers, then sync its complete file once before exec.
-             * Recovery and the interrupted action use real syscall I/O. */
-            io_fault seed_fault = {0};
-            ps_io seed_io = {&seed_fault,        disk_read,    disk_write,
-                             xa_allocation_sync, disk_reserve, NULL};
-            lc_client *client = xa_client(path, sync, 1, &seed_io, &e);
+            lc_client *client = NULL;
             lc_xa_store *journal = NULL, *other = NULL;
-            if (managed) {
-              ok(lc_xa_store_open_owned(client, xa_owner_ids[0], &journal, &e),
-                 &e);
-              xa_managed_seed(client, journal, action, &e);
-            } else
-              xa_seed(client, action, &e);
-            lc_xa_store_close(journal);
-            lc_client_close(client);
-            REQUIRE(!live);
-            int seed_fd = open(path, O_RDWR);
-            REQUIRE(seed_fd >= 0 && !ps_native_io.sync(NULL, seed_fd) &&
-                    !close(seed_fd));
             if (!stop) {
+              /* Prepare one durable starting state per action. The counting
+               * run and every crash child start from that same file image. */
+              io_fault seed_fault = {0};
+              ps_io seed_io = {&seed_fault,           disk_read,    disk_write,
+                               fixture_complete_sync, disk_reserve, NULL};
+              client = xa_client(path, sync, 1, &seed_io, &e);
+              if (managed) {
+                ok(lc_xa_store_open_owned(client, xa_owner_ids[0], &journal,
+                                          &e),
+                   &e);
+                xa_managed_seed(client, journal, action, &e);
+              } else
+                xa_seed(client, action, &e);
+              lc_xa_store_close(journal);
+              lc_client_close(client);
+              REQUIRE(!live);
+              xa_crash_seed_capture(seed, path);
               outbox_crash_io context = {0};
               xa_crash_execute(path, sync, managed, action, &context, &e);
               sites = context.calls;
@@ -99,6 +123,7 @@ static void xa_crashes(const char *directory) {
                       "XA crash sync=%d managed=%d action=%d sites=%zu\n", sync,
                       managed, action, sites);
             } else {
+              xa_crash_seed_restore(seed, path);
               REQUIRE(snprintf(sync_text, sizeof(sync_text), "%d", sync) > 0);
               REQUIRE(snprintf(action_text, sizeof(action_text), "%d", action) >
                       0);
@@ -148,6 +173,8 @@ static void xa_crashes(const char *directory) {
   REQUIRE(!unsetenv("POUCH_XA_CRASH_STOP"));
   REQUIRE(!unsetenv("POUCH_XA_CRASH_AFTER"));
   REQUIRE(!unsetenv("POUCH_XA_KEY"));
+  free(seed->bytes);
+  free(seed);
   lc_error_cleanup(&e);
   printf("XA process deaths=%zu passed\n", deaths);
 }

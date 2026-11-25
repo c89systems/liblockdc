@@ -314,11 +314,6 @@ static void xa_verify(lc_client *client, int action, int completed,
 }
 /* Allocation cuts test ownership/retry. Successful sync is immediate in this
  * profile; separate stable-image and exec-death profiles prove persistence. */
-static int xa_allocation_sync(void *context, int fd) {
-  (void)context;
-  (void)fd;
-  return 0;
-}
 static int xa_selected(const char *name, int value, int maximum) {
   const char *text = getenv(name);
   char *end;
@@ -351,8 +346,13 @@ static size_t xa_trial(const char *directory, int action, int sync, int kind,
               retention_disk_sync,
               retention_disk_reserve,
               NULL};
-  ps_io allocation_io = {&disk.fault,        disk_read,    disk_write,
-                         xa_allocation_sync, disk_reserve, NULL};
+  ps_io allocation_io = {&disk.fault,           disk_read,    disk_write,
+                         fixture_complete_sync, disk_reserve, NULL};
+  ps_io recovery_io = ps_native_io;
+  recovery_io.sync = fixture_complete_sync;
+  const ps_io *reopen_io = kind == 2 ? &allocation_io
+                           : kind    ? &recovery_io
+                                     : NULL;
   lc_client *client =
       xa_client(path, sync, 1, kind == 2 ? &allocation_io : &io, &e);
   xa_seed(client, action, &e);
@@ -382,11 +382,11 @@ static size_t xa_trial(const char *directory, int action, int sync, int kind,
   REQUIRE(!live);
   if (kind != 2)
     retention_disk_restore(&disk, path);
-  client = xa_client(path, sync, 0, kind == 2 ? &allocation_io : NULL, &e);
+  client = xa_client(path, sync, 0, reopen_io, &e);
   xa_verify(client, action, completed, &e);
   lc_client_close(client);
   REQUIRE(!live);
-  client = xa_client(path, sync, 0, kind == 2 ? &allocation_io : NULL, &e);
+  client = xa_client(path, sync, 0, reopen_io, &e);
   xa_visible(client, action, &e);
   lc_client_close(client);
   REQUIRE(!live);
@@ -401,6 +401,7 @@ static size_t xa_trial(const char *directory, int action, int sync, int kind,
 static void xa_faults(const char *directory, int kind) {
   size_t cuts = 0U;
   size_t cases = 0U;
+  fixture_directory_sync_model(kind != 0);
   for (int sync = 0; sync < 2; ++sync)
     for (int persist = 0; persist < (kind == 1 ? 3 : 1); ++persist)
       for (int action = 0; action < 11; ++action) {
@@ -417,6 +418,7 @@ static void xa_faults(const char *directory, int kind) {
             ++cuts;
           }
       }
+  fixture_directory_sync_model(0);
   REQUIRE(cases);
   printf("XA %s cuts=%zu passed\n",
          kind == 0   ? "durability"

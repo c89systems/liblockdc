@@ -38,7 +38,7 @@ if(CMAKE_BINARY_DIR STREQUAL "${CMAKE_SOURCE_DIR}/build/debug")
     -DLOCKDC_BUILD_POSTGRES=${LOCKDC_BUILD_POSTGRES}
     -P "${CMAKE_SOURCE_DIR}/tests/clangd_public_api_test.cmake")
   set_tests_properties(clangd_public_api_test PROPERTIES
-    LABELS "unit;local;lifecycle-host;editor" RUN_SERIAL TRUE TIMEOUT 90)
+    LABELS "unit;local;lifecycle-host;editor" TIMEOUT 90)
 endif()
 
 if(LOCKDC_EXTERNAL_ROOT)
@@ -99,7 +99,6 @@ if(TARGET lc_shared)
       ${lockdc_lua_module_arg}
       -P "${CMAKE_SOURCE_DIR}/tests/shared_public_symbol_boundary_test.cmake"
   )
-  set_tests_properties(shared_public_symbol_boundary PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 add_test(NAME example_receiver_style
@@ -143,7 +142,7 @@ foreach(contract release_test_selection valgrind_targeting)
     -DLOCKDC_BUILD_TYPE=${CMAKE_BUILD_TYPE}
     -P "${CMAKE_SOURCE_DIR}/tests/${contract}_test.cmake")
   set_tests_properties(${contract}_test PROPERTIES
-    LABELS "unit;local;lifecycle-host" RUN_SERIAL TRUE TIMEOUT 20)
+    LABELS "unit;local;lifecycle-host" TIMEOUT 20)
 endforeach()
 set_tests_properties(run_timed_log_test PROPERTIES
   LABELS "unit;local"
@@ -389,7 +388,7 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_TEST_CASE=collection_edits
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_collection_edits_shared_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections")
+      RESOURCE_LOCK lua_collection_edits TIMEOUT 30 LABELS "unit;local;lua;collections")
     add_test(NAME lua_collection_edits_test
       COMMAND ${CMAKE_COMMAND}
         -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -398,7 +397,7 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_TEST_CASE=collection_edits
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_collection_edits_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections")
+      RESOURCE_LOCK lua_collection_edits TIMEOUT 30 LABELS "unit;local;lua;collections")
     add_test(NAME lua_collection_count_retention_test
       COMMAND ${CMAKE_COMMAND}
         -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -407,7 +406,7 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_TEST_CASE=collection_count
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_collection_count_retention_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections;retention")
+      TIMEOUT 30 LABELS "unit;local;lua;collections;retention")
     add_test(NAME lua_collection_writer_test
       COMMAND ${CMAKE_COMMAND}
         -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -416,7 +415,7 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_TEST_CASE=collection_writer
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_collection_writer_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections;retention")
+      TIMEOUT 30 LABELS "unit;local;lua;collections;retention")
     add_test(NAME lua_collection_leases_test
       COMMAND ${CMAKE_COMMAND}
         -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -432,9 +431,9 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_TEST_CASE=collection_staged
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_collection_staged_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections")
+      TIMEOUT 30 LABELS "unit;local;lua;collections")
     set_tests_properties(lua_collection_leases_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections")
+      TIMEOUT 30 LABELS "unit;local;lua;collections")
     add_test(NAME lua_xa_test
       COMMAND ${CMAKE_COMMAND}
         -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -442,7 +441,7 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_XA_BINARY=$<TARGET_FILE:lc_lua_xa_test>
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_xa_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;xa")
+      TIMEOUT 30 LABELS "unit;local;lua;xa")
     add_test(NAME lua_state_retention_test
       COMMAND ${CMAKE_COMMAND}
         -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -451,7 +450,7 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_TEST_CASE=retention
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_state_retention_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;retention")
+      TIMEOUT 30 LABELS "unit;local;lua;retention")
     add_test(NAME lua_compression_test
       COMMAND ${CMAKE_COMMAND}
         -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -460,7 +459,7 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_TEST_CASE=compression
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_compression_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;pouch")
+      TIMEOUT 30 LABELS "unit;local;lua;pouch")
     add_test(NAME lua_collections_test
       COMMAND ${CMAKE_COMMAND}
         -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -469,7 +468,7 @@ if(TARGET lockdc_lua_core)
         -DLOCKDC_LUA_TEST_CASE=collections
         -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
     set_tests_properties(lua_collections_test PROPERTIES
-      RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections")
+      TIMEOUT 30 LABELS "unit;local;lua;collections")
     add_test(NAME lua_binding_core_smoke_test
       COMMAND "${LOCKDC_LUA_BIN}" "${CMAKE_SOURCE_DIR}/tests/lua/test_lockdc_core_smoke.lua"
     )
@@ -525,7 +524,7 @@ if(TARGET lockdc_pouch_replay_probe
         --segment-bytes 65536 ${replay_args})
     set_tests_properties(pouch_replay_${replay_transform} PROPERTIES
       LABELS "integration;offline;pouch;replay"
-      RUN_SERIAL TRUE TIMEOUT 60
+      TIMEOUT 60
       WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
   endforeach()
 endif()

@@ -56,8 +56,8 @@ static void index_crashes(const char *directory) {
            * once. Child admission/recovery, mutation and publication use real
            * syscall I/O. No deliberate death belongs in live sanitizer runs. */
           io_fault seed_fault = {0};
-          ps_io seed_io = {&seed_fault,          disk_read,    disk_write,
-                           index_immediate_sync, disk_reserve, NULL};
+          ps_io seed_io = {&seed_fault,           disk_read,    disk_write,
+                           fixture_complete_sync, disk_reserve, NULL};
           lc_client *client = index_client(path, sync, 1, 1, &seed_io, &e);
           index_seed(client, action, &e);
           lc_client_close(client);

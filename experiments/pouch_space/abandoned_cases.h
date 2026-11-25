@@ -5,6 +5,7 @@
 
 typedef struct abandoned_io {
   uint64_t reads, writes, syncs, read_bytes, write_bytes;
+  unsigned grant_reads[2];
   int enabled;
 } abandoned_io;
 static ssize_t abandoned_disk_read(void *context, int fd, void *bytes,
@@ -13,6 +14,12 @@ static ssize_t abandoned_disk_read(void *context, int fd, void *bytes,
   if (__atomic_load_n(&audit->enabled, __ATOMIC_ACQUIRE)) {
     __atomic_add_fetch(&audit->reads, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&audit->read_bytes, count, __ATOMIC_RELAXED);
+    if (count == PS_TOKEN_RECORD_BYTES) {
+      if (offset == PS_TOKEN_RECORD_OFFSET)
+        __atomic_add_fetch(&audit->grant_reads[0], 1, __ATOMIC_RELAXED);
+      else if (offset == PS_PAGE + PS_TOKEN_RECORD_OFFSET)
+        __atomic_add_fetch(&audit->grant_reads[1], 1, __ATOMIC_RELAXED);
+    }
   }
   return pread(fd, bytes, count, offset);
 }
@@ -167,6 +174,9 @@ static void namespace_abandoned_case(int durable, int empty, int wrote,
   /* One piece per call, including the unprofitable live piece. Bounded calls
    * must eventually reach and retire every unused grant without copying it. */
   for (uint64_t pass = 0; pass <= original_runs + 1; ++pass) {
+    uint64_t reads = audit.reads;
+    unsigned first_grant_reads = audit.grant_reads[0];
+    unsigned second_grant_reads = audit.grant_reads[1];
     OK(ps_namespace_repack(ns, PS_CATALOG_SEGMENT, 1, 1, NULL, NULL, &result,
                            &error));
     CHECK(result.visited <= 1 && !result.body_bytes && !result.mapping_bytes);
@@ -177,6 +187,13 @@ static void namespace_abandoned_case(int durable, int empty, int wrote,
     }
     memset(&storage, 0, sizeof(storage));
     OK(ps_namespace_sources_visit(ns, tail_storage_visit, &storage, &error));
+    if (audit.reads != reads) {
+      /* Cold successor admission may validate both persisted token grants
+       * when finishing the tail. Discarding the unused pieces reads nothing. */
+      CHECK(reopened && result.finished_tail && !first_grant_reads &&
+            !second_grant_reads && audit.grant_reads[0] == 1 &&
+            audit.grant_reads[1] == 1 && audit.reads == reads + 2);
+    }
     if (storage.runs == kept_runs)
       break;
   }
@@ -187,7 +204,7 @@ static void namespace_abandoned_case(int durable, int empty, int wrote,
   elapsed = abandoned_clock(CLOCK_MONOTONIC) - elapsed;
   cpu = abandoned_clock(CLOCK_PROCESS_CPUTIME_ID) - cpu;
   work = audit;
-  CHECK(!work.reads && !work.read_bytes);
+  CHECK(work.read_bytes == work.reads * PS_TOKEN_RECORD_BYTES);
   checkpoint = abandoned_clock(CLOCK_MONOTONIC);
   checkpoint_cpu = abandoned_clock(CLOCK_PROCESS_CPUTIME_ID);
   __atomic_store_n(&audit.enabled, 1, __ATOMIC_RELEASE);

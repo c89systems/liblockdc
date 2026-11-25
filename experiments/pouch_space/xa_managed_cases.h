@@ -191,8 +191,13 @@ static size_t xa_managed_trial(const char *directory, int action, int sync,
               retention_disk_sync,
               retention_disk_reserve,
               NULL};
-  ps_io allocation_io = {&disk.fault,        disk_read,    disk_write,
-                         xa_allocation_sync, disk_reserve, NULL};
+  ps_io allocation_io = {&disk.fault,           disk_read,    disk_write,
+                         fixture_complete_sync, disk_reserve, NULL};
+  ps_io recovery_io = ps_native_io;
+  recovery_io.sync = fixture_complete_sync;
+  const ps_io *reopen_io = kind == 2 ? &allocation_io
+                           : kind    ? &recovery_io
+                                     : NULL;
   lc_client *client =
       xa_client(path, sync, 1, kind == 2 ? &allocation_io : &io, &e);
   ok(lc_xa_store_open_owned(client, xa_owner_ids[0], &journal, &e), &e);
@@ -224,7 +229,7 @@ static size_t xa_managed_trial(const char *directory, int action, int sync,
           rc == LC_OK); /* Captured expected image owns tracked bytes. */
   if (kind != 2)
     retention_disk_restore(&disk, path);
-  client = xa_client(path, sync, 0, kind == 2 ? &allocation_io : NULL, &e);
+  client = xa_client(path, sync, 0, reopen_io, &e);
   ok(lc_xa_store_open_owned(client, xa_owner_ids[0], &journal, &e), &e);
   ok(lc_xa_store_open_owned(client, xa_owner_ids[1], &other, &e), &e);
   if (rc == LC_OK) {
@@ -253,6 +258,7 @@ static size_t xa_managed_trial(const char *directory, int action, int sync,
 }
 static void xa_managed_faults(const char *directory, int kind) {
   size_t cuts = 0U;
+  fixture_directory_sync_model(kind != 0);
   for (int sync = 0; sync < 2; ++sync)
     for (int persist = 0; persist < (kind == 1 ? 3 : 1); ++persist)
       for (int action = 0; action < 8; ++action) {
@@ -267,6 +273,7 @@ static void xa_managed_faults(const char *directory, int kind) {
             ++cuts;
           }
       }
+  fixture_directory_sync_model(0);
   printf("XA managed %s cuts=%zu passed\n",
          kind == 0   ? "durability"
          : kind == 1 ? "I/O"

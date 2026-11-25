@@ -1,5 +1,6 @@
 #ifndef POUCH_SPACE_ROOT_CONVERSION_CASES_H
 #define POUCH_SPACE_ROOT_CONVERSION_CASES_H
+#include "crash_fixture.h"
 #include "lc_pouch_query_index.h"
 
 static int root_count_value(void *context, ps_key key, const ps_ref *ref,
@@ -244,6 +245,7 @@ typedef struct root_seed_image {
   fixture base;
   char etags[3][65];
   unsigned char *image;
+  unsigned char pages[PS_DEFAULT_CAPACITY / PS_PAGE];
 } root_seed_image;
 static void root_image_open(root_seed_image *seed, const char *directory,
                             int codec, int sync) {
@@ -258,6 +260,7 @@ static void root_image_open(root_seed_image *seed, const char *directory,
           !close(fd));
   REQUIRE(!unlink(seed->base.path));
   lc_error_cleanup(&seed->base.error);
+  crash_fixture_pages(seed->image, seed->pages);
 }
 static size_t root_conversion_trial(root_seed_image *seed, int codec,
                                     size_t event, int request, size_t scope,
@@ -279,11 +282,10 @@ static size_t root_conversion_trial(root_seed_image *seed, int codec,
   f.io = &io;
   char etags[3][65];
   memcpy(etags, seed->etags, sizeof(etags));
-  int fd = open(f.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-  REQUIRE(fd >= 0 &&
-          pwrite(fd, seed->image, PS_DEFAULT_CAPACITY, 0) ==
-              PS_DEFAULT_CAPACITY &&
-          !fdatasync(fd) && !close(fd));
+  int fd = open(f.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  REQUIRE(fd >= 0 && !ftruncate(fd, PS_DEFAULT_CAPACITY));
+  crash_fixture_write(fd, seed->image, seed->pages);
+  REQUIRE(!close(fd));
   f.settings.compression = codec & 2 ? "none" : "zlib";
   root_cut state = {.disk = &model,
                     .fail = event,

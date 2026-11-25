@@ -5,6 +5,7 @@
 #include "collection_transform.h"
 #include "collection_walk.h"
 #include "collections.h"
+#include "fixture_directory_sync.h"
 #include "lc_collection_internal.h"
 #include "lc_collection_query.h"
 #include "namespace_work.h"
@@ -12,6 +13,7 @@
 #include "pouch.h"
 #include "pouch_internal.h"
 #include "root_internal.h"
+#include "space_internal.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -1804,7 +1806,7 @@ static int disk_sync(void *context, int fd) {
   disk_model *m = context;
   int fail = disk_cut(m);
   if (!fail || m->mode >= 2) {
-    REQUIRE(!fdatasync(fd));
+    /* Track the modeled barrier in stable pages. The fixture is disposable. */
     if (!m->freeze || (fail && m->mode >= 2))
       for (size_t page = 0U; page < PS_DEFAULT_CAPACITY / PS_PAGE; ++page)
         if (m->dirty[page]) {
@@ -1834,7 +1836,7 @@ static void restore_disk(disk_model *m, const char *path) {
     if (m->dirty[page])
       REQUIRE(pwrite(fd, m->stable + page * PS_PAGE, PS_PAGE,
                      (off_t)(page * PS_PAGE)) == PS_PAGE);
-  REQUIRE(!fdatasync(fd) && !close(fd));
+  REQUIRE(!close(fd));
   memset(m->dirty, 0, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
   m->freeze = 0;
 }
@@ -1871,6 +1873,7 @@ static size_t io_trial(const char *directory, int codec, int sync,
   io.write = disk_write;
   io.sync = disk_sync;
   io.reserve = disk_reserve;
+  fixture_directory_sync_model(1);
   setup_io(&f, directory, codec, sync, 1, &io);
   (void)append(f.collection, "seed", operation >= 4 ? 73728U : 80U, &f.error);
   if (operation >= 4) {
@@ -1934,8 +1937,10 @@ static size_t io_trial(const char *directory, int codec, int sync,
   clear(&f.error);
   close_store(&f);
   restore_disk(&m, f.path);
-  /* Reopen through ordinary I/O: only modeled stable bytes survived. */
-  f.io = NULL;
+  /* Crash recovery reads the restored bytes through native file I/O. */
+  io = ps_native_io;
+  io.sync = fixture_complete_sync;
+  f.io = &io;
   open_client(&f, 0);
   if (operation == 7) {
     background_verify_empty(&f);
@@ -2006,6 +2011,7 @@ static size_t io_trial(const char *directory, int codec, int sync,
   free(m.stable);
   free(m.dirty);
   free(m.scratch);
+  fixture_directory_sync_model(0);
   return calls;
 }
 static void io_failures(const char *directory, int codec, int sync) {
@@ -2045,7 +2051,10 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
            "allocation codec=%d sync=%d op=%d "
            "cut=%zu",
            codec, sync, operation, cut);
-  setup(&f, directory, codec, sync, 1);
+  ps_io io = ps_native_io;
+  io.sync = fixture_complete_sync;
+  fixture_directory_sync_model(1);
+  setup_io(&f, directory, codec, sync, 1, &io);
   (void)append(f.collection, "seed", operation >= 7 ? 73728U : 80U, &f.error);
   if (operation >= 7) {
     lc_collection_handle *c = f.collection->impl;
@@ -2187,6 +2196,7 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
   close_store(&f);
   lc_error_cleanup(&f.error);
   REQUIRE(!unlink(f.path));
+  fixture_directory_sync_model(0);
   return calls;
 }
 static void allocation_failures(const char *directory, int codec, int sync) {

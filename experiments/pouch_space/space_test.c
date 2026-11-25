@@ -6484,19 +6484,26 @@ static void budget_lifecycle(int durable) {
 }
 static void budget_fill(ps_space *s, uint64_t *next, const void *bytes) {
   ps_writer *w = NULL;
+  uint64_t ready = 0;
   int rc;
+  /* Fixture entries only occupy capacity. Publish the same individual
+   * entries and certify the final prefix once before returning to the case. */
   for (;;) {
+    uint64_t published;
     OK(ps_begin(s, NULL, state((*next)++), &w, &error));
     OK(ps_write(w, bytes, PS_PAGE, &error));
-    rc = ps_publish(w, NULL, &error);
+    rc = ps_internal_publish_deferred(w, &published, &error);
     ps_writer_close(w);
     if (rc != LC_OK) {
       CHECK(rc == LC_ERR_INVALID);
       lc_error_cleanup(&error);
       break;
     }
+    ready = published;
     CHECK(*next < 4096);
   }
+  if (s->durable && ready)
+    OK(ps_internal_durable(s, ready, &error));
 }
 static void budget_capacity(int durable) {
   ps_space *s;

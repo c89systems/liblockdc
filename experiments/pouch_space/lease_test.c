@@ -91,17 +91,24 @@ static double real_clock(clockid_t id) {
   return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 }
 #ifdef __linux__
+static int model_test_sync;
+static void test_sync_model(int enabled) {
+  __atomic_store_n(&model_test_sync, enabled, __ATOMIC_RELAXED);
+}
 int __real_fdatasync(int);
 int __real_fsync(int);
 int __wrap_fdatasync(int fd) {
   if (__atomic_load_n(&measure_enabled, __ATOMIC_ACQUIRE))
     __atomic_add_fetch(&measured_syncs, 1, __ATOMIC_RELAXED);
-  return __real_fdatasync(fd);
+  return __atomic_load_n(&model_test_sync, __ATOMIC_RELAXED)
+             ? 0
+             : __real_fdatasync(fd);
 }
 int __wrap_fsync(int fd) {
   if (__atomic_load_n(&measure_enabled, __ATOMIC_ACQUIRE))
     __atomic_add_fetch(&measured_syncs, 1, __ATOMIC_RELAXED);
-  return __real_fsync(fd);
+  return __atomic_load_n(&model_test_sync, __ATOMIC_RELAXED) ? 0
+                                                             : __real_fsync(fd);
 }
 #endif
 typedef union allocation_header {
@@ -1263,13 +1270,13 @@ static void measure_end(measurement *m) {
   m->syncs = __atomic_load_n(&measured_syncs, __ATOMIC_RELAXED);
   m->staged_decision = 1000 * phase_elapsed;
 }
-static void compare(const char *directory) {
+static void compare(const char *directory, int samples) {
   lc_error e;
   lc_error_init(&e);
   fixture *f = calloc(1, sizeof(*f));
   REQUIRE(f);
   benchmark_normal = 1;
-  for (int sample = 0; sample < 5; ++sample)
+  for (int sample = 0; sample < samples; ++sample)
     for (int profile = 0; profile < 16; ++profile)
       for (int engine = 0; engine < 2; ++engine) {
         int selected = sample & 1 ? 15 - profile : profile;
@@ -2195,7 +2202,7 @@ static size_t io_trial(const char *directory, int sync, int crypto, int mode,
   m.mode = mode;
   m.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
   m.dirty = calloc(1, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
-  m.scratch = malloc(PS_PAGE);
+  m.scratch = malloc(PS_CHUNK);
   REQUIRE(m.stable && m.dirty && m.scratch);
   ps_io io = {&m, disk_read, disk_write, disk_sync, disk_reserve, NULL};
   lc_error e;
@@ -2216,11 +2223,16 @@ static size_t io_trial(const char *directory, int sync, int crypto, int mode,
   }
   int baseline_fd = open(f->path, O_RDONLY);
   REQUIRE(baseline_fd >= 0);
-  for (size_t at = 0; at < PS_DEFAULT_CAPACITY; at += PS_PAGE) {
-    REQUIRE(pread(baseline_fd, m.scratch, PS_PAGE, (off_t)at) == PS_PAGE);
+  for (size_t at = 0; at < PS_DEFAULT_CAPACITY;) {
     /* Exclusive reopen consumes a receipt in the advisory slots. */
-    size_t slots = at == PS_READINESS_OFFSET ? 2 * PS_READINESS_SLOT_BYTES : 0;
-    REQUIRE(!memcmp(m.stable + at + slots, m.scratch + slots, PS_PAGE - slots));
+    if (at == PS_READINESS_OFFSET)
+      at += 2 * PS_READINESS_SLOT_BYTES;
+    size_t end =
+        at < PS_READINESS_OFFSET ? PS_READINESS_OFFSET : PS_DEFAULT_CAPACITY;
+    size_t bytes = end - at < PS_CHUNK ? end - at : PS_CHUNK;
+    REQUIRE(pread(baseline_fd, m.scratch, bytes, (off_t)at) == (ssize_t)bytes);
+    REQUIRE(!memcmp(m.stable + at, m.scratch, bytes));
+    at += bytes;
   }
   REQUIRE(!close(baseline_fd));
   now(1050);
@@ -2379,9 +2391,11 @@ static int run_portable_case(run *r) {
 static void run_linux_case(run *r) {
   if (!strcmp(r->mode, "lifecycle"))
     lifecycle(r->directory);
-  else if (!strcmp(r->mode, "phases"))
+  else if (!strcmp(r->mode, "phases")) {
+    test_sync_model(1);
     phase_failures(r->directory);
-  else if (!strcmp(r->mode, "policy"))
+    test_sync_model(0);
+  } else if (!strcmp(r->mode, "policy"))
     lease_policy(r->directory);
   else if (!strcmp(r->mode, "shared-autonomous-capacity") ||
            !strcmp(r->mode, "shared-unpaced-capacity"))
@@ -2396,10 +2410,14 @@ static void run_linux_case(run *r) {
     fairness(r->directory);
   else if (!strcmp(r->mode, "concurrency"))
     concurrency(r->directory);
-  else if (!strcmp(r->mode, "coordinated"))
+  else if (!strcmp(r->mode, "coordinated")) {
+    test_sync_model(1);
     coordinated(r->directory);
-  else if (!strcmp(r->mode, "compare"))
-    compare(r->directory);
+    test_sync_model(0);
+  } else if (!strcmp(r->mode, "compare"))
+    compare(r->directory, 5);
+  else if (!strcmp(r->mode, "compare-correctness"))
+    compare(r->directory, 2);
   else if (!strcmp(r->mode, "capacity-probe"))
     lease_capacity_case(r->directory, 0, 0, 0, 0, 0, 0);
   else if (!strcmp(r->mode, "capacity-tail-probe"))
@@ -2417,18 +2435,25 @@ static void run_linux_case(run *r) {
              !strcmp(r->mode, "capacity-required"))
     lease_capacity_profile(r->directory, !strcmp(r->mode, "capacity-required"));
   else if (!strncmp(r->mode, "allocation-", 11) && strlen(r->mode) == 12 &&
-           r->mode[11] >= '0' && r->mode[11] <= '3')
+           r->mode[11] >= '0' && r->mode[11] <= '3') {
+    /* These cases inject allocation failures followed by a clean reopen.
+     * Model completed syncs so every rebuilt fixture needn't flush to disk. */
+    test_sync_model(1);
     allocation_failures(r->directory, r->mode[11] - '0', r->native, r->sync,
                         r->cold, r->no_error, r->diagnostic, r->selected);
-  else if (!strncmp(r->mode, "process-", 8) && strlen(r->mode) == 9 &&
-           r->mode[8] >= '0' && r->mode[8] <= '3')
+    test_sync_model(0);
+  } else if (!strncmp(r->mode, "process-", 8) && strlen(r->mode) == 9 &&
+             r->mode[8] >= '0' && r->mode[8] <= '3')
     process_cuts(r->directory, r->mode[8] - '0');
   else if (!strncmp(r->mode, "io-", 3) && strlen(r->mode) == 6 &&
            r->mode[3] >= '0' && r->mode[3] <= '3' && r->mode[4] == '-' &&
-           r->mode[5] >= '0' && r->mode[5] <= '1')
+           r->mode[5] >= '0' && r->mode[5] <= '1') {
+    /* The stable crash image records barrier effects for every injected cut. */
+    test_sync_model(1);
     io_failures(r->directory, r->mode[3] - '0', r->mode[5] - '0', r->diagnostic,
                 r->selected, r->io_mode, r->cold);
-  else
+    test_sync_model(0);
+  } else
     REQUIRE(0);
 }
 #endif

@@ -1,5 +1,6 @@
 #ifndef POUCH_SPACE_COLLECTION_CODEC_CASES_H
 #define POUCH_SPACE_COLLECTION_CODEC_CASES_H
+#include "fixture_directory_sync.h"
 #include "lc_collection_unit_recode.h"
 
 static size_t unit_allocations, unit_fail_allocation, unit_largest;
@@ -281,6 +282,10 @@ static size_t unit_trial(const char *directory, const char *key, int codec,
                          int durable, lc_u64 bytes, int compressible, int kind,
                          size_t cut, int corruption) {
   unit_fixture f = {0};
+  ps_io io = ps_native_io;
+  io.sync = fixture_complete_sync;
+  if (kind)
+    f.options.storage.io = &io;
   lc_error e;
   lc_error_init(&e);
   unit_fixture_open(&f, directory, key, codec, durable, bytes, compressible,
@@ -390,6 +395,7 @@ static size_t unit_trial(const char *directory, const char *key, int codec,
 }
 static void unit_cases(const char *directory, const char *key, int faults) {
   size_t sites = 0;
+  fixture_directory_sync_model(faults);
   for (int codec = 0; codec < 4; ++codec)
     for (int durable = 0; durable < 2; ++durable) {
       if (faults) {
@@ -430,6 +436,7 @@ static void unit_cases(const char *directory, const char *key, int faults) {
                            corruption);
       }
     }
+  fixture_directory_sync_model(0);
   if (faults)
     printf(
         "native collection unit conversion allocation/I/O/partial sites=%zu\n",

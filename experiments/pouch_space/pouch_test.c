@@ -4,6 +4,7 @@
 #include "checkpoint_record.h"
 #include "collections.h"
 #include "coordination.h"
+#include "fixture_barriers.h"
 #include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
@@ -468,6 +469,7 @@ static size_t fault_case(const char *path, size_t nth, int phase, int transform,
 }
 static void faults(const char *path) {
   size_t count = 0;
+  fixture_barriers_model(1);
   for (int transform = 0; transform <= 3; transform += 3)
     for (int sync = 0; sync < 2; ++sync)
       for (int phase = 0; phase < 5; ++phase) {
@@ -476,6 +478,7 @@ static void faults(const char *path) {
           (void)fault_case(path, n, phase, transform, sync);
         count += total;
       }
+  fixture_barriers_model(0);
   printf("production state allocation failure sites: %lu\n",
          (unsigned long)count);
 }
@@ -1119,6 +1122,7 @@ static size_t io_case(const char *path, size_t nth, int sync, int partial) {
 }
 static void io_faults(const char *path) {
   size_t count = 0;
+  fixture_barriers_model(1);
   for (int sync = 0; sync < 2; ++sync)
     for (int partial = 0; partial < 2; ++partial) {
       size_t total = io_case(path, SIZE_MAX, sync, partial);
@@ -1126,6 +1130,7 @@ static void io_faults(const char *path) {
         (void)io_case(path, n, sync, partial);
       count += total;
     }
+  fixture_barriers_model(0);
   printf("production state I/O failure sites: %lu\n", (unsigned long)count);
 }
 
@@ -1662,6 +1667,7 @@ static size_t mutation_fault_case(const char *path, size_t nth, int operation,
 }
 static void mutation_faults(const char *path, int use_io) {
   size_t count = 0;
+  fixture_barriers_model(1);
   for (int transform = 0; transform <= 3; transform += 3)
     for (int sync = 0; sync < 2; ++sync)
       for (int operation = 0; operation < 3; ++operation) {
@@ -1672,6 +1678,7 @@ static void mutation_faults(const char *path, int use_io) {
                                     use_io);
         count += total;
       }
+  fixture_barriers_model(0);
   printf("metadata/delete %s failure sites: %lu\n",
          use_io ? "I/O" : "allocation", (unsigned long)count);
 }
@@ -2529,6 +2536,7 @@ static size_t read_failure_case(const char *path, size_t nth, int phase,
 }
 static void read_faults(const char *path, int use_io) {
   size_t total = 0;
+  fixture_barriers_model(1);
   for (int transform = 0; transform <= 3; transform += 3)
     for (int cold = 0; cold < 2; ++cold)
       for (int phase = 0; phase < 7; ++phase) {
@@ -2538,6 +2546,7 @@ static void read_faults(const char *path, int use_io) {
           (void)read_failure_case(path, n, phase, cold, use_io, transform);
         total += count;
       }
+  fixture_barriers_model(0);
   printf("container read %s failure sites: %lu\n",
          use_io ? "I/O" : "allocation", (unsigned long)total);
 }
@@ -3895,6 +3904,7 @@ static size_t lifetime_failure(const char *path, size_t nth, int crypto,
 }
 static void lifetime_faults(const char *path) {
   size_t total = 0;
+  fixture_barriers_model(1);
   for (int crypto = 0; crypto <= 3; crypto += 3)
     for (int sync = 0; sync < 2; ++sync)
       for (int object = 0; object < 2; ++object)
@@ -3907,6 +3917,7 @@ static void lifetime_faults(const char *path) {
                                      kind);
             total += count;
           }
+  fixture_barriers_model(0);
   printf("recreated lifetime allocation/I/O/torn failure sites: %lu\n",
          (unsigned long)total);
 }
@@ -5112,6 +5123,7 @@ static size_t maintenance_failure(const char *path, size_t nth, int kind,
 }
 static void maintenance_faults(const char *path, int io) {
   size_t cases = 0;
+  fixture_barriers_model(1);
   for (int durable = 0; durable < 2; ++durable)
     for (int kind = io ? 1 : 0; kind <= (io ? 2 : 0); ++kind)
       for (int partial = 0; partial <= (io ? 1 : 0); ++partial) {
@@ -5121,6 +5133,7 @@ static void maintenance_faults(const char *path, int io) {
           (void)maintenance_failure(path, nth, kind, durable, partial);
         cases += count;
       }
+  fixture_barriers_model(0);
   printf("maintenance %s failure sites: %lu\n", io ? "I/O" : "allocation",
          (unsigned long)cases);
 }
@@ -6263,6 +6276,7 @@ static size_t staging_failure(const char *path, size_t nth, int crypto,
 }
 static void staging_faults(const char *path, int recovery, int rotating) {
   size_t total = 0;
+  fixture_barriers_model(1);
   for (int crypto = 0; crypto <= 3; crypto += 3)
     for (int sync = 0; sync < 2; ++sync)
       for (int operation = recovery ? 4 : 0; operation < (recovery ? 5 : 4);
@@ -6275,6 +6289,7 @@ static void staging_faults(const char *path, int recovery, int rotating) {
                                   rotating);
           total += count;
         }
+  fixture_barriers_model(0);
   printf("staged publication failure sites: %lu\n", (unsigned long)total);
 }
 static int staged_crash_armed;

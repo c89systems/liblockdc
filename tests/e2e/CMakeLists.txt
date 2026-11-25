@@ -90,6 +90,10 @@ function(lc_add_lua_e2e_test test_name script_path)
     TIMEOUT 300
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   )
+  if(LUA_E2E_POUCH_ROOT)
+    # These scenarios only read the prepared modules and use private roots.
+    set_tests_properties(${test_name} PROPERTIES RUN_SERIAL FALSE)
+  endif()
 endfunction()
 
 lc_add_e2e_shard(lc_e2e_disk_direct LC_E2E_GROUP_DISK_DIRECT)
@@ -100,6 +104,14 @@ lc_add_e2e_shard(lc_e2e_mem_direct LC_E2E_GROUP_MEM_DIRECT)
 lc_add_e2e_shard(lc_e2e_disk_consumer LC_E2E_GROUP_DISK_CONSUMER)
 lc_add_e2e_shard(lc_e2e_s3_consumer LC_E2E_GROUP_S3_CONSUMER)
 lc_add_e2e_shard(lc_e2e_mem_consumer LC_E2E_GROUP_MEM_CONSUMER)
+# Each lockd backend has its own fixtures. Serialize scenarios that use the
+# same backend and let the local Pouch tests overlap their waits.
+foreach(backend disk s3 mem)
+  set_tests_properties(lc_e2e_${backend}_direct lc_e2e_${backend}_consumer
+    PROPERTIES RUN_SERIAL FALSE RESOURCE_LOCK lockdc_e2e_${backend})
+endforeach()
+set_tests_properties(lc_e2e_pouch_direct lc_e2e_pouch_shared_outbox
+  PROPERTIES RUN_SERIAL FALSE RESOURCE_LOCK lockdc_e2e_pouch_roots)
 
 if(TARGET lc_example_acquire_lease_lifecycle)
   add_test(NAME lc_example_smoke_acquire_lease_lifecycle

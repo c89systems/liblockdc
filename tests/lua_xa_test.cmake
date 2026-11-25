@@ -12,9 +12,10 @@ file(REMOVE_RECURSE "${root}")
 file(MAKE_DIRECTORY "${root}")
 set(runner)
 if("$ENV{LOCKDC_LUA_XA_VALGRIND}" STREQUAL "1")
+    get_filename_component(runner_name "${LOCKDC_LUA_XA_BINARY}" NAME)
     set(runner valgrind --error-exitcode=99 --leak-check=full
         --errors-for-leak-kinds=definite,indirect
-        "--log-file=${LOCKDC_BINARY_DIR}/lua-xa-valgrind.log")
+        "--log-file=${LOCKDC_BINARY_DIR}/lua-${LOCKDC_LUA_TEST_CASE}-${runner_name}-valgrind.log")
 endif()
 execute_process(
     COMMAND ${runner} "${LOCKDC_LUA_XA_BINARY}"

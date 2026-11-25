@@ -469,11 +469,6 @@ static void index_shared(const char *directory) {
   }
   lc_error_cleanup(&e);
 }
-static int index_immediate_sync(void *context, int fd) {
-  (void)context;
-  (void)fd;
-  return 0;
-}
 static size_t index_trial(const char *directory, int action, int sync, int kind,
                           int persist, size_t cut) {
   lc_error e;
@@ -496,8 +491,13 @@ static size_t index_trial(const char *directory, int action, int sync, int kind,
               retention_disk_sync,
               retention_disk_reserve,
               NULL};
-  ps_io allocations = {&disk.fault,          disk_read,    disk_write,
-                       index_immediate_sync, disk_reserve, NULL};
+  ps_io allocations = {&disk.fault,           disk_read,    disk_write,
+                       fixture_complete_sync, disk_reserve, NULL};
+  ps_io recovery_io = ps_native_io;
+  recovery_io.sync = fixture_complete_sync;
+  const ps_io *reopen_io = kind == 2 ? &allocations
+                           : kind    ? &recovery_io
+                                     : NULL;
   const ps_io *selected = kind == 2 ? &allocations : &io;
   lc_client *client = index_client(path, sync, 1, 1, selected, &e);
   index_seed(client, action, &e);
@@ -539,11 +539,11 @@ static size_t index_trial(const char *directory, int action, int sync, int kind,
   REQUIRE(!live);
   if (kind != 2)
     retention_disk_restore(&disk, path);
-  client = index_client(path, sync, 0, 1, kind == 2 ? &allocations : NULL, &e);
+  client = index_client(path, sync, 0, 1, reopen_io, &e);
   index_verify(client, action, rc == LC_OK, &e);
   lc_client_close(client);
   REQUIRE(!live);
-  client = index_client(path, sync, 0, 1, kind == 2 ? &allocations : NULL, &e);
+  client = index_client(path, sync, 0, 1, reopen_io, &e);
   index_verify(client, action, rc == LC_OK, &e);
   lc_client_close(client);
   REQUIRE(!live);
@@ -557,6 +557,7 @@ static size_t index_trial(const char *directory, int action, int sync, int kind,
 }
 static void index_faults(const char *directory, int kind) {
   size_t cuts = 0U;
+  fixture_directory_sync_model(kind != 0);
   for (int sync = 0; sync < 2; ++sync)
     for (int persist = 0; persist < (kind == 1 ? 3 : 1); ++persist)
       for (int action = 0; action < 4; ++action) {
@@ -570,6 +571,7 @@ static void index_faults(const char *directory, int kind) {
             ++cuts;
           }
       }
+  fixture_directory_sync_model(0);
   printf("index %s cuts=%zu passed\n",
          kind == 2 ? "allocation"
          : kind    ? "I/O"
@@ -655,6 +657,7 @@ static void index_corrupt_generation(const char *directory) {
     lc_client_close(client);
     REQUIRE(!live);
     disk.stable[payload] ^= 1U;
+    disk.dirty[payload / PS_PAGE] = 1;
     retention_disk_restore(&disk, path);
     client = index_client(path, sync, 0, 1, NULL, &e);
     /* Query before explicit repair: a valid manifest cannot make the damaged

@@ -377,6 +377,7 @@ static size_t cq_trial_run(const char *directory, int codec, int sync,
   m.scratch = malloc(PS_PAGE);
   REQUIRE(m.stable && m.dirty && m.scratch);
   ps_io io = {&m, disk_read, disk_write, disk_sync, disk_reserve, NULL};
+  fixture_directory_sync_model(1);
   setup_io(&f, directory, codec, sync, 0, &io);
   cq_seed(&f, 7U);
   if (action) {
@@ -414,7 +415,9 @@ static size_t cq_trial_run(const char *directory, int codec, int sync,
   close_store(&f);
   if (!allocating)
     restore_disk(&m, f.path);
-  f.io = NULL;
+  io = ps_native_io;
+  io.sync = fixture_complete_sync;
+  f.io = &io;
   open_client(&f, 0);
   open_collection(&f, 0, &f.collection);
   open_collection(&f, 0, &f.peer);
@@ -428,6 +431,7 @@ static size_t cq_trial_run(const char *directory, int codec, int sync,
   free(m.stable);
   free(m.dirty);
   free(m.scratch);
+  fixture_directory_sync_model(0);
   return calls;
 }
 typedef struct cq_trial_context {

@@ -467,6 +467,20 @@ function(lc_configure_c_test_target target)
     lc_configure_development_runtime(${target})
 endfunction()
 
+function(lc_wrap_unit_symbols target)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(launcher "${CMAKE_SOURCE_DIR}/tests/support/darwin-test-link.sh")
+        set_property(TARGET ${target} PROPERTY C_LINKER_LAUNCHER bash "${launcher}")
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${launcher}")
+        set(wrap_flag "-Wl,--wrap=")
+    else()
+        set(wrap_flag "LINKER:--wrap=")
+    endif()
+    foreach(symbol IN LISTS ARGN)
+        target_link_options(${target} PRIVATE "${wrap_flag}${symbol}")
+    endforeach()
+endfunction()
+
 function(lc_enable_coverage_if_requested target)
     get_target_property(target_type ${target} TYPE)
     if(LOCKDC_ENABLE_COVERAGE AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
@@ -1215,7 +1229,8 @@ if(LOCKDC_BUILD_TESTS)
                 -DLOCKDC_SANITIZER_INSTRUMENTED=${LOCKDC_SANITIZER_INSTRUMENTED}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/package_archives_test.cmake
         )
-        set_tests_properties(package_archives_test PROPERTIES RUN_SERIAL TRUE)
+        set_tests_properties(package_archives_test PROPERTIES
+            RESOURCE_LOCK lockdc_install_tree COST 14)
     endif()
 
     if(TARGET lc_shared AND TARGET lc_static
@@ -1259,7 +1274,6 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/version_resolution_test.cmake
     )
-    set_tests_properties(version_resolution_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME dist_dir_configure_test
         COMMAND ${CMAKE_COMMAND}
@@ -1267,7 +1281,6 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/dist_dir_configure_test.cmake
     )
-    set_tests_properties(dist_dir_configure_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME c_only_configure_test
         COMMAND ${CMAKE_COMMAND}
@@ -1281,7 +1294,6 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_TARGET_LIBC=${LOCKDC_TARGET_LIBC}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/c_only_configure_test.cmake
     )
-    set_tests_properties(c_only_configure_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME cpp_public_header_test
         COMMAND ${CMAKE_COMMAND}
@@ -1293,7 +1305,6 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_EXTERNAL_ROOT=${LOCKDC_EXTERNAL_ROOT}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp_public_header_test.cmake
     )
-    set_tests_properties(cpp_public_header_test PROPERTIES RUN_SERIAL TRUE)
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET lc_static AND TARGET lc_shared
        AND CMAKE_SYSTEM_PROCESSOR STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR)
@@ -1308,7 +1319,7 @@ if(LOCKDC_BUILD_TESTS)
                 -DLOCKDC_READELF=${CMAKE_READELF}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/optional_postgres_dependency_test.cmake)
         set_tests_properties(optional_postgres_dependency_test PROPERTIES
-            RUN_SERIAL TRUE TIMEOUT 120 LABELS "unit;local;packaging")
+            PROCESSORS 4 COST 16 TIMEOUT 120 LABELS "unit;local;packaging")
     endif()
 
     if(LOCKDC_BUILD_POSTGRES AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
@@ -1346,7 +1357,6 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_TARGET_LIBC=${LOCKDC_TARGET_LIBC}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/deferred_vendored_install_manifest_test.cmake
     )
-    set_tests_properties(deferred_vendored_install_manifest_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME arch_alias_configure_test
         COMMAND ${CMAKE_COMMAND}
@@ -1359,7 +1369,6 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_TARGET_LIBC=${LOCKDC_TARGET_LIBC}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/arch_alias_configure_test.cmake
     )
-    set_tests_properties(arch_alias_configure_test PROPERTIES RUN_SERIAL TRUE)
 
     set(lockdc_cross_closure_test_args)
     if(TARGET lc_pouch_compaction_stack_test AND CMAKE_GENERATOR MATCHES "^Ninja")
@@ -1388,7 +1397,10 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_TARGET_ID=${LOCKDC_TARGET_ID}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_license_install_tree_test.cmake
     )
-    set_tests_properties(runtime_license_install_tree_test PROPERTIES RUN_SERIAL TRUE)
+    # The archive checks and SDK install share the parent build's install
+    # manifest and package staging directory.
+    set_tests_properties(runtime_license_install_tree_test PROPERTIES
+        RESOURCE_LOCK lockdc_install_tree COST 14)
 
     add_test(NAME install_tree_sdk_test
         COMMAND ${CMAKE_COMMAND}
@@ -1401,19 +1413,19 @@ if(LOCKDC_BUILD_TESTS)
             $<$<BOOL:${CMAKE_BUILD_TYPE}>:-DLOCKDC_BUILD_TYPE=${CMAKE_BUILD_TYPE}>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/install_tree_sdk_test.cmake
     )
-    set_tests_properties(install_tree_sdk_test PROPERTIES RUN_SERIAL TRUE)
+    set_tests_properties(install_tree_sdk_test PROPERTIES
+        RESOURCE_LOCK lockdc_install_tree COST 14)
 
     add_test(NAME devenv_kube_lifecycle_test
         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/devenv_kube_lifecycle_test.py
     )
-    set_tests_properties(devenv_kube_lifecycle_test PROPERTIES RUN_SERIAL TRUE)
+    set_tests_properties(devenv_kube_lifecycle_test PROPERTIES COST 14)
 
     add_test(NAME pouch_boundary_test
         COMMAND ${CMAKE_COMMAND}
             -DLOCKDC_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/pouch_boundary_test.cmake
     )
-    set_tests_properties(pouch_boundary_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME pslog_build_modes_test
         COMMAND ${CMAKE_COMMAND}
@@ -1428,9 +1440,10 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_DEPENDENCY_BUILD_ROOT=${LOCKDC_DEPENDENCY_BUILD_ROOT}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/pslog_build_modes_test.cmake
     )
-    # Core-only fixtures must stay isolated when a parent enables PostgreSQL.
+    # Nested builds have their own scratch trees and inherit the PostgreSQL
+    # setting so the core-only fixture exercises its explicit overrides.
     set_tests_properties(pslog_build_modes_test PROPERTIES
-        RUN_SERIAL TRUE ENVIRONMENT "LOCKDC_BUILD_POSTGRES=ON")
+        PROCESSORS 4 COST 18 ENVIRONMENT "LOCKDC_BUILD_POSTGRES=ON")
 
     add_test(NAME curl_dependency_interface_test
         COMMAND ${CMAKE_COMMAND}
@@ -1440,7 +1453,6 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_DEPENDENCY_BUILD_ROOT=${LOCKDC_DEPENDENCY_BUILD_ROOT}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/curl_dependency_interface_test.cmake
     )
-    set_tests_properties(curl_dependency_interface_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME libssh2_dependency_interface_test
         COMMAND ${CMAKE_COMMAND}
@@ -1448,21 +1460,18 @@ if(LOCKDC_BUILD_TESTS)
             -DLOCKDC_DEPENDENCY_BUILD_ROOT=${LOCKDC_DEPENDENCY_BUILD_ROOT}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/libssh2_dependency_interface_test.cmake
     )
-    set_tests_properties(libssh2_dependency_interface_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME pslog_dependency_download_name_test
         COMMAND ${CMAKE_COMMAND}
             -DLOCKDC_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/pslog_dependency_download_name_test.cmake
     )
-    set_tests_properties(pslog_dependency_download_name_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME host_dependency_root_layout_test
         COMMAND ${CMAKE_COMMAND}
             -DLOCKDC_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/host_dependency_root_layout_test.cmake
     )
-    set_tests_properties(host_dependency_root_layout_test PROPERTIES RUN_SERIAL TRUE)
 
     add_test(NAME dependency_download_timeout_test
         COMMAND ${CMAKE_COMMAND}

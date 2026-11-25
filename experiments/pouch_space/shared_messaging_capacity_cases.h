@@ -578,8 +578,11 @@ static void shared_autonomous_capacity(const char *directory, int codec,
           (cycle == CYCLES || churn_expired(&owners[peer], &e)))
         break;
       if (real_clock(CLOCK_MONOTONIC) - start >= 24) {
-        fprintf(stderr, "worker: allocated=%llu checkpoints=%llu pressure=%d\n",
+        fprintf(stderr, "worker: allocated=%llu retired=%llu live=%llu "
+                        "checkpoints=%llu pressure=%d\n",
                 (unsigned long long)stats.allocated_bytes,
+                (unsigned long long)stats.retired_bytes,
+                (unsigned long long)stats.live_bytes,
                 (unsigned long long)stats.checkpoints,
                 ps_maintenance_pressure_requested(space));
         REQUIRE(0);
@@ -592,10 +595,13 @@ static void shared_autonomous_capacity(const char *directory, int codec,
       longest_wait = waited;
     checkpoints = stats.checkpoints;
     if (getenv("POUCH_SPACE_CHURN_TRACE"))
-      fprintf(stderr, "worker cycle=%llu allocated=%llu checkpoints=%llu\n",
+      fprintf(stderr, "worker cycle=%llu allocated=%llu retired=%llu "
+                      "checkpoints=%llu pressure=%d\n",
               (unsigned long long)cycle,
               (unsigned long long)stats.allocated_bytes,
-              (unsigned long long)checkpoints);
+              (unsigned long long)stats.retired_bytes,
+              (unsigned long long)checkpoints,
+              ps_maintenance_pressure_requested(space));
     if (stats.allocated_bytes > peak)
       peak = stats.allocated_bytes;
     churn_read_state(&owners[peer], "stable", 1000, &e);

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "../../tests/support/lc_test_barrier.h"
 #include "../../tests/support/lc_test_tmp.h"
 #include "collection_segment.h"
 #include "lc_api_internal.h"
@@ -11,7 +12,7 @@
 #include "lc_pouch_internal.h"
 #include "lc_pouch_storage.h"
 #include "root.h"
-#include <pthread.h>
+#include "space_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

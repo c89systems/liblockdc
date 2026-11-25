@@ -23,7 +23,7 @@ if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     add_test(NAME pouch_space_platform
       COMMAND pouch_space_platform_test ${CMAKE_CURRENT_BINARY_DIR})
     set_tests_properties(pouch_space_platform PROPERTIES TIMEOUT 90
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endif()
 endif()
 
@@ -45,7 +45,7 @@ if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
       add_test(NAME pouch_space_coordination_${mode}
         COMMAND pouch_space_coordination_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
       set_tests_properties(pouch_space_coordination_${mode} PROPERTIES TIMEOUT 120
-        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        LABELS "unit;local;pouch-space")
     endforeach()
   endif()
 endif()
@@ -89,9 +89,10 @@ if(LOCKDC_BUILD_TESTS)
   add_executable(pouch_space_client_test client_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_client_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_client_test PRIVATE pouch_space_experiment)
+  lc_wrap_unit_symbols(pouch_space_client_test fsync)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(pouch_space_client_test PRIVATE
-      "LINKER:--wrap=pthread_mutex_init"
+      "LINKER:--wrap=pthread_mutex_init" "LINKER:--wrap=fdatasync"
       "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
       "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   endif()
@@ -104,6 +105,22 @@ if(LOCKDC_BUILD_TESTS)
   target_link_libraries(pouch_space_compaction_test PRIVATE pouch_space_test_experiment)
   lc_configure_c_test_target(pouch_space_compaction_test)
 endif()
+
+if(LOCKDC_BUILD_TESTS)
+  add_executable(pouch_space_collection_test collection_test.c
+    ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_collection_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_collection_test PRIVATE pouch_space_experiment)
+  lc_wrap_unit_symbols(pouch_space_collection_test
+    lc_alloc_with_allocator lc_calloc_with_allocator lc_realloc_with_allocator
+    lc_strdup_with_allocator fsync)
+  lc_configure_c_test_target(pouch_space_collection_test)
+endif()
+set(pouch_space_collection_cases
+  units unit-faults unit-concurrency records record-faults workspace
+  workspace-faults walk walk-faults transform transform-concurrency)
+set(pouch_space_collection_fault_cases transform-faults transform-prepare-faults)
+set(pouch_space_collection_fault_timeout 180)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   add_custom_target(pouch_space_smoke
@@ -161,6 +178,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
       pouch_space_darwin_case(pouch_space_compaction_${backend}
         pouch_space_compaction_test 90 ${backend})
     endforeach()
+    if(TARGET pouch_space_collection_test)
+      add_dependencies(pouch_space_smoke pouch_space_collection_test)
+      pouch_space_darwin_case(pouch_space_collection_storage
+        pouch_space_collection_test 120)
+      foreach(mode IN LISTS pouch_space_collection_cases)
+        pouch_space_darwin_case(pouch_space_collection_${mode}
+          pouch_space_collection_test 600 ${mode})
+      endforeach()
+      foreach(mode IN LISTS pouch_space_collection_fault_cases)
+        pouch_space_darwin_case(pouch_space_collection_${mode}
+          pouch_space_collection_test ${pouch_space_collection_fault_timeout} ${mode})
+      endforeach()
+    endif()
     if(NOT CMAKE_CROSSCOMPILING)
       lc_apply_test_defaults()
     endif()
@@ -168,6 +198,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(bundle_targets
       pouch_space_platform_test pouch_space_coordination_test pouch_space_test
       pouch_space_lease_test pouch_space_client_test pouch_space_compaction_test)
+    if(TARGET pouch_space_collection_test)
+      list(APPEND bundle_targets pouch_space_collection_test)
+    endif()
     set(bundle_files)
     foreach(target IN LISTS bundle_targets)
       list(APPEND bundle_files "$<TARGET_FILE:${target}>")
@@ -190,6 +223,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 endif()
 
 if(LOCKDC_BUILD_BENCHMARKS)
+  # Count comparisons as correctness checks in CTest. Keep them ordered
+  # against one another and schedule them before the short-test tail.
+  set(pouch_space_comparison_schedule RESOURCE_LOCK pouch_space_comparison COST 12)
   add_executable(pouch_space_control_compare control_compare.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_control_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_control_compare PRIVATE pouch_space_experiment)
@@ -201,7 +237,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
       add_test(NAME pouch_space_control_compare_${mode}
         COMMAND pouch_space_control_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 16)
       set_tests_properties(pouch_space_control_compare_${mode} PROPERTIES TIMEOUT 60
-        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
     endforeach()
   endif()
   add_executable(pouch_space_compare compare.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
@@ -223,27 +259,27 @@ if(LOCKDC_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_BINARY_DIR} 24 65536 0 8 --reopen --rounds 16
         --stable-index --reclaim)
     set_tests_properties(pouch_space_compare_runtime-shared-index_pressure
-      PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
     foreach(mode pouch-shared-index runtime-shared-index)
       add_test(NAME pouch_space_compare_${mode}_extended_rounds
         COMMAND pouch_space_lifecycle_compare ${mode}
           ${CMAKE_CURRENT_BINARY_DIR} 8 65536 0 2 --reopen --rounds 27
           --stable-index --reclaim)
       set_tests_properties(pouch_space_compare_${mode}_extended_rounds
-        PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
       foreach(sync 0 1)
         add_test(NAME pouch_space_compare_${mode}_parallel_joins_${sync}
           COMMAND pouch_space_lifecycle_compare ${mode}
             ${CMAKE_CURRENT_BINARY_DIR} 8 8192 ${sync} 4 --rounds 3
             --stable-index --parallel-joins)
         set_tests_properties(pouch_space_compare_${mode}_parallel_joins_${sync}
-          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
         add_test(NAME pouch_space_compare_${mode}_reclaim_${sync}
           COMMAND pouch_space_lifecycle_compare ${mode}
             ${CMAKE_CURRENT_BINARY_DIR} 16 65536 ${sync} 2 --reopen --rounds 12
             --stable-index --reclaim)
         set_tests_properties(pouch_space_compare_${mode}_reclaim_${sync}
-          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
       endforeach()
     endforeach()
     foreach(mode pouch-index runtime-index)
@@ -252,13 +288,13 @@ if(LOCKDC_BUILD_BENCHMARKS)
           COMMAND pouch_space_lifecycle_compare ${mode}
             ${CMAKE_CURRENT_BINARY_DIR} 8 65536 ${sync} 4 --reopen --rounds 4)
         set_tests_properties(pouch_space_compare_${mode}_churn_${sync}
-          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
         add_test(NAME pouch_space_compare_${mode}_stable_${sync}
           COMMAND pouch_space_lifecycle_compare ${mode}
             ${CMAKE_CURRENT_BINARY_DIR} 8 65536 ${sync} 4 --reopen --rounds 4
             --stable-index)
         set_tests_properties(pouch_space_compare_${mode}_stable_${sync}
-          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
       endforeach()
     endforeach()
   endif()
@@ -279,7 +315,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
             COMMAND pouch_space_lifecycle_compare ${mode}
               ${CMAKE_CURRENT_BINARY_DIR} 4 4096 ${sync} 2 ${reopen_args})
           set_tests_properties(pouch_space_compare_${mode}_${sync}_${reopen}
-            PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+            PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
         endforeach()
       endforeach()
     endforeach()
@@ -289,19 +325,19 @@ if(LOCKDC_BUILD_BENCHMARKS)
       add_test(NAME pouch_space_compare_${mode}
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 12 4096 0 2 4096)
       set_tests_properties(pouch_space_compare_${mode} PROPERTIES TIMEOUT 60
-        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
       add_test(NAME pouch_space_compare_${mode}_durable
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 8 65536 1 2 4096)
       set_tests_properties(pouch_space_compare_${mode}_durable PROPERTIES TIMEOUT 60
-        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
       add_test(NAME pouch_space_compare_${mode}_reopened
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 12 4096 0 2 4096 --reopen)
       set_tests_properties(pouch_space_compare_${mode}_reopened PROPERTIES TIMEOUT 60
-        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
       add_test(NAME pouch_space_compare_${mode}_reopened_durable
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 8 65536 1 2 4096 --reopen)
       set_tests_properties(pouch_space_compare_${mode}_reopened_durable PROPERTIES TIMEOUT 60
-        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        LABELS "unit;local;pouch-space" ${pouch_space_comparison_schedule})
     endforeach()
   endif()
 endif()
@@ -342,8 +378,10 @@ if(LOCKDC_BUILD_TESTS)
     add_test(NAME pouch_space_live-allocator_${mode}
       COMMAND pouch_space_live_allocator_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_live-allocator_${mode} PROPERTIES TIMEOUT 120
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
+  set_tests_properties(pouch_space_live-allocator_readiness-sync-timeout
+    PROPERTIES RUN_SERIAL TRUE)
   add_executable(pouch_space_physical_claim_test physical_claim_test.c)
   target_include_directories(pouch_space_physical_claim_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_physical_claim_test PRIVATE pouch_space_experiment)
@@ -356,7 +394,7 @@ if(LOCKDC_BUILD_TESTS)
     add_test(NAME pouch_space_physical-claims_${mode}
       COMMAND pouch_space_physical_claim_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_physical-claims_${mode} PROPERTIES TIMEOUT 120
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
   add_executable(pouch_space_reader_pin_test reader_pin_test.c)
   target_include_directories(pouch_space_reader_pin_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -377,25 +415,21 @@ if(LOCKDC_BUILD_TESTS)
     add_test(NAME pouch_space_reader-pins_${mode}
       COMMAND pouch_space_reader_pin_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_reader-pins_${mode} PROPERTIES TIMEOUT 240
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
-  add_executable(pouch_space_collection_test collection_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
-  target_include_directories(pouch_space_collection_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  target_link_libraries(pouch_space_collection_test PRIVATE pouch_space_experiment)
-  target_link_options(pouch_space_collection_test PRIVATE
-    "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
-    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
-  lc_configure_c_test_target(pouch_space_collection_test)
   add_test(NAME pouch_space_collection_storage COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR})
-  set_tests_properties(pouch_space_collection_storage PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
-  foreach(mode units unit-faults unit-concurrency records record-faults workspace workspace-faults walk walk-faults transform transform-faults transform-prepare-faults transform-concurrency)
+  set_tests_properties(pouch_space_collection_storage PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space")
+  foreach(mode IN LISTS pouch_space_collection_cases pouch_space_collection_fault_cases)
+    set(timeout_seconds 600)
+    if(mode IN_LIST pouch_space_collection_fault_cases)
+      set(timeout_seconds ${pouch_space_collection_fault_timeout})
+    endif()
     add_test(NAME pouch_space_collection_${mode}
       COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-    set_tests_properties(pouch_space_collection_${mode} PROPERTIES TIMEOUT 600
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    set_tests_properties(pouch_space_collection_${mode} PROPERTIES TIMEOUT ${timeout_seconds}
+      LABELS "unit;local;pouch-space")
   endforeach()
-  set_tests_properties(pouch_space_collection_transform-faults
-    pouch_space_collection_transform-prepare-faults PROPERTIES TIMEOUT 1800)
+  # SDK fixtures use separate temporary roots and process-local failure hooks.
   foreach(surface queue outbox xa query collection-query)
     if(surface STREQUAL "queue")
       set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_pouch.c)
@@ -588,7 +622,7 @@ if(LOCKDC_BUILD_TESTS)
       add_test(NAME pouch_space_native_queue_sdk
         COMMAND lc_unit_pouch ${behavior_cases})
       set_tests_properties(pouch_space_native_queue_sdk PROPERTIES TIMEOUT 180
-        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        LABELS "unit;local;pouch-space")
     endif()
     foreach(codec RANGE 0 3)
       foreach(sync RANGE 0 1)
@@ -600,7 +634,7 @@ if(LOCKDC_BUILD_TESTS)
           COMMAND pouch_space_${surface}_sdk_test
             ${behavior_cases})
         set_tests_properties(pouch_space_${surface}_sdk_${codec}_${sync}
-          PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+          PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space"
             ENVIRONMENT "POUCH_SPACE_TEST_CODEC=${codec};POUCH_SPACE_TEST_SYNC=${sync};${index_environment}")
         set(conversion_cases)
         if(surface STREQUAL "queue")
@@ -616,7 +650,7 @@ if(LOCKDC_BUILD_TESTS)
           add_test(NAME pouch_space_root_conversion_${surface}_${codec}_${sync}
             COMMAND pouch_space_${surface}_sdk_test ${conversion_cases})
           set_tests_properties(pouch_space_root_conversion_${surface}_${codec}_${sync}
-            PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+            PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space"
               ENVIRONMENT "POUCH_SPACE_TEST_CODEC=${codec};POUCH_SPACE_TEST_SYNC=${sync};POUCH_SPACE_TEST_CONVERT=1")
         endif()
         if(surface STREQUAL "queue")
@@ -625,7 +659,7 @@ if(LOCKDC_BUILD_TESTS)
               test_client_queue_watch_polling_detects_change
               test_client_queue_watch_detects_transaction_ack_commit)
           set_tests_properties(pouch_space_queue_notifications_${codec}_${sync}
-            PROPERTIES TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+            PROPERTIES TIMEOUT 60 LABELS "unit;local;pouch-space"
               ENVIRONMENT "POUCH_SPACE_TEST_CODEC=${codec};POUCH_SPACE_TEST_SYNC=${sync};POUCH_SPACE_TEST_WATCH=1")
         endif()
       endforeach()
@@ -637,48 +671,49 @@ if(LOCKDC_BUILD_TESTS)
   target_link_libraries(pouch_space_collection_sdk_test PRIVATE pouch_space_test_experiment)
   target_link_options(pouch_space_collection_sdk_test PRIVATE
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
-    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
+    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator"
+    "LINKER:--wrap=fsync")
   lc_configure_c_test_target(pouch_space_collection_sdk_test)
   add_test(NAME pouch_space_collection_sdk COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR})
-  set_tests_properties(pouch_space_collection_sdk PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  set_tests_properties(pouch_space_collection_sdk PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_root_conversion COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion)
-  set_tests_properties(pouch_space_root_conversion PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  set_tests_properties(pouch_space_root_conversion PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_root_conversion-growth COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-growth)
-  set_tests_properties(pouch_space_root_conversion-growth PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  set_tests_properties(pouch_space_root_conversion-growth PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
   foreach(codec RANGE 0 3)
     foreach(sync RANGE 0 1)
       add_test(NAME pouch_space_root_conversion-faults_${codec}_${sync}
         COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-faults ${codec} ${sync})
-      set_tests_properties(pouch_space_root_conversion-faults_${codec}_${sync} PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      set_tests_properties(pouch_space_root_conversion-faults_${codec}_${sync} PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space")
       if(codec EQUAL 0 OR codec EQUAL 3)
         add_test(NAME pouch_space_collection_shared-catalog_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} shared-catalog ${codec} ${sync})
         set_tests_properties(pouch_space_collection_shared-catalog_${codec}_${sync} PROPERTIES
-          TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          TIMEOUT 60 LABELS "unit;local;pouch-space")
         add_test(NAME pouch_space_collection_shared-orphans_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} shared-orphans ${codec} ${sync})
         set_tests_properties(pouch_space_collection_shared-orphans_${codec}_${sync} PROPERTIES
-          TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          TIMEOUT 60 LABELS "unit;local;pouch-space")
         add_test(NAME pouch_space_collection_shared-append_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} shared-append ${codec} ${sync})
         set_tests_properties(pouch_space_collection_shared-append_${codec}_${sync} PROPERTIES
-          TIMEOUT 90 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          TIMEOUT 90 LABELS "unit;local;pouch-space")
         add_test(NAME pouch_space_collection_shared-capacity_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} shared-capacity ${codec} ${sync})
         set_tests_properties(pouch_space_collection_shared-capacity_${codec}_${sync} PROPERTIES
-          TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          TIMEOUT 180 LABELS "unit;local;pouch-space")
         add_test(NAME pouch_space_root_conversion-crash_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-crash ${codec} ${sync})
-        set_tests_properties(pouch_space_root_conversion-crash_${codec}_${sync} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        set_tests_properties(pouch_space_root_conversion-crash_${codec}_${sync} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
         add_test(NAME pouch_space_root_conversion-controls_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-controls ${codec} ${sync})
-        set_tests_properties(pouch_space_root_conversion-controls_${codec}_${sync} PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        set_tests_properties(pouch_space_root_conversion-controls_${codec}_${sync} PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space")
       endif()
       foreach(mode maintenance maintenance-io maintenance-allocation background background-io background-allocation)
         add_test(NAME pouch_space_collection_${mode}_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${codec} ${sync})
         set_tests_properties(pouch_space_collection_${mode}_${codec}_${sync} PROPERTIES
-          TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          TIMEOUT 1200 LABELS "unit;local;pouch-space")
       endforeach()
       foreach(mode query query-io query-allocation)
         if((codec EQUAL 1 OR codec EQUAL 2) AND NOT mode STREQUAL "query")
@@ -688,29 +723,34 @@ if(LOCKDC_BUILD_TESTS)
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR}
             ${mode} ${codec} ${sync})
         set_tests_properties(pouch_space_collection_${mode}_${codec}_${sync}
-          PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space")
       endforeach()
       add_test(NAME pouch_space_collection_io_${codec}_${sync}
         COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} io ${codec} ${sync})
       set_tests_properties(pouch_space_collection_io_${codec}_${sync} PROPERTIES
-        TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        TIMEOUT 1200 LABELS "unit;local;pouch-space")
       add_test(NAME pouch_space_collection_allocation_${codec}_${sync}
         COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} allocation ${codec} ${sync})
       set_tests_properties(pouch_space_collection_allocation_${codec}_${sync} PROPERTIES
-        TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        TIMEOUT 1200 LABELS "unit;local;pouch-space")
     endforeach()
   endforeach()
   foreach(mode lifecycle phases policy protection fairness concurrency coordinated capacity-completion capacity-required attachment-windows release-barrier recovery-retirement stage-barrier stage-delete-renew shared-authority shared-queue-delivery shared-queue-transaction shared-outbox-handoff shared-outbox-recovery shared-outbox-completion)
     add_test(NAME pouch_space_lease_${mode} COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-    set_tests_properties(pouch_space_lease_${mode} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    set_tests_properties(pouch_space_lease_${mode} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
   endforeach()
   if(LOCKDC_BUILD_BENCHMARKS)
-    add_test(NAME pouch_space_lease_compare COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} compare)
-    set_tests_properties(pouch_space_lease_compare PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    # Exercise every profile in both backend orders. The direct compare mode
+    # takes five samples for benchmarking.
+    add_test(NAME pouch_space_lease_compare
+      COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} compare-correctness)
+    set_tests_properties(pouch_space_lease_compare PROPERTIES
+      TIMEOUT 240 COST 60 LABELS "unit;local;pouch-space"
+      RESOURCE_LOCK pouch_space_comparison)
   endif()
   foreach(crypto 0 1 2 3)
     add_test(NAME pouch_space_lease_process-${crypto} COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} process-${crypto})
-    set_tests_properties(pouch_space_lease_process-${crypto} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    set_tests_properties(pouch_space_lease_process-${crypto} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
     foreach(native 0 1)
       foreach(sync 0 1)
         foreach(cold 0 1)
@@ -718,7 +758,7 @@ if(LOCKDC_BUILD_TESTS)
             add_test(NAME pouch_space_lease_allocation-${crypto}-${native}-${sync}-${cold}-${no_error}
               COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} allocation-${crypto} ${native} ${sync} ${cold} ${no_error})
             set_tests_properties(pouch_space_lease_allocation-${crypto}-${native}-${sync}-${cold}-${no_error}
-              PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+              PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space")
           endforeach()
         endforeach()
       endforeach()
@@ -727,7 +767,7 @@ if(LOCKDC_BUILD_TESTS)
       add_test(NAME pouch_space_lease_io-${crypto}-${sync}
         COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} io-${crypto}-${sync})
       set_tests_properties(pouch_space_lease_io-${crypto}-${sync}
-        PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space")
       set(shared_modes shared-queue-pressure shared-outbox-pressure)
       if(crypto EQUAL 0 OR crypto EQUAL 3)
         list(APPEND shared_modes shared-messaging-capacity shared-autonomous-capacity shared-unpaced-capacity shared-concurrent-capacity shared-lease-pressure)
@@ -736,13 +776,23 @@ if(LOCKDC_BUILD_TESTS)
         add_test(NAME pouch_space_lease_${mode}_${crypto}_${sync}
           COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${crypto} ${sync})
         set_tests_properties(pouch_space_lease_${mode}_${crypto}_${sync}
-          PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
+        if(mode STREQUAL "shared-concurrent-capacity")
+          # The two lanes and the real compactor exercise bounded namespace
+          # handoff on the same inode. Keep unrelated disk load out of it.
+          set_tests_properties(pouch_space_lease_${mode}_${crypto}_${sync}
+            PROPERTIES RUN_SERIAL TRUE)
+        endif()
       endforeach()
     endforeach()
   endforeach()
   foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-progress retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare outbox-markers outbox-notifications outbox-marker-io-faults outbox-marker-allocation-faults outbox-marker-crash outbox-marker-concurrency)
     add_test(NAME pouch_space_client_${mode} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-    set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space")
+    if(mode MATCHES "compare$")
+      set_tests_properties(pouch_space_client_${mode} PROPERTIES
+        RESOURCE_LOCK pouch_space_comparison COST 12)
+    endif()
   endforeach()
   set_tests_properties(pouch_space_client_outbox-marker-crash PROPERTIES TIMEOUT 300)
   foreach(codec RANGE 0 3)
@@ -753,7 +803,7 @@ if(LOCKDC_BUILD_TESTS)
       add_test(NAME pouch_space_client_${mode}_${codec}
         COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
       set_tests_properties(pouch_space_client_${mode}_${codec} PROPERTIES
-        TIMEOUT 900 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+        TIMEOUT 900 LABELS "unit;local;pouch-space"
         ENVIRONMENT "POUCH_INDEX_CODEC=${codec}")
     endforeach()
     foreach(mode xa-durability xa-io-faults xa-allocation-faults
@@ -766,10 +816,22 @@ if(LOCKDC_BUILD_TESTS)
          mode MATCHES "(io-faults|allocation-faults|crash)$")
         continue()
       endif()
+      if(mode STREQUAL "xa-crash")
+        # Each pair of durability and ownership settings has an isolated root.
+        foreach(profile RANGE 0 3)
+          set(name pouch_space_client_xa-crash_${codec}_${profile})
+          add_test(NAME ${name}
+            COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} xa-crash)
+          set_tests_properties(${name} PROPERTIES TIMEOUT 900 COST 120
+            LABELS "unit;local;pouch-space"
+            ENVIRONMENT "POUCH_XA_CODEC=${codec};POUCH_XA_CRASH_PROFILE=${profile}")
+        endforeach()
+        continue()
+      endif()
       add_test(NAME pouch_space_client_${mode}_${codec}
         COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
       set_tests_properties(pouch_space_client_${mode}_${codec} PROPERTIES
-        TIMEOUT 900 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+        TIMEOUT 900 LABELS "unit;local;pouch-space"
         ENVIRONMENT "POUCH_XA_CODEC=${codec}")
     endforeach()
   endforeach()
@@ -782,11 +844,12 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_frame_test)
   foreach(mode codec writer recovery checkpoint-handoff)
     add_test(NAME pouch_space_frames_${mode} COMMAND pouch_space_frame_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-    set_tests_properties(pouch_space_frames_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    set_tests_properties(pouch_space_frames_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space")
   endforeach()
   add_executable(pouch_space_pouch_test pouch_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_pouch_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_pouch_test PRIVATE pouch_space_experiment)
+  lc_wrap_unit_symbols(pouch_space_pouch_test fsync fdatasync)
   target_link_options(pouch_space_pouch_test PRIVATE
     "LINKER:--wrap=OPENSSL_init_crypto"
     "LINKER:--wrap=clock_gettime"
@@ -796,7 +859,7 @@ if(LOCKDC_BUILD_TESTS)
   foreach(mode lifecycle body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetimes lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-close maintenance-tail maintenance-capacity-schedule maintenance-checksums maintenance-append-pressure maintenance-checkpoint-batch shared-state)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 240
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
   # Thousands of independent cold/warm allocation failures also run under TSAN.
   set_tests_properties(pouch_space_pouch_read-faults PROPERTIES TIMEOUT 600)
@@ -804,7 +867,7 @@ if(LOCKDC_BUILD_TESTS)
   set_tests_properties(pouch_space_pouch_staging-faults PROPERTIES TIMEOUT 600)
   foreach(mode staging-active-faults staging-active-recovery-faults shared-admission shared-state-crash shared-state-delta append-hint)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-    set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space")
   endforeach()
   foreach(crypto 0 1 2 3)
     foreach(sync 0 1)
@@ -812,7 +875,7 @@ if(LOCKDC_BUILD_TESTS)
         add_test(NAME pouch_space_pouch_staging-crash-${crypto}-${sync}-${rotation}
           COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} staging-crash-matrix ${crypto} ${sync} ${rotation})
         set_tests_properties(pouch_space_pouch_staging-crash-${crypto}-${sync}-${rotation}
-          PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
       endforeach()
     endforeach()
   endforeach()
@@ -820,6 +883,7 @@ if(LOCKDC_BUILD_TESTS)
   add_executable(pouch_space_namespace_test namespace_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_namespace_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_namespace_test PRIVATE pouch_space_experiment)
+  lc_wrap_unit_symbols(pouch_space_namespace_test fsync fdatasync)
   target_link_options(pouch_space_namespace_test PRIVATE
     "LINKER:--wrap=ps_coordination_open" "LINKER:--wrap=pthread_cond_wait"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
@@ -829,17 +893,17 @@ if(LOCKDC_BUILD_TESTS)
     add_test(NAME pouch_space_namespace_${mode}
       COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_namespace_${mode} PROPERTIES TIMEOUT 120
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
   set_tests_properties(pouch_space_namespace_conversion-faults pouch_space_namespace_compound-recode-faults pouch_space_namespace_body-budget-faults pouch_space_namespace_append-budget-faults pouch_space_namespace_batch-faults PROPERTIES TIMEOUT 600)
   add_test(NAME pouch_space_namespace_shared-successor
     COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} shared-successor)
   set_tests_properties(pouch_space_namespace_shared-successor PROPERTIES
-    TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    TIMEOUT 120 LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_namespace_rolled-sources
     COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} rolled-sources)
   set_tests_properties(pouch_space_namespace_rolled-sources PROPERTIES
-    TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    TIMEOUT 120 LABELS "unit;local;pouch-space")
   add_executable(pouch_space_state_record_test state_record_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_state_record_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_state_record_test PRIVATE pouch_space_experiment)
@@ -851,7 +915,7 @@ if(LOCKDC_BUILD_TESTS)
     add_test(NAME pouch_space_state_records_${mode}
       COMMAND pouch_space_state_record_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_state_records_${mode} PROPERTIES TIMEOUT 120
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
   add_executable(pouch_space_root_test root_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_root_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -867,7 +931,7 @@ if(LOCKDC_BUILD_TESTS)
     add_test(NAME pouch_space_root_${mode}
       COMMAND pouch_space_root_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_root_${mode} PROPERTIES TIMEOUT 120
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
   add_executable(pouch_space_control_test control_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_control_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -875,7 +939,7 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_control_test)
   add_test(NAME pouch_space_controls COMMAND pouch_space_control_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(pouch_space_controls PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   add_executable(pouch_space_record_test record_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_record_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_record_test PRIVATE pouch_space_experiment)
@@ -889,12 +953,12 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_record_test)
   add_test(NAME pouch_space_records COMMAND pouch_space_record_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(pouch_space_records PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   add_executable(pouch_space_crc_test crc_test.c)
   target_link_libraries(pouch_space_crc_test PRIVATE pouch_space_experiment)
   lc_configure_c_test_target(pouch_space_crc_test)
   add_test(NAME pouch_space_crc COMMAND pouch_space_crc_test)
-  set_tests_properties(pouch_space_crc PROPERTIES TIMEOUT 30 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  set_tests_properties(pouch_space_crc PROPERTIES TIMEOUT 30 LABELS "unit;local;pouch-space")
 
   add_executable(pouch_space_directory_test directory_test.c)
   target_link_libraries(pouch_space_directory_test PRIVATE pouch_space_experiment)
@@ -904,54 +968,54 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_directory_test)
   add_test(NAME pouch_space_directory COMMAND pouch_space_directory_test)
   set_tests_properties(pouch_space_directory PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
   add_test(NAME pouch_space_checkpoint-idempotence
     COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} checkpoint-idempotence)
   set_tests_properties(pouch_space_checkpoint-idempotence PROPERTIES TIMEOUT 60
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   foreach(mode native-metadata native-metadata-faults native-metadata-concurrency native-metadata-shared-reserve)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-    set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
   endforeach()
   foreach(mode revision revision-faults revision-concurrency revision-process revision-values checkpoint-records checkpoint-owner checkpoint-ranges checkpoint-namespace checkpoint-faults checkpoint-large-group checkpoint-history stream-pieces stream-piece-repair owned-repack stream-repack owned-bitmap owned-page-packing namespace-repack namespace-repack-concurrency namespace-repack-shared-refresh namespace-repack-churn namespace-tail namespace-tail-faults namespace-tail-concurrency namespace-abandoned namespace-abandoned-empty namespace-abandoned-faults namespace-abandoned-concurrency standing-prefix standing-owners standing-capacity standing-concurrency standing-deletion root-covered-admission root-obligations root-obligation-faults owned-repack-faults)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
   set_tests_properties(pouch_space_checkpoint-faults PROPERTIES TIMEOUT 600)
   foreach(mode namespace-active-retirement namespace-active-retirement-faults)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
   add_test(NAME pouch_space_budget COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} budget)
   add_test(NAME pouch_space_budget-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} budget-capacity)
   foreach(mode value-budget value-budget-capacity value-budget-faults value-budget-concurrency value-budget-process)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      LABELS "unit;local;pouch-space")
   endforeach()
   add_test(NAME pouch_space_grant-budget COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} grant-budget)
   add_test(NAME pouch_space_append-budget COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} append-budget)
   set_tests_properties(pouch_space_append-budget PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_grant-budget-faults COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} grant-budget-faults)
   set_tests_properties(pouch_space_grant-budget pouch_space_grant-budget-faults PROPERTIES TIMEOUT 600
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_budget pouch_space_budget-capacity PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_reopen COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen)
   add_test(NAME pouch_space_reopen-portable COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-portable)
   set_tests_properties(pouch_space_reopen-portable PROPERTIES TIMEOUT 30
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_reopen-sanitize COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-sanitize)
   set_tests_properties(pouch_space_reopen-sanitize PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_reopen-ordering COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-ordering)
   set_tests_properties(pouch_space_reopen-ordering PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_metadata COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata)
   add_test(NAME pouch_space_metadata-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity)
   add_test(NAME pouch_space_metadata-capacity-faults COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity-faults)
@@ -965,31 +1029,31 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_lifecycle COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} lifecycle)
   add_test(NAME pouch_space_catalog COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} catalog)
   set_tests_properties(pouch_space_catalog PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_lifecycle PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_streams PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_stream-recovery PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_packing PROPERTIES TIMEOUT 60
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_metadata PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_metadata-capacity PROPERTIES TIMEOUT 240
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_metadata-capacity-faults PROPERTIES TIMEOUT 600
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_metadata-repack pouch_space_metadata-repack-faults pouch_space_metadata-growth PROPERTIES TIMEOUT 240
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_metadata-growth-faults PROPERTIES TIMEOUT 600
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_reopen PROPERTIES TIMEOUT 30
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_commit PROPERTIES TIMEOUT 30
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_foundation PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    LABELS "unit;local;pouch-space")
 
   # Every executable in this directory participates in the smoke test set.
   # The multifile queue control uses the SDK test from the main test tree.

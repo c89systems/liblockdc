@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
 #include "budget.h"
+#include "fixture_barriers.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_retention_record.h"
@@ -639,6 +640,7 @@ static void faults(const char *directory, int io) {
   char *key = NULL;
   ok(lc_pouch_crypto_generate_key_string(&key, &e), &e);
   size_t total = 0;
+  fixture_barriers_model(1);
   for (int crypto = 0; crypto <= 3; crypto += 3)
     for (int sync = 0; sync < 2; ++sync)
       for (int existing = 0; existing < 2; ++existing)
@@ -652,6 +654,7 @@ static void faults(const char *directory, int io) {
               (void)failure(directory, nth, kind, existing, crypto, sync, key,
                             no_error);
         }
+  fixture_barriers_model(0);
   lc_pouch_crypto_key_string_free(key);
   lc_error_cleanup(&e);
   printf("SDK %s failure sites: %lu\n", io ? "I/O" : "allocation",
@@ -1376,6 +1379,7 @@ static void retention_allocation_faults(const char *directory) {
   lc_error_init(&e);
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/retention-alloc-", directory) <
           (int)sizeof(prefix));
+  fixture_barriers_model(1);
   for (int native = 0; native < 2; ++native)
     for (int sync = 0; sync < 2; ++sync)
       for (int cold = 0; cold < 2; ++cold)
@@ -1442,6 +1446,7 @@ static void retention_allocation_faults(const char *directory) {
               lc_test_tmp_cleanup_path(trial, prefix);
             }
           }
+  fixture_barriers_model(0);
   printf("retention controls: %lu warm/cold allocation cuts, both "
          "owners/policies, "
          "same-owner and close/reopen retry\n",
@@ -1471,11 +1476,11 @@ static ssize_t retention_disk_write(void *context, int fd, const void *p,
   int fail = io_fails(&m->fault);
   size_t want = fail && !m->complete_writes ? n / 2 : n;
   REQUIRE(pwrite(fd, p, want, at) == (ssize_t)want);
-  if (want && !m->frozen) {
+  if (want) {
     for (size_t page = (size_t)at / PS_PAGE;
          page <= ((size_t)at + want - 1) / PS_PAGE; ++page)
       m->dirty[page] = 1;
-    if (fail && m->persist)
+    if (fail && m->persist && !m->frozen)
       memcpy(m->stable + at, p, want);
   }
   if (fail) {
@@ -1488,7 +1493,7 @@ static int retention_disk_sync(void *context, int fd) {
   retention_disk *m = context;
   int fail = io_fails(&m->fault);
   if (!fail || m->persist) {
-    REQUIRE(ps_native_io.sync(NULL, fd) == 0);
+    /* The stable image models which writes a completed barrier preserves. */
     for (size_t page = 0; !m->frozen && page < PS_DEFAULT_CAPACITY / PS_PAGE;
          ++page)
       if (m->dirty[page]) {
@@ -1511,9 +1516,12 @@ static int retention_disk_reserve(void *context, int fd, off_t at, off_t n) {
 static void retention_disk_restore(retention_disk *m, const char *path) {
   int fd = open(path, O_RDWR);
   REQUIRE(fd >= 0);
-  for (size_t at = 0; at < PS_DEFAULT_CAPACITY; at += PS_CHUNK)
-    REQUIRE(pwrite(fd, m->stable + at, PS_CHUNK, (off_t)at) == PS_CHUNK);
-  REQUIRE(ps_native_io.sync(NULL, fd) == 0 && close(fd) == 0);
+  for (size_t page = 0; page < PS_DEFAULT_CAPACITY / PS_PAGE; ++page)
+    if (m->dirty[page]) {
+      size_t at = page * PS_PAGE;
+      REQUIRE(pwrite(fd, m->stable + at, PS_PAGE, (off_t)at) == PS_PAGE);
+    }
+  REQUIRE(!close(fd));
   memset(m->dirty, 0, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
 }
 /* Leave a peer claim holding the largest currently admissible payload.
@@ -1614,6 +1622,7 @@ static void retention_io_faults(const char *directory) {
   lc_error_init(&e);
   REQUIRE(snprintf(path, sizeof(path), "%s/retention-io", directory) <
           (int)sizeof(path));
+  fixture_directory_sync_model(1);
   for (int sync = 0; sync < 2; ++sync)
     for (int persist = 0; persist < 2; ++persist)
       for (int action = 0; action < 9; ++action) {
@@ -1723,6 +1732,7 @@ static void retention_io_faults(const char *directory) {
         printf("retention I/O sync%d persist%d action%d: %lu cuts\n", sync,
                persist, action, (unsigned long)sites);
       }
+  fixture_directory_sync_model(0);
   printf("retention: %lu lost/torn write/barrier/read cuts\n",
          (unsigned long)total);
   free(large);

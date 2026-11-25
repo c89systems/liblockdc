@@ -1,8 +1,10 @@
 #ifndef POUCH_SPACE_COLLECTION_WORKSPACE_CASES_H
 #define POUCH_SPACE_COLLECTION_WORKSPACE_CASES_H
 #include "collection_conversion.h"
+#include "fixture_directory_sync.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 typedef struct workspace_output {
   ps_collection_conversion *work;
@@ -330,56 +332,93 @@ static void workspace_records(const char *directory, const char *key) {
 }
 
 typedef struct workspace_fault {
-  unsigned char *stable;
-  unsigned char *dirty;
+  unsigned char *stable, *live;
+  unsigned char dirty[PS_DEFAULT_CAPACITY / PS_PAGE];
+  unsigned char used[PS_DEFAULT_CAPACITY / PS_PAGE];
   size_t calls, fail;
   int mode;
 } workspace_fault;
+static void workspace_fault_open(workspace_fault *m) {
+  m->stable = calloc(1, PS_DEFAULT_CAPACITY);
+  m->live = calloc(1, PS_DEFAULT_CAPACITY);
+  REQUIRE(m->stable && m->live);
+  fixture_directory_sync_model(1);
+}
+static void workspace_fault_close(workspace_fault *m) {
+  fixture_directory_sync_model(0);
+  free(m->stable);
+  free(m->live);
+}
+static void workspace_fault_reset(workspace_fault *m, int mode) {
+  for (size_t page = 0; page < sizeof(m->used); ++page)
+    if (m->used[page]) {
+      size_t offset = page * PS_PAGE;
+      memset(m->stable + offset, 0, PS_PAGE);
+      memset(m->live + offset, 0, PS_PAGE);
+      m->dirty[page] = m->used[page] = 0;
+    }
+  m->calls = m->fail = 0;
+  m->mode = mode;
+}
+static void workspace_fault_restore(workspace_fault *m) {
+  for (size_t page = 0; page < sizeof(m->dirty); ++page)
+    if (m->dirty[page]) {
+      size_t offset = page * PS_PAGE;
+      memcpy(m->live + offset, m->stable + offset, PS_PAGE);
+      m->dirty[page] = 0;
+    }
+}
 static int workspace_cut(workspace_fault *m) {
   return m->fail && ++m->calls == m->fail;
 }
 static ssize_t workspace_rd(void *context, int fd, void *p, size_t n,
                             off_t at) {
   workspace_fault *m = context;
+  (void)fd;
   if (workspace_cut(m)) {
     errno = EIO;
     return -1;
   }
-  return pread(fd, p, n, at);
+  REQUIRE(at >= 0 && (uint64_t)at <= PS_DEFAULT_CAPACITY &&
+          n <= PS_DEFAULT_CAPACITY - (uint64_t)at);
+  memcpy(p, m->live + at, n);
+  return (ssize_t)n;
 }
 static ssize_t workspace_wr(void *context, int fd, const void *p, size_t n,
                             off_t at) {
   workspace_fault *m = context;
-  REQUIRE(at >= 0 && (uint64_t)at + n <= 10 * PS_MIB);
+  (void)fd;
+  REQUIRE(at >= 0 && (uint64_t)at <= PS_DEFAULT_CAPACITY &&
+          n <= PS_DEFAULT_CAPACITY - (uint64_t)at);
   for (size_t page = (size_t)at / PS_PAGE;
        page < ((size_t)at + n + PS_PAGE - 1) / PS_PAGE; ++page)
-    m->dirty[page] = 1;
+    m->dirty[page] = m->used[page] = 1;
   if (workspace_cut(m)) {
     if (m->mode >= 2 && n > 1) {
-      REQUIRE(pwrite(fd, p, n / 2, at) == (ssize_t)(n / 2));
+      memcpy(m->live + at, p, n / 2);
       if (m->mode == 3)
         memcpy(m->stable + at, p, n / 2);
     }
     errno = EIO;
     return -1;
   }
-  return pwrite(fd, p, n, at);
+  memcpy(m->live + at, p, n);
+  return (ssize_t)n;
 }
 static int workspace_sync(void *context, int fd) {
   workspace_fault *m = context;
+  (void)fd;
   if (workspace_cut(m)) {
     errno = EIO;
     return -1;
   }
-  int rc = fdatasync(fd);
-  if (!rc)
-    for (size_t page = 0; page < 10 * PS_MIB / PS_PAGE; ++page)
-      if (m->dirty[page]) {
-        REQUIRE(pread(fd, m->stable + page * PS_PAGE, PS_PAGE,
-                      page * PS_PAGE) == PS_PAGE);
-        m->dirty[page] = 0;
-      }
-  return rc;
+  for (size_t page = 0; page < sizeof(m->dirty); ++page)
+    if (m->dirty[page]) {
+      size_t offset = page * PS_PAGE;
+      memcpy(m->stable + offset, m->live + offset, PS_PAGE);
+      m->dirty[page] = 0;
+    }
+  return 0;
 }
 static int workspace_reserve(void *context, int fd, off_t at, off_t length) {
   workspace_fault *m = context;
@@ -387,7 +426,12 @@ static int workspace_reserve(void *context, int fd, off_t at, off_t length) {
     errno = EIO;
     return -1;
   }
-  return posix_fallocate(fd, at, length) ? (errno = ENOSPC, -1) : 0;
+  struct stat st;
+  if (fstat(fd, &st))
+    return -1;
+  if (st.st_size >= at + length)
+    return 0;
+  return ftruncate(fd, at + length);
 }
 static void workspace_fill(ps_collection_segment *segment, lc_error *e) {
   unsigned char bytes[128];
@@ -398,14 +442,12 @@ static void workspace_fill(ps_collection_segment *segment, lc_error *e) {
   ok(ps_collection_segment_seal(segment, e), e);
 }
 static size_t workspace_fault_trial(const char *directory, const char *key_text,
-                                    int sync, int stage, int mode, size_t cut) {
+                                    workspace_fault *model, int sync, int stage,
+                                    int mode, size_t cut) {
   char path[1024];
   REQUIRE(snprintf(path, sizeof(path), "%s/workspace-fault", directory) > 0);
-  workspace_fault model = {.stable = calloc(1, 10 * PS_MIB),
-                           .dirty = calloc(1, 10 * PS_MIB / PS_PAGE),
-                           .mode = mode};
-  REQUIRE(model.stable && model.dirty);
-  ps_io io = {&model,         workspace_rd,      workspace_wr,
+  workspace_fault_reset(model, mode);
+  ps_io io = {model,          workspace_rd,      workspace_wr,
               workspace_sync, workspace_reserve, NULL};
   ps_root_options options = {0};
   options.storage.initial_capacity = options.storage.maximum_capacity =
@@ -471,8 +513,8 @@ static size_t workspace_fault_trial(const char *directory, const char *key_text,
   ok(ps_flush(s, &e), &e);
   unit_allocations = 0;
   unit_fail_allocation = mode == 0 ? cut : 0;
-  model.calls = 0;
-  model.fail = mode ? cut : 0;
+  model->calls = 0;
+  model->fail = mode ? cut : 0;
   int rc;
   uint64_t removed = 999;
   switch (stage) {
@@ -502,20 +544,16 @@ static size_t workspace_fault_trial(const char *directory, const char *key_text,
     rc = ps_collection_conversion_reclaim(s, collection, &e);
     break;
   }
-  size_t calls = mode ? model.calls : unit_allocations;
-  unit_fail_allocation = model.fail = 0;
+  size_t calls = mode ? model->calls : unit_allocations;
+  unit_fail_allocation = model->fail = 0;
   REQUIRE(rc == LC_OK || rc == LC_ERR_NOMEM || rc == LC_ERR_TRANSPORT);
   clear(&e);
   ps_collection_segment_close(candidate);
   ps_collection_conversion_close(w);
   ps_collection_segment_close(source);
   ok(ps_root_close(root, &e), &e);
-  if (mode) {
-    int fd = open(path, O_RDWR | O_CLOEXEC);
-    REQUIRE(fd >= 0 &&
-            pwrite(fd, model.stable, 10 * PS_MIB, 0) == 10 * PS_MIB &&
-            !fdatasync(fd) && !close(fd));
-  }
+  if (mode)
+    workspace_fault_restore(model);
   ok(ps_root_open(path, 0, &options, &root, &e), &e);
   s = ps_root_space(root);
   ok(ps_collection_conversion_open(s, collection, target, 1, &w, &e), &e);
@@ -560,8 +598,6 @@ static size_t workspace_fault_trial(const char *directory, const char *key_text,
     lc_pouch_crypto_close(target);
     ok(ps_root_close(root, &e), &e);
     REQUIRE(!unlink(path));
-    free(model.stable);
-    free(model.dirty);
     lc_error_cleanup(&e);
     return calls;
   }
@@ -579,26 +615,27 @@ static size_t workspace_fault_trial(const char *directory, const char *key_text,
   lc_pouch_crypto_close(target);
   ok(ps_root_close(root, &e), &e);
   REQUIRE(!unlink(path));
-  free(model.stable);
-  free(model.dirty);
   lc_error_cleanup(&e);
   return calls;
 }
 static void workspace_faults(const char *directory, const char *key) {
   size_t total = 0;
+  workspace_fault model = {0};
+  workspace_fault_open(&model);
   for (int sync = 0; sync < 2; ++sync)
     for (int stage = 0; stage < 7; ++stage)
       for (int mode = 0; mode < 4; ++mode) {
-        size_t calls =
-            workspace_fault_trial(directory, key, sync, stage, mode, SIZE_MAX);
+        size_t calls = workspace_fault_trial(directory, key, &model, sync,
+                                             stage, mode, SIZE_MAX);
         for (size_t cut = 1; cut <= calls; ++cut) {
-          workspace_fault_trial(directory, key, sync, stage, mode, cut);
+          workspace_fault_trial(directory, key, &model, sync, stage, mode, cut);
           ++total;
         }
         printf("workspace faults sync=%d stage=%d mode=%d cuts=%zu\n", sync,
                stage, mode, calls);
         fflush(stdout);
       }
+  workspace_fault_close(&model);
   REQUIRE(total > 300);
   printf("workspace failure points=%zu\n", total);
 }

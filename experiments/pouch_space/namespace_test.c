@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
 #include "budget.h"
+#include "fixture_barriers.h"
 #include "frame.h"
 #include "lc_api_internal.h"
 #include "namespace.h"
@@ -3531,6 +3532,11 @@ typedef struct run {
 } run;
 static void *worker(void *p) {
   run *r = p;
+  /* These sweeps observe failed I/O and recovery after a same-host reopen. */
+  fixture_barriers_model(!strcmp(r->mode, "recode-faults") ||
+                         !strcmp(r->mode, "body-select-faults") ||
+                         !strcmp(r->mode, "compound-recode-faults") ||
+                         !strcmp(r->mode, "conversion-faults"));
   if (!strcmp(r->mode, "lifecycle"))
     lifecycle(r->path, r->key);
   else if (!strcmp(r->mode, "faults"))
@@ -3614,6 +3620,7 @@ static void *worker(void *p) {
     }
   } else
     concurrency(r->path);
+  fixture_barriers_model(0);
   return NULL;
 }
 int main(int argc, char **argv) {

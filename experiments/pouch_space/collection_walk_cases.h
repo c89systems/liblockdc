@@ -419,8 +419,10 @@ static size_t walk_fault_trial(const char *directory, const char *key,
                                int codec, int sync, int mode, size_t cut) {
   lc_error e;
   lc_error_init(&e);
+  ps_io io = ps_native_io;
+  io.sync = fixture_complete_sync;
   record_fixture *f =
-      record_fixture_open(directory, key, codec, sync, 3, 65537, &e);
+      record_fixture_open_io(directory, key, codec, sync, 3, 65537, &io, 1, &e);
   lc_collection_chunks_reader_close(&f->reader);
   ps_collection_conversion *work = NULL;
   walk_bind_fixture(f, &work, &e);
@@ -461,6 +463,7 @@ static size_t walk_fault_trial(const char *directory, const char *key,
 }
 static void walk_faults(const char *directory, const char *key) {
   size_t total = 0;
+  fixture_directory_sync_model(1);
   {
     lc_error e;
     lc_error_init(&e);
@@ -521,17 +524,21 @@ static void walk_faults(const char *directory, const char *key) {
                mode, calls);
         fflush(stdout);
       }
+  fixture_directory_sync_model(0);
+  workspace_fault model = {0};
+  workspace_fault_open(&model);
   for (int sync = 0; sync < 2; ++sync)
     for (int mode = 0; mode < 4; ++mode) {
-      size_t calls =
-          workspace_fault_trial(directory, key, sync, 7, mode, SIZE_MAX);
+      size_t calls = workspace_fault_trial(directory, key, &model, sync, 7,
+                                           mode, SIZE_MAX);
       for (size_t cut = 1; cut <= calls; ++cut) {
-        workspace_fault_trial(directory, key, sync, 7, mode, cut);
+        workspace_fault_trial(directory, key, &model, sync, 7, mode, cut);
         ++total;
       }
       printf("prune faults sync=%d mode=%d cuts=%zu\n", sync, mode, calls);
       fflush(stdout);
     }
+  workspace_fault_close(&model);
   REQUIRE(total > 300);
   printf("native walk and source disposal fault points=%zu\n", total);
 }

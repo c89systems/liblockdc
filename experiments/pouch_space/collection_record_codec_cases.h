@@ -1,6 +1,7 @@
 #ifndef POUCH_SPACE_COLLECTION_RECORD_CODEC_CASES_H
 #define POUCH_SPACE_COLLECTION_RECORD_CODEC_CASES_H
 #include "control.h"
+#include "fixture_directory_sync.h"
 #include "lc_collection_record_recode.h"
 
 #define RECORD_PARTS 128U
@@ -702,8 +703,10 @@ static size_t record_fault_trial(const char *directory, const char *key,
                                  size_t cut) {
   lc_error e;
   lc_error_init(&e);
+  ps_io io = ps_native_io;
+  io.sync = fixture_complete_sync;
   record_fixture *f =
-      record_fixture_open(directory, key, codec, sync, 3, 65537, &e);
+      record_fixture_open_io(directory, key, codec, sync, 3, 65537, &io, 1, &e);
   lc_collection_recode_stream stream = {.units = 999};
   lc_collection_recode_links links = {0};
   lc_pouch_collection_record body_record, converted = {.generation = 999};
@@ -780,6 +783,7 @@ static size_t record_fault_trial(const char *directory, const char *key,
 }
 static void record_faults(const char *directory, const char *key) {
   size_t sites = 0;
+  fixture_directory_sync_model(1);
   for (int codec = 0; codec <= 3; codec += 3)
     for (int sync = 0; sync < 2; ++sync)
       for (int stage = 0; stage < 7; ++stage)
@@ -793,6 +797,7 @@ static void record_faults(const char *directory, const char *key) {
             ++sites;
           }
         }
+  fixture_directory_sync_model(0);
   printf("native collection record/index allocation/I/O/partial sites=%zu\n",
          sites);
 }
