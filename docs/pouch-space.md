@@ -57,6 +57,9 @@ Fresh shared roots make their already durable free-page zeros available to
 all owners in the first live cohort. Cold reopen clears that proof.
 After a clean exclusive NoSync close, a checked journal can serve reads.
 The first persistent mutation or explicit flush stabilizes that recovered view.
+Collection retention can write tombstones in the checked unused suffix of an
+existing grant and stabilize them with the recovered view at the final
+maintenance barrier.
 Replayed keys acquire a physical snapshot identity when a write or checkpoint
 needs it. Exclusive collection recovery verifies unused suffix bytes and repairs
 any that are nonzero. An unchanged suffix can reuse the existing tail proof.

@@ -13,7 +13,7 @@ struct ps_collection_segment {
   size_t count, room;
   uint64_t tail, capacity, preferred;
   unsigned long references;
-  int sealed, recovering, shared, editing;
+  int sealed, recovering, shared, editing, suffix_checked;
 };
 
 static int cs_error(lc_error *e, int code, const char *message) {
@@ -80,8 +80,10 @@ static int cs_mapping(ps_collection_segment *s, uint64_t at,
   return LC_OK;
 }
 
+enum cs_access { CS_READ, CS_WRITE, CS_SUFFIX_WRITE };
+
 static int cs_transfer(ps_collection_segment *s, uint64_t at, void *bytes,
-                       size_t n, int writing, lc_error *e) {
+                       size_t n, enum cs_access access, lc_error *e) {
   ps_owned_mapping run = {0};
   unsigned char *p = bytes;
   size_t take;
@@ -93,8 +95,13 @@ static int cs_transfer(ps_collection_segment *s, uint64_t at, void *bytes,
     take = run.capacity - (at - run.base) < (uint64_t)n
                ? (size_t)(run.capacity - (at - run.base))
                : n;
-    rc = writing ? ps_owned_write(run.handle, at - run.base, p, take, e)
-                 : ps_owned_read(run.handle, at - run.base, p, take, e);
+    if (access == CS_READ)
+      rc = ps_owned_read(run.handle, at - run.base, p, take, e);
+    else if (access == CS_SUFFIX_WRITE)
+      rc =
+          ps_owned_write_suffix(s->head, run.handle, at - run.base, p, take, e);
+    else
+      rc = ps_owned_write(run.handle, at - run.base, p, take, e);
     if (rc != LC_OK)
       return rc;
     at += take;
@@ -153,7 +160,7 @@ static int cs_suffix_dirty(ps_collection_segment *s, uint64_t at, int *dirty,
   while (at < s->capacity) {
     take = s->capacity - at < sizeof(zero) ? (size_t)(s->capacity - at)
                                            : sizeof(zero);
-    rc = cs_transfer(s, at, s->zero, take, 0, e);
+    rc = cs_transfer(s, at, s->zero, take, CS_READ, e);
     if (rc != LC_OK)
       return rc;
     if (memcmp(s->zero, zero, take)) {
@@ -177,15 +184,15 @@ static int cs_read(void *context, uint64_t at, const struct iovec *parts,
     if (at > limit || (uint64_t)parts[i].iov_len > limit - at)
       return cs_error(e, LC_ERR_PROTOCOL,
                       "collection read exceeds its captured canonical range");
-    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, 0, e);
+    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, CS_READ, e);
     at += parts[i].iov_len;
   }
   return rc;
 }
 
-static int cs_patch(void *context, uint64_t at, const struct iovec *parts,
-                    int count, lc_error *e) {
-  ps_collection_segment *s = context;
+static int cs_patch_at(ps_collection_segment *s, uint64_t at,
+                       const struct iovec *parts, int count,
+                       enum cs_access access, lc_error *e) {
   uint64_t limit;
   int i, rc = LC_OK;
   pthread_mutex_lock(&s->mutex);
@@ -195,10 +202,21 @@ static int cs_patch(void *context, uint64_t at, const struct iovec *parts,
     if (at > limit || (uint64_t)parts[i].iov_len > limit - at)
       return cs_error(e, LC_ERR_INVALID,
                       "collection patch exceeds its private canonical range");
-    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, 1, e);
+    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, access, e);
     at += parts[i].iov_len;
   }
   return rc;
+}
+
+static int cs_patch(void *context, uint64_t at, const struct iovec *parts,
+                    int count, lc_error *e) {
+  return cs_patch_at(context, at, parts, count, CS_WRITE, e);
+}
+
+static int cs_retention_patch(void *context, uint64_t at,
+                              const struct iovec *parts, int count,
+                              lc_error *e) {
+  return cs_patch_at(context, at, parts, count, CS_SUFFIX_WRITE, e);
 }
 
 static int cs_tail(void *context, uint64_t *tail, lc_error *e) {
@@ -210,9 +228,9 @@ static int cs_tail(void *context, uint64_t *tail, lc_error *e) {
   return LC_OK;
 }
 
-static int cs_append(void *context, const struct iovec *parts, int count,
-                     lc_error *e) {
-  ps_collection_segment *s = context;
+static int cs_append_at_tail(ps_collection_segment *s,
+                             const struct iovec *parts, int count,
+                             enum cs_access access, lc_error *e) {
   uint64_t end, at;
   int i, rc;
   pthread_mutex_lock(&s->mutex);
@@ -232,6 +250,8 @@ static int cs_append(void *context, const struct iovec *parts, int count,
     rc = ps_owned_mark_edit(s->head, e);
     s->editing = rc == LC_OK;
   }
+  if (end > s->capacity)
+    access = CS_WRITE;
   if (rc == LC_OK)
     rc = cs_grant(s, end, e);
   if (rc == LC_OK)
@@ -240,10 +260,20 @@ static int cs_append(void *context, const struct iovec *parts, int count,
   /* Logical append authority excludes other appenders. Mapping capture and
    * private range writes remain independent of this bounded metadata append. */
   for (i = 0; i < count && rc == LC_OK; ++i) {
-    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, 1, e);
+    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, access, e);
     at += parts[i].iov_len;
   }
   return rc;
+}
+
+static int cs_append(void *context, const struct iovec *parts, int count,
+                     lc_error *e) {
+  return cs_append_at_tail(context, parts, count, CS_WRITE, e);
+}
+
+static int cs_retention_append(void *context, const struct iovec *parts,
+                               int count, lc_error *e) {
+  return cs_append_at_tail(context, parts, count, CS_SUFFIX_WRITE, e);
 }
 
 static void cs_discard(void *context, uint64_t at) {
@@ -255,6 +285,8 @@ static void cs_discard(void *context, uint64_t at) {
 
 static const lc_pouch_record_io_ops cs_ops = {cs_read, cs_append, cs_patch,
                                               cs_tail, cs_discard};
+static const lc_pouch_record_io_ops cs_retention_ops = {
+    NULL, cs_retention_append, cs_retention_patch, cs_tail, cs_discard};
 static const lc_pouch_record_io_ops cs_view_ops = {cs_read, NULL, NULL, cs_tail,
                                                    NULL};
 
@@ -359,6 +391,7 @@ static int cs_recover(ps_collection_segment *s, const ps_owned_status *status,
   if (rc == LC_OK) {
     pthread_mutex_lock(&s->mutex);
     s->tail = accepted;
+    s->suffix_checked = !dirty;
     pthread_mutex_unlock(&s->mutex);
   }
   return rc;
@@ -597,5 +630,9 @@ void ps_collection_segment_bind(ps_collection_segment *segment,
   out->ops = segment->head ? &ops : &view_ops;
   out->context = segment;
   out->io = out->unit_io = ps_collection_segment_io(segment);
+  if (segment->suffix_checked) {
+    out->retention_io.ops = &cs_retention_ops;
+    out->retention_io.context = segment;
+  }
   ps_collection_segment_retain(segment);
 }

@@ -168,6 +168,11 @@ void ps_owned_run_close(ps_owned_run *);
 int ps_owned_read(ps_owned_run *, uint64_t offset, void *, size_t, lc_error *);
 int ps_owned_write(ps_owned_run *, uint64_t offset, const void *, size_t,
                    lc_error *);
+/* Caller holds append authority and has checked the rejected canonical suffix.
+ * A write within that suffix can share the caller's final durability barrier.
+ */
+int ps_owned_write_suffix(ps_owned_head *, ps_owned_run *, uint64_t offset,
+                          const void *, size_t, lc_error *);
 /* Independently checked finalized bytes for bounded relocation. The identity
  * header is immutable; its separate completion footer joins canonical byte
  * readiness, without a per-record ownership journal event. Caller excludes

@@ -10910,6 +10910,41 @@ int ps_owned_write(ps_owned_run *run, uint64_t offset, const void *bytes,
     note_owned_write(run->space, n, rc);
   return rc;
 }
+int ps_owned_write_suffix(ps_owned_head *head, ps_owned_run *run,
+                          uint64_t offset, const void *bytes, size_t n,
+                          lc_error *error) {
+  ps_space *s;
+  uint64_t base, capacity;
+  int append, rc;
+  if (!head || !run || run->space != head->space || (!bytes && n))
+    return err(error, LC_ERR_INVALID, "owned suffix write arguments invalid");
+  s = head->space;
+  if (s->durable || s->readiness || !s->open_grant_covered ||
+      !__atomic_load_n(&s->deferred_recovery, __ATOMIC_ACQUIRE))
+    return ps_owned_write(run, offset, bytes, n, error);
+  base = ps_owned_run_base(run);
+  capacity = ps_owned_run_capacity(run);
+  pthread_mutex_lock(&s->mutex);
+  append = !head->entry->deleted && !head->entry->stream.head->sealed &&
+           run->entry->state == 1 && !run->entry->deleted &&
+           run->entry->key.owner == head->entry->token &&
+           !ps_owned_run_mapped(run) && offset <= capacity &&
+           n <= capacity - offset &&
+           (base >= head->entry->bytes || offset >= head->entry->bytes - base);
+  pthread_mutex_unlock(&s->mutex);
+  if (!append)
+    return ps_owned_write(run, offset, bytes, n, error);
+  /* No selected bytes or allocation metadata are replaced. Recovery rejects
+   * a partial record or a suffix that reached storage ahead of an earlier one.
+   */
+  rc = healthy(s, error);
+  if (rc == LC_OK)
+    rc = file_transfer(s, (void *)bytes, n,
+                       run->entry->extents[0].offset + PS_RUN_HEADER + offset,
+                       1, NULL, error);
+  note_owned_write(s, n, rc);
+  return rc;
+}
 static int owned_piece_crc(ps_space *s, uint64_t offset, uint64_t length,
                            void *scratch, uint32_t *crc, lc_error *error) {
   size_t n;

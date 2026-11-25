@@ -442,6 +442,97 @@ static void maintenance_retention_replay(const char *directory, int codec,
   free(disk.dirty);
   free(disk.stable);
 }
+static void maintenance_retention_cold(const char *directory, int codec,
+                                       int cut_sync) {
+  fixture f;
+  disk_model disk = {0};
+  ps_io io = {&disk, disk_read, disk_write, disk_sync, disk_reserve, NULL};
+  lc_collection_metadata_req policy = {0};
+  lc_pouch_maintenance_options options = {0};
+  lc_pouch_maintenance_result result = {0};
+  lc_collection_info info;
+  lc_collection_append_status_res status;
+  ps_stats before, after;
+  disk.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
+  disk.dirty = calloc((size_t)(PS_DEFAULT_CAPACITY / PS_PAGE), 1);
+  disk.scratch = malloc(PS_PAGE);
+  REQUIRE(disk.stable && disk.dirty && disk.scratch);
+  setup_io(&f, directory, codec, 0, 0, &io);
+  ps_space *space = ps_root_space(client_root(&f));
+  policy.has_max_entries = 1;
+  policy.max_entries = 2;
+  ok(lc_collection_metadata(f.collection, &policy, &info, &f.error), &f.error);
+  REQUIRE(append(f.collection, "stable-1", 80U, &f.error).position == 1U);
+  REQUIRE(append(f.collection, "stable-2", 80U, &f.error).position == 2U);
+  ok(ps_checkpoint(space, &f.error), &f.error);
+  ok(ps_status(space, &before, &f.error), &f.error);
+  for (int i = 3; i <= 6; ++i) {
+    char id[32];
+    snprintf(id, sizeof(id), "cached-%d", i);
+    REQUIRE(append(f.collection, id, 80U, &f.error).position == (lc_u64)i);
+  }
+  ok(ps_status(space, &after, &f.error), &f.error);
+  REQUIRE(after.syncs == before.syncs);
+  reopen(&f);
+  lc_pouch *pouch = ((lc_client_handle *)f.client)->pouch;
+  space = ps_root_space(client_root(&f));
+  ok(lc_collection_describe(f.collection, &info, &f.error), &f.error);
+  REQUIRE(info.live_count == 6U && info.upper_position == 6U);
+  ok(ps_status(space, &before, &f.error), &f.error);
+  REQUIRE(!before.syncs);
+  options.ns = "journal";
+  /* Persist maintenance writes while dropping all preceding cached writes.
+   * The first sync fails without stabilizing any of those preceding bytes. */
+  disk.cut_sync_after_writeback = cut_sync;
+  int rc = lc_pouch_maintenance_run(pouch, &options, &result, &f.error);
+  disk.cut_sync_after_writeback = 0;
+  REQUIRE(result.retention_deleted_state_count == 4);
+  lc_pouch_maintenance_result_cleanup(&pouch->allocator, &result);
+  if (cut_sync) {
+    REQUIRE(rc == LC_ERR_TRANSPORT && disk.late_bytes);
+    clear(&f.error);
+  } else {
+    ok(rc, &f.error);
+    ok(ps_status(space, &after, &f.error), &f.error);
+    REQUIRE(after.syncs == before.syncs + 1U &&
+            after.checkpoints == before.checkpoints);
+  }
+  close_store(&f);
+  restore_disk(&disk, f.path);
+  open_client(&f, 0);
+  open_collection(&f, 0, &f.collection);
+  ok(lc_collection_describe(f.collection, &info, &f.error), &f.error);
+  REQUIRE(info.live_count == 2 && info.upper_position == (cut_sync ? 2 : 6));
+  ok(lc_collection_append_status(f.collection, "stable-1", &status, &f.error),
+     &f.error);
+  REQUIRE(status.entry.position == 1U &&
+          status.state == (cut_sync ? LC_COLLECTION_APPEND_COMMITTED
+                                    : LC_COLLECTION_APPEND_DELETED));
+  if (cut_sync) {
+    read_entry(f.collection, 1, 80U, &f.error);
+    read_entry(f.collection, 2, 80U, &f.error);
+    ok(lc_collection_append_status(f.collection, "cached-3", &status, &f.error),
+       &f.error);
+    REQUIRE(status.state == LC_COLLECTION_APPEND_ABSENT);
+    REQUIRE(append(f.collection, "replacement", 97U, &f.error).position == 3U);
+    ok(ps_flush(ps_root_space(client_root(&f)), &f.error), &f.error);
+    close_store(&f);
+    restore_disk(&disk, f.path);
+    open_client(&f, 0);
+    open_collection(&f, 0, &f.collection);
+    ok(lc_collection_describe(f.collection, &info, &f.error), &f.error);
+    REQUIRE(info.live_count == 3U && info.upper_position == 3U);
+    read_entry(f.collection, 3, 97U, &f.error);
+  } else {
+    read_entry(f.collection, 5, 80U, &f.error);
+    read_entry(f.collection, 6, 80U, &f.error);
+  }
+  close_store(&f);
+  lc_error_cleanup(&f.error);
+  free(disk.scratch);
+  free(disk.dirty);
+  free(disk.stable);
+}
 static void maintenance_suite(const char *directory, int codec, int sync,
                               int death) {
   maintenance_lifecycle(directory, codec, sync);

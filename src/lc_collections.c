@@ -2552,6 +2552,7 @@ static int lc_cc_delete_current(lc_collection *self, uint64_t position,
   lc_pouch_collection_record deleted;
   lc_collection_handle *collection;
   lc_collection_input input;
+  lc_pouch_record_io output;
   lc_u64 segment;
   lc_u64 generation;
   int found;
@@ -2622,10 +2623,12 @@ static int lc_cc_delete_current(lc_collection *self, uint64_t position,
       rc = lc_collection_rotate(collection, 0, error);
     segment = collection->head.active;
     generation = collection->order.generation + 1U;
+    output = collection->active.io;
+    if (only_due && collection->active.retention_io.ops)
+      output = collection->active.retention_io;
     lc_collection_metadata_leave(collection);
     if (rc == LC_OK)
-      rc = lc_pouch_collection_record_delete(collection->pouch,
-                                             collection->active.io, &record,
+      rc = lc_pouch_collection_record_delete(collection->pouch, output, &record,
                                              generation, &deleted, error);
     if (rc == LC_OK)
       rc = lc_collection_segment_ready(&collection->active, error);

@@ -1754,7 +1754,9 @@ static void edit_recovery(const char *directory, int codec, int sync) {
 typedef struct disk_model {
   unsigned char *stable, *dirty, *scratch;
   size_t calls, cut;
+  size_t late_bytes;
   int armed, fired, mode, freeze;
+  int cut_sync_after_writeback;
 } disk_model;
 static int disk_cut(disk_model *m) {
   if (m->armed && ++m->calls == m->cut) {
@@ -1793,8 +1795,10 @@ static ssize_t disk_write(void *context, int fd, const void *bytes, size_t n,
     for (size_t page = (size_t)at / PS_PAGE;
          page <= ((size_t)at + count - 1U) / PS_PAGE; ++page)
       m->dirty[page] = 1;
-    if (fail && m->mode >= 2)
+    if ((fail && m->mode >= 2) || m->cut_sync_after_writeback)
       memcpy(m->stable + at, bytes, count);
+    if (m->cut_sync_after_writeback)
+      m->late_bytes += count;
   }
   if (fail) {
     errno = EIO;
@@ -1805,6 +1809,11 @@ static ssize_t disk_write(void *context, int fd, const void *bytes, size_t n,
 static int disk_sync(void *context, int fd) {
   disk_model *m = context;
   int fail = disk_cut(m);
+  if (m->cut_sync_after_writeback) {
+    m->freeze = 1;
+    errno = EIO;
+    return -1;
+  }
   if (!fail || m->mode >= 2) {
     /* Track the modeled barrier in stable pages. The fixture is disposable. */
     if (!m->freeze || (fail && m->mode >= 2))
@@ -2239,6 +2248,8 @@ int main(int argc, char **argv) {
         !strcmp(argv[2], "query-allocation") ||
         !strcmp(argv[2], "maintenance") ||
         !strcmp(argv[2], "maintenance-live") ||
+        !strcmp(argv[2], "maintenance-retention-cold") ||
+        !strcmp(argv[2], "maintenance-retention-writeback") ||
         !strcmp(argv[2], "maintenance-io") ||
         !strcmp(argv[2], "maintenance-allocation") ||
         !strcmp(argv[2], "background") || !strcmp(argv[2], "background-live") ||
@@ -2332,7 +2343,13 @@ int main(int argc, char **argv) {
                !strcmp(argv[2], "maintenance-live"))
       maintenance_suite(directory, codec, sync,
                         !strcmp(argv[2], "maintenance"));
-    else if (!strcmp(argv[2], "maintenance-io")) {
+    else if (!strcmp(argv[2], "maintenance-retention-cold") ||
+             !strcmp(argv[2], "maintenance-retention-writeback")) {
+      REQUIRE(!sync);
+      maintenance_retention_cold(
+          directory, codec,
+          !strcmp(argv[2], "maintenance-retention-writeback"));
+    } else if (!strcmp(argv[2], "maintenance-io")) {
       size_t cuts = 0U;
       for (int operation = 4; operation < 6; ++operation) {
         size_t calls = io_trial(directory, codec, sync, operation, 0, 0U);

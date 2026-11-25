@@ -62,6 +62,8 @@ typedef struct lc_collection_segment {
   const lc_collection_segment_ops *ops;
   void *context;
   lc_pouch_record_io io, unit_io;
+  /* Optional writer for maintenance tombstones, with a final root barrier. */
+  lc_pouch_record_io retention_io;
 } lc_collection_segment;
 /* Adopts fd on both success and failure. The native owner retains its alias
  * only for native directory/commit-batcher policy and existing test hooks.
