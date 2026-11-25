@@ -69,6 +69,8 @@ enum ps_kind {
    */
   PS_QUERY_FIRST = 16,
   PS_QUERY_LAST = 37,
+  /* Rebuildable index page keyed by collection owner and row ordinal. */
+  PS_COLLECTION_QUERY = 38,
   /* Canonical per-key metadata and retained transaction decisions. Numeric
    * slot identities belong to the actual namespace. Checkpoint selection
    * binds their coverage/high-water control through the same directory. */

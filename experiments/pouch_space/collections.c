@@ -633,31 +633,20 @@ static int ids_refresh(void *context, lc_collection_ids *ids, lc_error *e) {
              ? lc_collection_ids_refresh(ids, e)
              : lc_collection_ids_scratch_open(&owner->allocator, ids, e);
 }
-#define COLLECTION_QUERY_NAME_BYTES (LC_XID_STRING_SIZE - 1U + 8U)
-static int query_name(const char *epoch, lc_u64 ordinal, unsigned char *name,
-                      lc_error *e) {
-  size_t i;
-  if (!lc_xid_is_valid(epoch))
-    return failure(e, LC_ERR_INVALID, NULL,
-                   "collection query epoch is invalid");
-  memcpy(name, epoch, LC_XID_STRING_SIZE - 1U);
-  for (i = 0U; i < 8U; ++i)
-    name[LC_XID_STRING_SIZE - 1U + i] = (unsigned char)(ordinal >> (8U * i));
-  return LC_OK;
-}
 static int query_open(void *context, const char *epoch, lc_u64 ordinal,
                       lc_pouch_index_input *out, lc_error *e) {
   ps_collection_owner *owner = ((collection_receiver *)context)->owner;
-  unsigned char name[COLLECTION_QUERY_NAME_BYTES];
-  int rc = query_name(epoch, ordinal, name, e);
   memset(out, 0, sizeof(*out));
-  return rc == LC_OK ? ps_query_artifact_open(owner->ns, owner->numeric, name,
-                                              sizeof(name), out, e)
-                     : rc;
+  if (!lc_xid_is_valid(epoch))
+    return failure(e, LC_ERR_INVALID, NULL,
+                   "collection query epoch is invalid");
+  if (strcmp(epoch, owner->id))
+    return LC_OK;
+  return ps_query_page_open(owner->ns, owner->numeric, ordinal, out, e);
 }
 static void query_close(void *context, lc_pouch_index_input *input) {
-  ps_collection_owner *owner = ((collection_receiver *)context)->owner;
-  ps_query_artifact_close(owner->ns->root, input);
+  (void)context;
+  ps_query_page_close(input);
 }
 typedef struct collection_query_producer {
   collection_receiver *receiver;
@@ -684,63 +673,24 @@ static int query_replace(void *context, const char *epoch, lc_u64 ordinal,
   collection_receiver *receiver = context;
   ps_collection_owner *owner = receiver->owner;
   collection_query_producer p;
-  unsigned char name[COLLECTION_QUERY_NAME_BYTES];
-  int rc = query_name(epoch, ordinal, name, e);
+  if (!lc_xid_is_valid(epoch))
+    return failure(e, LC_ERR_INVALID, NULL,
+                   "collection query epoch is invalid");
+  /* A single-file collection's scratch projection uses its persistent
+   * collection ID as its epoch. The collection owner is never reused. */
+  if (strcmp(epoch, owner->id))
+    return LC_OK;
   p.receiver = receiver;
   p.produce = produce;
   p.context = producer;
-  return rc == LC_OK
-             ? ps_query_artifact_replace(owner->ns, owner->numeric, name,
-                                         sizeof(name), bound, query_produce, &p,
-                                         select, selector, e)
-             : rc;
-}
-typedef struct collection_query_cleanup {
-  collection_receiver *receiver;
-  lc_pouch_maintenance_result *result;
-} collection_query_cleanup;
-static int query_cleanup_one(void *context, const void *name, size_t length,
-                             const ps_catalog_info *info, lc_error *e) {
-  collection_query_cleanup *cleanup = context;
-  collection_receiver *receiver = cleanup->receiver;
-  lc_collection_handle *c = receiver->receiver;
-  const unsigned char *bytes = name;
-  char epoch[LC_XID_STRING_SIZE];
-  int rc;
-  if (length != COLLECTION_QUERY_NAME_BYTES)
-    return failure(e, LC_ERR_PROTOCOL, NULL,
-                   "collection query catalog identity is invalid");
-  memcpy(epoch, bytes, LC_XID_STRING_SIZE - 1U);
-  epoch[LC_XID_STRING_SIZE - 1U] = '\0';
-  if (!lc_xid_is_valid(epoch))
-    return failure(e, LC_ERR_PROTOCOL, NULL,
-                   "collection query catalog epoch is invalid");
-  rc = lc_collection_metadata_enter(c, 1, e);
-  if (rc != LC_OK)
-    return rc;
-  rc = lc_collection_refresh_view(c, e);
-  if (rc == LC_OK && strcmp(epoch, lc_collection_query_epoch(c, &c->order))) {
-    rc = ps_namespace_work_ensure(receiver->owner->ns,
-                                  LC_POUCH_STORAGE_WORK_ORDINARY, 0, e);
-    if (rc == LC_OK)
-      rc = ps_query_artifact_remove(space(receiver->owner),
-                                    receiver->owner->numeric, name, length,
-                                    &info->revision, e);
-    if (rc == LC_OK && cleanup->result)
-      ++cleanup->result->cleanup_deleted_count;
-  }
-  lc_collection_metadata_leave(c);
-  return rc;
+  return ps_query_page_replace(owner->ns, owner->numeric, ordinal, bound,
+                               query_produce, &p, select, selector, e);
 }
 static int query_cleanup(void *context, lc_pouch_maintenance_result *out,
                          lc_error *e) {
-  collection_receiver *receiver = context;
-  ps_collection_owner *owner = receiver->owner;
-  collection_query_cleanup cleanup;
-  cleanup.receiver = receiver;
-  cleanup.result = out;
-  return ps_catalog_visit(space(owner), owner->numeric, PS_CATALOG_PROJECTION,
-                          query_cleanup_one, &cleanup, e);
+  ps_collection_owner *owner = ((collection_receiver *)context)->owner;
+  return ps_query_catalog_reclaim(space(owner), owner->numeric,
+                                  out ? &out->cleanup_deleted_count : NULL, e);
 }
 
 static int projection_begin(void *context,

@@ -531,13 +531,13 @@ static uint64_t aligned(uint64_t n) {
 static int valid_key(ps_key k) {
   return (k.kind >= PS_STATE && k.kind <= PS_CATALOG) || k.kind == PS_CONTROL ||
          k.kind == PS_ROUTING ||
-         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST) ||
+         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_COLLECTION_QUERY) ||
          (k.kind >= PS_KEY_METADATA && k.kind <= PS_NAMESPACE_CHECKPOINT);
 }
 int ps_internal_immutable_key(ps_key k) {
   return k.kind == PS_STATE || k.kind == PS_COLLECTION ||
          k.kind == PS_CONTROL || k.kind == PS_ROUTING ||
-         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST) ||
+         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_COLLECTION_QUERY) ||
          (k.kind >= PS_KEY_METADATA && k.kind <= PS_NAMESPACE_CHECKPOINT);
 }
 static uint64_t key_hash(ps_key k) {
@@ -2881,7 +2881,7 @@ static int verify_entry(ps_space *s, ps_entry *p, recovery_values *values,
    * Their descriptors still own exact, checked ranges; readers validate their
    * payload CRC and the query owner rebuilds invalid data. Lost/corrupt query
    * payload must not truncate later acknowledged canonical publications. */
-  if (p->key.kind >= PS_QUERY_FIRST && p->key.kind <= PS_QUERY_LAST)
+  if (p->key.kind >= PS_QUERY_FIRST && p->key.kind <= PS_COLLECTION_QUERY)
     return LC_OK;
   return verify_value_payloads(s, p, values->buffer, &values->packed, error);
 }

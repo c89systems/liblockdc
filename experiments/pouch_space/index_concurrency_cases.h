@@ -3,16 +3,6 @@
 #include "index_cases.h"
 #include "owned.h"
 
-static int index_capture_binding(void *context, const void *name, size_t length,
-                                 const ps_catalog_info *info, lc_error *e) {
-  ps_catalog_info *captured = context;
-  (void)name;
-  (void)e;
-  REQUIRE(length == 10U && !captured->stream.owner);
-  *captured = *info;
-  return LC_OK;
-}
-
 typedef struct index_gate {
   pthread_mutex_t mutex;
   pthread_cond_t changed;
@@ -177,12 +167,11 @@ static int index_selected_pause(void *context, lc_pouch_index_commit_fn commit,
 }
 static void *index_visibility_publish(void *context) {
   index_visibility_actor *actor = context;
-  const unsigned char name[10] = {1U, LC_POUCH_INDEX_PACKED, 1U};
   lc_error e;
   lc_error_init(&e);
-  actor->result = ps_query_artifact_replace(
-      actor->ns, actor->owner, name, sizeof(name), 7U, index_small_producer,
-      (void *)"visible", index_selected_pause, &actor->gate, &e);
+  actor->result = ps_query_page_replace(actor->ns, actor->owner, 1U, 7U,
+                                        index_small_producer, (void *)"visible",
+                                        index_selected_pause, &actor->gate, &e);
   lc_error_cleanup(&e);
   return NULL;
 }
@@ -192,7 +181,6 @@ static void index_visibility(const char *directory) {
   ps_root_options options = {0};
   ps_namespace_info identity;
   index_visibility_actor actor = {0};
-  const unsigned char name[10] = {1U, LC_POUCH_INDEX_PACKED, 1U};
   lc_pouch_index_input input = {0};
   pthread_t thread;
   lc_error e;
@@ -206,8 +194,7 @@ static void index_visibility(const char *directory) {
   index_gate_init(&actor.gate);
   REQUIRE(!pthread_create(&thread, NULL, index_visibility_publish, &actor));
   index_gate_wait(&actor.gate);
-  int opened = ps_query_artifact_open(actor.ns, actor.owner, name, sizeof(name),
-                                      &input, &e);
+  int opened = ps_query_page_open(actor.ns, actor.owner, 1U, &input, &e);
   pthread_mutex_lock(&actor.gate.mutex);
   actor.gate.release = 1;
   pthread_cond_broadcast(&actor.gate.changed);
@@ -221,7 +208,7 @@ static void index_visibility(const char *directory) {
   REQUIRE(index_input_crc(&input, &e) == crc);
   ok(ps_checkpoint(ps_root_space(root), &e), &e);
   REQUIRE(index_input_crc(&input, &e) == crc);
-  ps_query_artifact_close(root, &input);
+  ps_query_page_close(&input);
   ps_namespace_release(actor.ns);
   ok(ps_root_close(root, &e), &e);
   index_gate_clear(&actor.gate);
@@ -249,23 +236,19 @@ static void *index_gate_allocate(void *context, size_t bytes) {
   return memory;
 }
 typedef struct index_input_actor {
-  ps_root *root;
   ps_namespace *ns;
   uint64_t owner;
   index_input_gate *gate;
-  lc_pouch_index_artifact_id id;
   lc_pouch_index_input input;
   int result;
 } index_input_actor;
 static void *index_captured_open(void *context) {
   index_input_actor *actor = context;
-  lc_error e;
-  lc_error_init(&e);
+  lc_error e = {0};
   actor->gate->reader = pthread_self();
   __atomic_store_n(&actor->gate->armed, 1, __ATOMIC_RELEASE);
-  const unsigned char name[10] = {1U, LC_POUCH_INDEX_PACKED, 7U};
-  actor->result = ps_query_artifact_open(actor->ns, actor->owner, name,
-                                         sizeof(name), &actor->input, &e);
+  actor->result =
+      ps_query_page_open(actor->ns, actor->owner, 7U, &actor->input, &e);
   lc_error_cleanup(&e);
   return NULL;
 }
@@ -277,64 +260,45 @@ static void index_retirement_admission(const char *directory) {
   ps_root *root = NULL;
   ps_namespace *ns = NULL;
   ps_namespace_info identity;
-  ps_catalog_info binding = {0};
-  ps_owned_head *retiring = NULL;
-  ps_owned_status status;
   index_input_actor actor = {0};
   pthread_t thread;
-  lc_error e;
-  lc_error_init(&e);
+  lc_pouch_index_input selected = {0};
+  lc_error e = {0};
   REQUIRE(snprintf(path, sizeof(path), "%s/index-retiring", directory) <
           (int)sizeof(path));
   options.crypto_allocator = &domain;
   index_gate_init(&gate.gate);
   ok(ps_root_open(path, 1, &options, &root, &e), &e);
-  actor.root = root;
   actor.gate = &gate;
-  actor.id.kind = LC_POUCH_INDEX_PACKED;
-  actor.id.segmented = 1;
-  actor.id.generation = 7U;
-  const unsigned char name[10] = {1U, LC_POUCH_INDEX_PACKED, 7U};
   ok(ps_root_namespace_acquire(root, "query/retirement", 1, &ns, &e), &e);
   ok(ps_namespace_identity(ns, &identity, &e), &e);
   actor.ns = ns;
   actor.owner = identity.owner;
-  ok(ps_query_artifact_replace(ns, identity.owner, name, sizeof(name), 3U,
-                               index_small_producer, (void *)"old", NULL, NULL,
-                               &e),
+  ok(ps_query_page_replace(ns, identity.owner, 7U, 3U, index_small_producer,
+                           (void *)"old", NULL, NULL, &e),
      &e);
-  ok(ps_catalog_visit(ps_root_space(root), identity.owner,
-                      PS_CATALOG_PROJECTION, index_capture_binding, &binding,
-                      &e),
-     &e);
-  ok(ps_owned_open(ps_root_space(root), NULL, binding.stream, 0,
-                   &binding.target, &retiring, &status, &e),
-     &e);
-  lc_pouch_index_input unavailable = {0};
-  REQUIRE(ps_query_artifact_open(ns, identity.owner, name, sizeof(name),
-                                 &unavailable, &e) == LC_ERR_INVALID);
-  REQUIRE(!unavailable.signature.present);
-  clear(&e);
-  ps_owned_close(retiring);
-  retiring = NULL;
   REQUIRE(!pthread_create(&thread, NULL, index_captured_open, &actor));
   index_gate_wait(&gate.gate);
-  ok(ps_query_artifact_remove(ps_root_space(root), identity.owner, name,
-                              sizeof(name), NULL, &e),
+  /* The opening reader has pinned the old incarnation. Selection and
+   * checkpoint can proceed while allocation of its public handle waits. */
+  ok(ps_query_page_replace(ns, identity.owner, 7U, 3U, index_small_producer,
+                           (void *)"new", NULL, NULL, &e),
      &e);
-  /* Hold the now-unbound physical head exactly as a concurrent retirement
-   * admission may do. The earlier catalog view still protects its bytes. */
-  ok(ps_owned_open(ps_root_space(root), NULL, binding.stream, 0,
-                   &binding.target, &retiring, &status, &e),
-     &e);
+  ok(ps_checkpoint(ps_root_space(root), &e), &e);
+  ok(ps_query_page_open(ns, identity.owner, 7U, &selected, &e), &e);
+  REQUIRE(selected.signature.present &&
+          index_input_crc(&selected, &e) ==
+              crc32(0, (const unsigned char *)"new", 3U));
+  ps_query_page_close(&selected);
   pthread_mutex_lock(&gate.gate.mutex);
   gate.gate.release = 1;
   pthread_cond_broadcast(&gate.gate.changed);
   pthread_mutex_unlock(&gate.gate.mutex);
   REQUIRE(!pthread_join(thread, NULL));
-  ps_owned_close(retiring);
-  REQUIRE(actor.result == LC_OK && !actor.input.signature.present);
-  ps_query_artifact_close(root, &actor.input);
+  REQUIRE(actor.result == LC_OK && actor.input.signature.present &&
+          index_input_crc(&actor.input, &e) ==
+              crc32(0, (const unsigned char *)"old", 3U));
+  ps_query_page_close(&actor.input);
   ps_namespace_release(ns);
   ok(ps_root_close(root, &e), &e);
   REQUIRE(!live && !unlink(path));

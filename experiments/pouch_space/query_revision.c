@@ -269,7 +269,7 @@ int ps_query_values_reclaim(ps_space *space, uint64_t owner, lc_error *e) {
   p.space = space;
   p.keep = NULL;
   p.count = 0;
-  return ps_values_visit(space, owner, PS_QUERY_FIRST, PS_QUERY_LAST,
+  return ps_values_visit(space, owner, PS_QUERY_FIRST, PS_COLLECTION_QUERY,
                          prune_value, &p, e);
 }
 static void query_dispose(void *context, void *build) {

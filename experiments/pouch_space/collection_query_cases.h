@@ -3,6 +3,7 @@
 #include "budget.h"
 #include "lc_collection_query.h"
 #include "query_index.h"
+#include "stream.h"
 #include <zlib.h>
 
 static int cq_build(fixture *f, lc_u64 ordinal) {
@@ -55,19 +56,33 @@ static int cq_load(fixture *f, lc_collection_index *index, int *found) {
   return cq_load_proof(f, index, found, NULL);
 }
 
-static int cq_dummy(void *context, lc_sink *sink, lc_error *e) {
-  (void)context;
-  if (sink->write(sink, "{}", 2, e))
-    return LC_OK;
-  return e->code;
-}
 static void cq_obsolete(fixture *f) {
-  lc_collection_handle *c = f->collection->impl;
+  ps_space *space = client_root(f)->space;
+  ps_stream *stream = NULL;
+  ps_stream_writer *writer = NULL;
+  ps_stream_info status;
+  ps_catalog_info binding;
+  ps_key key = {0, 1, PS_STREAM};
+  unsigned char name[LC_XID_STRING_SIZE - 1U + 8U] = {0};
   char epoch[LC_XID_STRING_SIZE];
   ok(lc_xid_new(epoch, &f->error), &f->error);
-  ok(c->queries.replace(c->queries.context, epoch, 0U, 2U, cq_dummy, NULL, NULL,
-                        NULL, &f->error),
+  memcpy(name, epoch, sizeof(epoch) - 1U);
+  ok(ps_catalog_allocate_id(space, &key.owner, &f->error), &f->error);
+  ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &f->error),
      &f->error);
+  ok(ps_stream_begin(stream, &writer, &f->error), &f->error);
+  ok(ps_stream_reserve_exact(writer, NULL, 2, &f->error), &f->error);
+  ok(ps_stream_write(writer, "{}", 2, &f->error), &f->error);
+  ok(ps_stream_commit(writer, PS_COMMIT_DEFER_SYNC, NULL, NULL, &f->error),
+     &f->error);
+  ps_stream_writer_close(writer);
+  ok(ps_stream_seal(stream, &f->error), &f->error);
+  ok(ps_stream_status(stream, &status, &f->error), &f->error);
+  ok(ps_catalog_put(space, NULL, collection_owner_id(f), PS_CATALOG_PROJECTION,
+                    name, sizeof(name), NULL, key, &status.ref, &binding,
+                    &f->error),
+     &f->error);
+  ok(ps_stream_close(stream, &f->error), &f->error);
 }
 typedef struct cq_output {
   uint64_t positions;
@@ -125,8 +140,20 @@ static int cq_count(void *context, const void *name, size_t length,
   ++*count;
   return LC_OK;
 }
+static int cq_count_value(void *context, ps_key key, const ps_ref *ref,
+                          uint64_t bytes, lc_error *e) {
+  size_t *count = context;
+  (void)ref;
+  (void)e;
+  REQUIRE(key.kind == PS_COLLECTION_QUERY && bytes);
+  ++*count;
+  return LC_OK;
+}
 static size_t cq_artifacts(fixture *f, uint64_t owner) {
   size_t count = 0U;
+  ok(ps_values_visit(client_root(f)->space, owner, PS_COLLECTION_QUERY,
+                     PS_COLLECTION_QUERY, cq_count_value, &count, &f->error),
+     &f->error);
   ok(ps_catalog_visit(client_root(f)->space, owner, PS_CATALOG_PROJECTION,
                       cq_count, &count, &f->error),
      &f->error);
