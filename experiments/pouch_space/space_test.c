@@ -7552,7 +7552,7 @@ static void piece_incremental(int durable) {
   CHECK(pwrite(fd, &wrong, 1, (off_t)physical) == 1);
   m.read_bytes = 0;
   OK(canonical_append(stream, body, 31, 7, 2, &second, &error));
-  CHECK(m.read_bytes == 31 + 43); /* unchanged prefix is never read again */
+  CHECK(!m.read_bytes); /* the finalized suffix is still in the append buffer */
   OK(ps_stream_status(stream, &info, &error));
   OK(ps_stream_close(stream, &error));
   OK(ps_owned_open(space, NULL, stream_key(1), 0, &info.ref, &head, &status,

@@ -189,6 +189,12 @@ typedef struct ps_piece_checksum {
 int ps_owned_piece_extend(ps_owned_run *, uint64_t prior_bytes,
                           const ps_piece_checksum *prior, uint64_t bytes,
                           void *scratch, ps_piece_checksum *, lc_error *);
+/* Compute the same footer from a bounded, finalized suffix just written by
+ * the active appender. The buffer starts at prior_bytes. */
+int ps_owned_piece_extend_buffer(ps_owned_run *, uint64_t prior_bytes,
+                                 const ps_piece_checksum *prior, uint64_t bytes,
+                                 const void *suffix, ps_piece_checksum *,
+                                 lc_error *);
 /* Checksum state output is optional. */
 int ps_owned_piece_inspect(ps_owned_run *, uint64_t bytes, ps_piece_checksum *,
                            lc_error *);

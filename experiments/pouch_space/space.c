@@ -10785,7 +10785,8 @@ static int owned_piece_crc(ps_space *s, uint64_t offset, uint64_t length,
 static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
                        int operation, uint64_t prior,
                        const ps_piece_checksum *prefix, ps_piece_checksum *out,
-                       const ps_owned_footer *captured, lc_error *error) {
+                       const ps_owned_footer *captured, const void *suffix,
+                       lc_error *error) {
   unsigned char footer[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES];
   ps_space *s;
   uint64_t offset;
@@ -10794,7 +10795,8 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
   int rc;
   if (!run || !bytes || bytes > ps_owned_run_capacity(run) ||
       ps_owned_run_capacity(run) > PS_STREAM_PIECE_BYTES ||
-      (operation && !scratch) || prior > bytes || (prior && !prefix) ||
+      (operation && !scratch && !suffix) || prior > bytes ||
+      (suffix && bytes - prior > PS_CHUNK) || (prior && !prefix) ||
       (prefix && (prefix->reconstructed < 0 || prefix->reconstructed > 1 ||
                   (!prior && prefix->crc))))
     return err(error, LC_ERR_INVALID,
@@ -10816,8 +10818,11 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
   rc = healthy(s, error);
   if (rc == LC_OK && operation == 2) {
     crc = prior ? prefix->crc : 0;
-    rc = owned_piece_crc(s, offset + PS_RUN_HEADER + prior, bytes - prior,
-                         scratch, &crc, error);
+    if (suffix)
+      crc = (uint32_t)ps_crc32(crc, suffix, (uInt)(bytes - prior));
+    else
+      rc = owned_piece_crc(s, offset + PS_RUN_HEADER + prior, bytes - prior,
+                           scratch, &crc, error);
     if (rc == LC_OK) {
       memcpy(footer, "LCPSPIEC", 8);
       ps_wire_put64(footer + 8,
@@ -10870,20 +10875,30 @@ int ps_owned_piece_extend(ps_owned_run *run, uint64_t prior,
                           lc_error *error) {
   if (!out)
     return err(error, LC_ERR_INVALID, "piece extension requires CRC output");
-  return owned_piece(run, bytes, scratch, 2, prior, prefix, out, NULL, error);
+  return owned_piece(run, bytes, scratch, 2, prior, prefix, out, NULL, NULL,
+                     error);
+}
+int ps_owned_piece_extend_buffer(ps_owned_run *run, uint64_t prior,
+                                 const ps_piece_checksum *prefix,
+                                 uint64_t bytes, const void *suffix,
+                                 ps_piece_checksum *out, lc_error *error) {
+  if (!out)
+    return err(error, LC_ERR_INVALID, "piece extension requires CRC output");
+  return owned_piece(run, bytes, NULL, 2, prior, prefix, out, NULL, suffix,
+                     error);
 }
 int ps_owned_piece_inspect(ps_owned_run *run, uint64_t bytes,
                            ps_piece_checksum *out, lc_error *error) {
-  return owned_piece(run, bytes, NULL, 0, 0, NULL, out, NULL, error);
+  return owned_piece(run, bytes, NULL, 0, 0, NULL, out, NULL, NULL, error);
 }
 int ps_owned_piece_inspect_initial(ps_owned_run *run, uint64_t bytes,
                                    const ps_owned_footer *captured,
                                    ps_piece_checksum *out, lc_error *error) {
-  return owned_piece(run, bytes, NULL, 0, 0, NULL, out, captured, error);
+  return owned_piece(run, bytes, NULL, 0, 0, NULL, out, captured, NULL, error);
 }
 int ps_owned_piece_verify(ps_owned_run *run, uint64_t bytes, void *scratch,
                           lc_error *error) {
-  return owned_piece(run, bytes, scratch, 1, 0, NULL, NULL, NULL, error);
+  return owned_piece(run, bytes, scratch, 1, 0, NULL, NULL, NULL, NULL, error);
 }
 typedef struct piece_selection {
   ps_owned_head *head;

@@ -149,9 +149,10 @@ static int stream_io(ps_stream *s, uint64_t offset, void *bytes, size_t n,
  */
 static int stream_pieces(ps_stream *s, uint64_t tail, int inspect, int partial,
                          const ps_owned_footer *footers, void *scratch,
-                         int *repaired, lc_error *error) {
+                         int buffered, int *repaired, lc_error *error) {
   ps_owned_mapping run = {0};
   uint64_t bytes, end, prior;
+  uint64_t start = s->checked;
   size_t at;
   ps_piece_checksum checksum, rebuilt = {0};
   int rc, found;
@@ -180,6 +181,11 @@ static int stream_pieces(ps_stream *s, uint64_t tail, int inspect, int partial,
                ? ps_owned_piece_inspect_initial(run.handle, bytes, &footers[at],
                                                 &checksum, error)
                : ps_owned_piece_inspect(run.handle, bytes, &checksum, error);
+    else if (buffered)
+      rc = ps_owned_piece_extend_buffer(
+          run.handle, prior, prior ? &s->checksum : NULL, bytes,
+          (const unsigned char *)scratch + (size_t)(s->checked - start),
+          &checksum, error);
     else
       rc = ps_owned_piece_extend(run.handle, prior, prior ? &s->checksum : NULL,
                                  bytes, scratch, &checksum, error);
@@ -208,7 +214,7 @@ int ps_stream_recovery_cover(ps_stream *s, uint64_t covered, lc_error *error) {
                         "piece coverage requires canonical recovery");
   if (s->recovery_floor < covered)
     s->recovery_floor = covered;
-  return stream_pieces(s, covered, 1, 0, NULL, NULL, NULL, error);
+  return stream_pieces(s, covered, 1, 0, NULL, NULL, 0, NULL, error);
 }
 static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *zero,
                         lc_error *error) {
@@ -283,7 +289,7 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
   if (rc == LC_OK)
     s->capacity = status->capacity;
   if (rc == LC_OK)
-    rc = stream_pieces(s, s->tail, 1, s->sealed, footers, NULL, NULL, error);
+    rc = stream_pieces(s, s->tail, 1, s->sealed, footers, NULL, 0, NULL, error);
   if (rc == LC_OK && s->capacity && !s->sealed) {
     if (!recover)
       rc = stream_error(error, LC_ERR_INVALID,
@@ -291,7 +297,7 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
     else if (!status->complete)
       recover_tail = 1;
     else {
-      rc = stream_pieces(s, s->tail, 1, 1, footers, NULL, NULL, error);
+      rc = stream_pieces(s, s->tail, 1, 1, footers, NULL, 0, NULL, error);
       if (rc == LC_ERR_PROTOCOL) {
         /* Canonical validation can rebuild an uncovered partial footer. */
         lc_error_cleanup(error);
@@ -315,8 +321,8 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
     rc = stream_error(error, LC_ERR_PROTOCOL,
                       "canonical recovery returned invalid tail");
   if (rc == LC_OK)
-    rc = stream_pieces(s, accepted, 2, 1, NULL, s->recovery_buffer, &repaired,
-                       error);
+    rc = stream_pieces(s, accepted, 2, 1, NULL, s->recovery_buffer, 0,
+                       &repaired, error);
   /* Rejected suffix repair waits for the first write admission. */
   if (rc == LC_OK && (accepted > s->tail || repaired))
     rc = ps_owned_restore_tail(s->head, accepted, accepted > s->tail, error);
@@ -1045,15 +1051,18 @@ int ps_stream_writer_crc(ps_stream_writer *w, uint64_t offset, uint64_t length,
 int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,
                      ps_commit_publish_fn publish, void *context,
                      lc_error *error) {
-  int rc;
+  int rc, buffered;
   if (!w || w->failed || w->published)
     return stream_error(error, LC_ERR_INVALID, "stream appender cannot commit");
   if (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC)
     return stream_error(error, LC_ERR_INVALID, "invalid canonical commit mode");
+  /* All fixups to a short append still live in the writer's existing buffer.
+   * A partially flushed append can have disk-only fixups. */
+  buffered = !w->flushed && w->stream->checked == w->start;
   rc = stream_flush(w, error);
   if (rc == LC_OK)
     rc = stream_pieces(w->stream, w->start + w->bytes, 0, 1, NULL, w->buffer,
-                       NULL, error);
+                       buffered, NULL, error);
   if (rc == LC_OK)
     rc = ps_owned_commit_canonical(w->stream->head, w->start + w->bytes, mode,
                                    publish, context, error);
