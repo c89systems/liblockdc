@@ -1988,7 +1988,9 @@ int ps_namespace_refresh_state(ps_namespace *ns,
     *info = view->projection;
     refresh->begin(refresh->context, view->incremental, slots, retained);
     slots = NULL;
-    rc = ps_namespace_view_visit(view, 1, refresh->visit, refresh->context, e);
+    /* The state cache needs record metadata. Captured payload readers verify
+     * their own encoded bytes, including after this metadata view is gone. */
+    rc = ps_namespace_view_visit(view, 0, refresh->visit, refresh->context, e);
   }
   lc_free_with_allocator(NULL, slots);
   ps_namespace_view_close(view);

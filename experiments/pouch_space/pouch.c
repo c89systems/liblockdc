@@ -196,7 +196,8 @@ static int replay(void *context, void *ns,
   if (rc == LC_OK && info)
     ps_namespace_view_projection(view, info);
   if (rc == LC_OK)
-    rc = ps_namespace_view_visit(view, 1, visit, opaque, e);
+    rc = ps_namespace_view_visit(view, mode != LC_POUCH_STORAGE_REPLAY_STATE,
+                                 visit, opaque, e);
   ps_namespace_view_close(view);
   return rc;
 }
@@ -209,7 +210,7 @@ static int replay_suffix(void *context, void *ns,
   (void)context;
   rc = ps_namespace_view_suffix_open(ns, info, start, &view, e);
   if (rc == LC_OK)
-    rc = ps_namespace_view_visit(view, 1, visit, opaque, e);
+    rc = ps_namespace_view_visit(view, 0, visit, opaque, e);
   ps_namespace_view_close(view);
   return rc;
 }
