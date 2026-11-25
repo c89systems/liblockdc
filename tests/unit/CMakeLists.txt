@@ -179,13 +179,14 @@ function(lc_add_unit_test target_name)
       endif()
       lc_add_unit_case_group(${target_name} ${group_name} test_names ${${group}})
     endforeach()
-  elseif(target_name STREQUAL "lc_unit_pouch_xa")
-    # The independent XA recovery fixtures each get the ordinary timeout.
+  elseif(target_name MATCHES "^lc_unit_(pouch_xa|collection_edits|mixed_storage)$")
+    # Independent fixtures each get the ordinary timeout.
+    list(GET ARGN 0 source)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/test_lc_pouch_xa.c")
+      "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
     set(selected_cases ${cases})
     if(NOT selected_cases)
-      file(READ "${CMAKE_CURRENT_SOURCE_DIR}/test_lc_pouch_xa.c" case_source)
+      file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${source}" case_source)
       string(REGEX MATCHALL "cmocka_unit_test_setup_teardown\\([ \r\n]*[A-Za-z0-9_]+"
         registrations "${case_source}")
       foreach(registration IN LISTS registrations)
@@ -194,7 +195,7 @@ function(lc_add_unit_test target_name)
       endforeach()
     endif()
     if(NOT selected_cases)
-      message(FATAL_ERROR "Empty Pouch XA test table")
+      message(FATAL_ERROR "Empty unit test table: ${target_name}")
     endif()
     set(test_names)
     lc_add_unit_case_group(${target_name} ${target_name} test_names ${selected_cases})
@@ -206,7 +207,7 @@ function(lc_add_unit_test target_name)
   set_tests_properties(${test_names} PROPERTIES
     LABELS "unit;cross-runtime"
     TIMEOUT 60)
-  if(target_name MATCHES "^lc_unit_(collections|collection_staged)$")
+  if(target_name MATCHES "^lc_unit_(collections|collection_staged|collection_edits|mixed_storage)$")
     # Collection suites fork workers and issue real durability barriers. Two
     # slots bound simultaneous heavy groups within the normal four-job lane.
     set_tests_properties(${test_names} PROPERTIES PROCESSORS 2)

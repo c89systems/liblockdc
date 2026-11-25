@@ -2329,12 +2329,13 @@ static int push_at_publication(void *context, lc_collection *collection,
                       "injected append publication failure", NULL, NULL, NULL);
 }
 
-static void test_segment_seals_recover_lost_projections(void **state) {
+static void segment_seals_recover_lost_projections(void **state,
+                                                   int first_mode) {
   fixture *f = *state;
   enum { entries = 4 };
   char paths[2][768], expected[512];
   check(f, lc_pouch_crypto_generate_key_string(&f->crypto_key, &f->error));
-  for (int mode = 0; mode < 8; ++mode) {
+  for (int mode = first_mode; mode < first_mode + 2; ++mode) {
     for (int loss = 0; loss < 3; ++loss) {
       close_handles(f);
       snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/lost-%d-%d",
@@ -2433,6 +2434,23 @@ static void test_segment_seals_recover_lost_projections(void **state) {
       assert_output(f, expected);
     }
   }
+}
+
+static void test_segment_seals_recover_lost_projections(void **state) {
+  segment_seals_recover_lost_projections(state, 0);
+}
+
+static void test_segment_seals_recover_compressed_projections(void **state) {
+  segment_seals_recover_lost_projections(state, 2);
+}
+
+static void test_segment_seals_recover_encrypted_projections(void **state) {
+  segment_seals_recover_lost_projections(state, 4);
+}
+
+static void
+test_segment_seals_recover_encrypted_compressed_projections(void **state) {
+  segment_seals_recover_lost_projections(state, 6);
 }
 
 typedef struct chunk_crash {
@@ -5892,6 +5910,13 @@ int main(int argc, char **argv) {
           test_push_writer_sync_failure_retains_retry_binding, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_segment_seals_recover_lost_projections, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_segment_seals_recover_compressed_projections, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_segment_seals_recover_encrypted_projections, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_segment_seals_recover_encrypted_compressed_projections, setup,
+          teardown),
       cmocka_unit_test_setup_teardown(
           test_push_writer_recovers_every_publication_boundary, setup,
           teardown),

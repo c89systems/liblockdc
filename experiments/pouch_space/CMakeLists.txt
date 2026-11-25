@@ -1069,9 +1069,15 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_streams COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} streams)
   add_test(NAME pouch_space_stream-recovery COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} stream-recovery)
   add_test(NAME pouch_space_lifecycle COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} lifecycle)
-  add_test(NAME pouch_space_catalog COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} catalog)
-  set_tests_properties(pouch_space_catalog PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space")
+  foreach(mode catalog catalog-scale
+      catalog-create-faults catalog-replace-faults catalog-remove-faults
+      catalog-checkpoint-faults catalog-reopen-write-sync-faults
+      catalog-reopen-allocation-faults catalog-reopen-read-faults)
+    add_test(NAME pouch_space_${mode}
+      COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 120
+      LABELS "unit;local;pouch-space")
+  endforeach()
   set_tests_properties(pouch_space_lifecycle PROPERTIES TIMEOUT 120
     LABELS "unit;local;pouch-space")
   set_tests_properties(pouch_space_streams PROPERTIES TIMEOUT 120

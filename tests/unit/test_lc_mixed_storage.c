@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../support/lc_test_cases.h"
 #include "../support/lc_test_tmp.h"
 #include "lc_collection_internal.h"
 #include "lc_collection_query.h"
@@ -1104,7 +1105,7 @@ test_mixed_retention_renewal_compaction_and_parent_expiry(void **state) {
   assert_collection(f, NULL, 1, 1);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
   const struct CMUnitTest tests[] = {
       cmocka_unit_test_setup_teardown(
           test_background_maintenance_sources_do_not_starve, setup, teardown),
@@ -1127,5 +1128,6 @@ int main(void) {
   };
   if (lc_allocator_tracking_configure(1, NULL) != LC_OK)
     return 1;
-  return cmocka_run_group_tests(tests, NULL, NULL);
+  return lc_test_run_cases(tests, sizeof(tests) / sizeof(*tests), argc, argv,
+                           NULL, NULL);
 }

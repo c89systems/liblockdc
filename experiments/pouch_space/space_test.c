@@ -5686,7 +5686,14 @@ static void catalog_scale(void) {
        "metadata, journal rollover and complete reclamation");
 }
 
-static void catalog_faults(void) {
+enum catalog_fault_operation {
+  CATALOG_CREATE,
+  CATALOG_REPLACE,
+  CATALOG_REMOVE,
+  CATALOG_CHECKPOINT
+};
+
+static void catalog_faults(enum catalog_fault_operation operation) {
   model m;
   ps_io io = model_init(&m);
   ps_space *space;
@@ -5698,114 +5705,117 @@ static void catalog_faults(void) {
   unsigned char event[108];
   char pad[32];
   uint64_t offset;
-  size_t operation, kind, phase, count, i, bytes;
+  size_t kind, phase, count, i, bytes;
   int rc;
-  for (operation = 0; operation < 4; ++operation)
-    for (kind = 0; kind < 2; ++kind) {
-      count = 0;
-      for (phase = 0; phase <= count; ++phase) {
-        clean();
-        m.operations = m.fail_at = 0;
-        space = create(3 * PS_MIB, 1, &io);
-        a = stream_open(space, 1, 1, NULL, NULL);
-        b = stream_open(space, 2, 1, NULL, NULL);
-        OK(canonical_append(a, "old", 3, 1, 1, &offset, &error));
-        OK(canonical_append(b, "new", 3, 1, 2, &offset, &error));
-        OK(ps_stream_status(a, &ai, &error));
-        OK(ps_stream_status(b, &bi, &error));
-        OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
-                          NULL, stream_key(1), &ai.ref, &original, &error));
-        for (i = 0; i < 11; ++i) {
-          snprintf(pad, sizeof(pad), "pad-%lu", (unsigned long)i);
-          OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, pad,
-                            strlen(pad), NULL, stream_key(1), &ai.ref, &seen,
-                            &error));
-        }
-        OK(ps_checkpoint(space, &error));
-        if (operation == 3)
-          OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
-                            &original.revision, stream_key(2), &bi.ref,
-                            &changed, &error));
-        OK(ps_status(space, &stats, &error));
-        m.operations = 0;
-        m.fail_at = kind == 0 ? phase : 0;
-        m.tear = m.persist_torn = 1;
-        allocation_call = 0;
-        allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
-        if (operation == 0)
-          rc = ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "next", 4,
-                              NULL, stream_key(2), &bi.ref, &changed, &error);
-        else if (operation == 1)
-          rc = ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
-                              &original.revision, stream_key(2), &bi.ref,
-                              &changed, &error);
-        else if (operation == 2)
-          rc = ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
-                                 &original.revision, &error);
-        else
-          rc = ps_checkpoint(space, &error);
-        allocation_fail = 0;
-        m.fail_at = 0;
-        if (!phase)
-          count = kind == 0 ? m.operations : allocation_call;
-        if (rc != LC_OK) {
-          CHECK(kind == 0 || rc == LC_ERR_NOMEM);
-          lc_error_cleanup(&error);
-        }
-        if (kind == 0 && phase == count && operation != 3) {
-          int fd = open(path, O_RDONLY);
-          bytes = operation == 2 ? 64 : sizeof(event);
-          CHECK(fd >= 0 && pread(fd, event, bytes,
-                                 PS_JOURNAL_OFFSET + stats.journal_bytes) ==
-                               (ssize_t)bytes);
-          CHECK(close(fd) == 0);
-          memcpy(m.stable + PS_JOURNAL_OFFSET + stats.journal_bytes, event,
-                 bytes);
-        }
-        OK(ps_stream_close(a, &error));
-        OK(ps_stream_close(b, &error));
-        OK(ps_close(space, &error));
-        crash(&m);
-        space = reopen(&io);
-        for (i = 0; i < 11; ++i) {
-          snprintf(pad, sizeof(pad), "pad-%lu", (unsigned long)i);
-          catalog_expect(space, 1, PS_CATALOG_COLLECTION, pad, strlen(pad), 1);
-        }
-        OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION,
-                          operation == 0 ? "next" : "slot", 4, &view, &error));
-        if (view) {
-          OK(ps_catalog_view_info(view, &seen, &error));
-          CHECK(seen.stream.key == 1 || seen.stream.key == 2);
-          if (operation == 0 || operation == 3 ||
-              (operation == 1 && rc == LC_OK))
-            CHECK(seen.stream.key == 2);
-          if (operation == 2)
-            CHECK(rc != LC_OK);
-          ps_catalog_view_close(view);
-          view = NULL;
-        } else
-          CHECK(operation == 2 || (operation == 0 && rc != LC_OK));
-        if (operation == 0)
-          catalog_expect(space, 1, PS_CATALOG_COLLECTION, "slot", 4, 1);
-        a = stream_open(space, 1, 0, &ai.ref, NULL);
-        b = stream_open(space, 2, 0, &bi.ref, NULL);
-        stream_expect(a, 0, "old", 3, 1);
-        stream_expect(b, 0, "new", 3, 2);
-        BAD(ps_stream_retire(a, &error));
-        OK(ps_checkpoint(space, &error));
-        OK(ps_stream_close(a, &error));
-        OK(ps_stream_close(b, &error));
-        OK(ps_close(space, &error));
-        space = reopen(&io);
-        catalog_expect(space, 1, PS_CATALOG_COLLECTION, "pad-0", 5, 1);
-        OK(ps_close(space, &error));
+  for (kind = 0; kind < 2; ++kind) {
+    count = 0;
+    for (phase = 0; phase <= count; ++phase) {
+      clean();
+      m.operations = m.fail_at = 0;
+      space = create(3 * PS_MIB, 1, &io);
+      a = stream_open(space, 1, 1, NULL, NULL);
+      b = stream_open(space, 2, 1, NULL, NULL);
+      OK(canonical_append(a, "old", 3, 1, 1, &offset, &error));
+      OK(canonical_append(b, "new", 3, 1, 2, &offset, &error));
+      OK(ps_stream_status(a, &ai, &error));
+      OK(ps_stream_status(b, &bi, &error));
+      OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+                        stream_key(1), &ai.ref, &original, &error));
+      for (i = 0; i < 11; ++i) {
+        snprintf(pad, sizeof(pad), "pad-%lu", (unsigned long)i);
+        OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, pad,
+                          strlen(pad), NULL, stream_key(1), &ai.ref, &seen,
+                          &error));
       }
-      CHECK(count >= 1);
+      OK(ps_checkpoint(space, &error));
+      if (operation == CATALOG_CHECKPOINT)
+        OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                          &original.revision, stream_key(2), &bi.ref, &changed,
+                          &error));
+      OK(ps_status(space, &stats, &error));
+      m.operations = 0;
+      m.fail_at = kind == 0 ? phase : 0;
+      m.tear = m.persist_torn = 1;
+      allocation_call = 0;
+      allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
+      if (operation == CATALOG_CREATE)
+        rc = ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "next", 4,
+                            NULL, stream_key(2), &bi.ref, &changed, &error);
+      else if (operation == CATALOG_REPLACE)
+        rc = ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                            &original.revision, stream_key(2), &bi.ref,
+                            &changed, &error);
+      else if (operation == CATALOG_REMOVE)
+        rc = ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                               &original.revision, &error);
+      else
+        rc = ps_checkpoint(space, &error);
+      allocation_fail = 0;
+      m.fail_at = 0;
+      if (!phase)
+        count = kind == 0 ? m.operations : allocation_call;
+      if (rc != LC_OK) {
+        CHECK(kind == 0 || rc == LC_ERR_NOMEM);
+        lc_error_cleanup(&error);
+      }
+      if (kind == 0 && phase == count && operation != CATALOG_CHECKPOINT) {
+        int fd = open(path, O_RDONLY);
+        bytes = operation == CATALOG_REMOVE ? 64 : sizeof(event);
+        CHECK(fd >= 0 &&
+              pread(fd, event, bytes,
+                    PS_JOURNAL_OFFSET + stats.journal_bytes) == (ssize_t)bytes);
+        CHECK(close(fd) == 0);
+        memcpy(m.stable + PS_JOURNAL_OFFSET + stats.journal_bytes, event,
+               bytes);
+      }
+      OK(ps_stream_close(a, &error));
+      OK(ps_stream_close(b, &error));
+      OK(ps_close(space, &error));
+      crash(&m);
+      space = reopen(&io);
+      for (i = 0; i < 11; ++i) {
+        snprintf(pad, sizeof(pad), "pad-%lu", (unsigned long)i);
+        catalog_expect(space, 1, PS_CATALOG_COLLECTION, pad, strlen(pad), 1);
+      }
+      OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION,
+                        operation == CATALOG_CREATE ? "next" : "slot", 4, &view,
+                        &error));
+      if (view) {
+        OK(ps_catalog_view_info(view, &seen, &error));
+        CHECK(seen.stream.key == 1 || seen.stream.key == 2);
+        if (operation == CATALOG_CREATE || operation == CATALOG_CHECKPOINT ||
+            (operation == CATALOG_REPLACE && rc == LC_OK))
+          CHECK(seen.stream.key == 2);
+        if (operation == CATALOG_REMOVE)
+          CHECK(rc != LC_OK);
+        ps_catalog_view_close(view);
+        view = NULL;
+      } else
+        CHECK(operation == CATALOG_REMOVE ||
+              (operation == CATALOG_CREATE && rc != LC_OK));
+      if (operation == CATALOG_CREATE)
+        catalog_expect(space, 1, PS_CATALOG_COLLECTION, "slot", 4, 1);
+      a = stream_open(space, 1, 0, &ai.ref, NULL);
+      b = stream_open(space, 2, 0, &bi.ref, NULL);
+      stream_expect(a, 0, "old", 3, 1);
+      stream_expect(b, 0, "new", 3, 2);
+      BAD(ps_stream_retire(a, &error));
+      OK(ps_checkpoint(space, &error));
+      OK(ps_stream_close(a, &error));
+      OK(ps_stream_close(b, &error));
+      OK(ps_close(space, &error));
+      space = reopen(&io);
+      catalog_expect(space, 1, PS_CATALOG_COLLECTION, "pad-0", 5, 1);
+      OK(ps_close(space, &error));
     }
+    CHECK(count >= 1);
+    printf("catalog publication fault sites: kind=%zu count=%zu\n", kind,
+           count);
+  }
   free(m.stable);
   clean();
-  puts("catalog: every create/replace/delete/checkpoint I/O and heap failure, "
-       "growing index, torn records and durable target references");
+  puts("catalog: every publication I/O and heap failure, growing index, "
+       "torn records and durable target references");
 }
 typedef struct catalog_actor {
   ps_space *space;
@@ -6066,7 +6076,13 @@ static void catalog_visitors(void) {
        "callback/allocation failure cleanup, orphan candidates and publication "
        "races");
 }
-static void catalog_reopen_faults(void) {
+enum catalog_reopen_fault_kind {
+  CATALOG_REOPEN_WRITE_SYNC,
+  CATALOG_REOPEN_ALLOCATE,
+  CATALOG_REOPEN_READ
+};
+
+static void catalog_reopen_faults(enum catalog_reopen_fault_kind kind) {
   model m;
   ps_io io = model_init(&m);
   ps_options options = {0};
@@ -6078,7 +6094,7 @@ static void catalog_reopen_faults(void) {
   unsigned char *saved = malloc((size_t)(3 * PS_MIB));
   unsigned char *large = malloc(PS_CHUNK + 17);
   char name[32];
-  size_t kind, phase, count, i;
+  size_t phase, count, i;
   uint64_t offset, reads;
   int rc;
   CHECK(saved && large);
@@ -6114,62 +6130,60 @@ static void catalog_reopen_faults(void) {
   memcpy(saved, m.stable, (size_t)(3 * PS_MIB));
   options.io = &io;
   options.durable_sync = 1;
-  for (kind = 0; kind < 3; ++kind) {
-    count = 0;
-    for (phase = 0; phase <= count; ++phase) {
-      memcpy(m.stable, saved, (size_t)(3 * PS_MIB));
-      crash(&m);
-      m.operations = 0;
-      m.fail_at = kind == 0 ? phase : 0;
-      m.reads = 0;
-      m.fail_read = kind == 2 ? phase : 0;
-      m.tear = m.persist_torn = 1;
-      allocation_call = 0;
-      allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
-      rc = ps_open(path, 0, &options, &space, &error);
-      allocation_fail = 0;
-      m.fail_at = m.fail_read = 0;
-      if (!phase)
-        count = kind == 0   ? m.operations
-                : kind == 1 ? allocation_call
-                            : m.reads;
-      if (rc == LC_OK)
-        OK(ps_close(space, &error));
-      else {
-        CHECK(space == NULL && (kind != 1 || rc == LC_ERR_NOMEM));
-        lc_error_cleanup(&error);
-      }
-      crash(&m);
-      space = reopen(&io);
-      context.space = space;
-      context.mode = 3;
-      context.candidate = 3;
-      context.seen = 0;
-      reads = m.read_bytes;
-      OK(ps_catalog_visit_orphans(space, catalog_orphan_test, &context,
-                                  &error));
-      CHECK(context.seen == 1 && m.read_bytes == reads);
-      for (i = 0; i < 24; ++i) {
-        snprintf(name, sizeof(name), "name-%lu", (unsigned long)i);
-        info = catalog_expect(space, 1, PS_CATALOG_COLLECTION, name,
-                              strlen(name), i == 1 || i == 2 ? 2 : 1);
-        if (i == 2)
-          CHECK(info.id == expected.id &&
-                info.revision.incarnation == expected.revision.incarnation);
-      }
-      catalog_expect(space, 9, PS_CATALOG_CONTROL, large, PS_CHUNK + 17, 2);
+  count = 0;
+  for (phase = 0; phase <= count; ++phase) {
+    memcpy(m.stable, saved, (size_t)(3 * PS_MIB));
+    crash(&m);
+    m.operations = 0;
+    m.fail_at = kind == CATALOG_REOPEN_WRITE_SYNC ? phase : 0;
+    m.reads = 0;
+    m.fail_read = kind == CATALOG_REOPEN_READ ? phase : 0;
+    m.tear = m.persist_torn = 1;
+    allocation_call = 0;
+    allocation_fail =
+        kind == CATALOG_REOPEN_ALLOCATE ? (phase ? phase : (size_t)-1) : 0;
+    rc = ps_open(path, 0, &options, &space, &error);
+    allocation_fail = 0;
+    m.fail_at = m.fail_read = 0;
+    if (!phase)
+      count = kind == CATALOG_REOPEN_WRITE_SYNC ? m.operations
+              : kind == CATALOG_REOPEN_ALLOCATE ? allocation_call
+                                                : m.reads;
+    if (rc == LC_OK)
       OK(ps_close(space, &error));
+    else {
+      CHECK(space == NULL &&
+            (kind != CATALOG_REOPEN_ALLOCATE || rc == LC_ERR_NOMEM));
+      lc_error_cleanup(&error);
     }
-    CHECK(count > (kind == 1 ? 10 : 1));
-    printf("catalog recovery fault sites: kind=%lu count=%lu\n",
-           (unsigned long)kind, (unsigned long)count);
+    crash(&m);
+    space = reopen(&io);
+    context.space = space;
+    context.mode = 3;
+    context.candidate = 3;
+    context.seen = 0;
+    reads = m.read_bytes;
+    OK(ps_catalog_visit_orphans(space, catalog_orphan_test, &context, &error));
+    CHECK(context.seen == 1 && m.read_bytes == reads);
+    for (i = 0; i < 24; ++i) {
+      snprintf(name, sizeof(name), "name-%lu", (unsigned long)i);
+      info = catalog_expect(space, 1, PS_CATALOG_COLLECTION, name, strlen(name),
+                            i == 1 || i == 2 ? 2 : 1);
+      if (i == 2)
+        CHECK(info.id == expected.id &&
+              info.revision.incarnation == expected.revision.incarnation);
+    }
+    catalog_expect(space, 9, PS_CATALOG_CONTROL, large, PS_CHUNK + 17, 2);
+    OK(ps_close(space, &error));
   }
+  CHECK(count > (kind == CATALOG_REOPEN_ALLOCATE ? 10 : 1));
+  printf("catalog recovery fault sites: kind=%d count=%zu\n", (int)kind, count);
   free(saved);
   free(large);
   free(m.stable);
   clean();
-  puts("catalog: every recovery read/write/sync and heap failure, name-index "
-       "rebuild, spanning descriptors and acknowledged revisions survive");
+  puts("catalog: every selected recovery failure, name-index rebuild, "
+       "spanning descriptors and acknowledged revisions survive");
 }
 
 static void catalog_removal_prefix(void) {
@@ -8298,9 +8312,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "catalog") == 0) {
       catalog_basic(0);
       catalog_basic(1);
-      catalog_faults();
       catalog_visitors();
-      catalog_reopen_faults();
       catalog_removal_prefix();
       catalog_bounds_rollover();
       catalog_invalid_records();
@@ -8309,6 +8321,21 @@ int main(int argc, char **argv) {
       catalog_concurrency(2);
       catalog_snapshot_prefix(0);
       catalog_snapshot_prefix(1);
+    } else if (strcmp(argv[2], "catalog-create-faults") == 0) {
+      catalog_faults(CATALOG_CREATE);
+    } else if (strcmp(argv[2], "catalog-replace-faults") == 0) {
+      catalog_faults(CATALOG_REPLACE);
+    } else if (strcmp(argv[2], "catalog-remove-faults") == 0) {
+      catalog_faults(CATALOG_REMOVE);
+    } else if (strcmp(argv[2], "catalog-checkpoint-faults") == 0) {
+      catalog_faults(CATALOG_CHECKPOINT);
+    } else if (strcmp(argv[2], "catalog-reopen-write-sync-faults") == 0) {
+      catalog_reopen_faults(CATALOG_REOPEN_WRITE_SYNC);
+    } else if (strcmp(argv[2], "catalog-reopen-allocation-faults") == 0) {
+      catalog_reopen_faults(CATALOG_REOPEN_ALLOCATE);
+    } else if (strcmp(argv[2], "catalog-reopen-read-faults") == 0) {
+      catalog_reopen_faults(CATALOG_REOPEN_READ);
+    } else if (strcmp(argv[2], "catalog-scale") == 0) {
       catalog_scale();
     } else if (strcmp(argv[2], "lifecycle") == 0) {
       stream_lifecycle(0);
