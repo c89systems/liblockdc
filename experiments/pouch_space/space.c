@@ -3767,8 +3767,20 @@ static int checkpoint_pack_directory(ps_space *s, ps_directory *directory,
 static int clear_checkpoint_journal(ps_space *s, uint64_t cursor,
                                     unsigned char *image, size_t bytes,
                                     lc_error *error) {
-  memset(image, 0, bytes);
-  return journal_transfer(s, cursor, image, bytes, 1, error);
+  unsigned char zero[PS_CHUNK] = {0};
+  size_t chunk;
+  int rc = LC_OK;
+  if (image) {
+    memset(image, 0, bytes);
+    return journal_transfer(s, cursor, image, bytes, 1, error);
+  }
+  while (rc == LC_OK && bytes) {
+    chunk = bytes < sizeof(zero) ? bytes : sizeof(zero);
+    rc = journal_transfer(s, cursor, zero, chunk, 1, error);
+    cursor += chunk;
+    bytes -= chunk;
+  }
+  return rc;
 }
 #define CHECKPOINT_ZERO_RANGES 16U
 typedef struct checkpoint_zero_range {
@@ -3913,9 +3925,11 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
     ps_readiness_begin(s, PS_READINESS_CHECKPOINT_RETIRE);
   if (rc == LC_OK)
     rc = transfer(s, zero, sizeof(zero), (uint64_t)s->root * PS_PAGE, 1, error);
-  if (rc == LC_OK && covered)
+  /* The new selector is durable. Retire the prefix at the existing
+   * checkpoint barrier even when the exclusive journal reuses its start. */
+  if (rc == LC_OK && s->journal)
     rc = clear_checkpoint_journal(s, s->journal_start, s->journal_image,
-                                  covered, error);
+                                  s->journal, error);
   if (rc == LC_OK) {
     prepared = ps_readiness_issued_tickets(s);
     rc = sync_file(s, error); /* obsolete root and covered journal retired */

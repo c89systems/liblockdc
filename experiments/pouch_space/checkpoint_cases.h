@@ -133,7 +133,7 @@ static void checkpoint_idempotence(int durable) {
   OK(ps_open(path, 0, &options, &space, &error));
   OK(ps_status(space, &before, &error));
   CHECK(before.capacity == PS_DEFAULT_CAPACITY + PS_MIB &&
-        !before.journal_bytes);
+        !before.journal_bytes && !before.syncs);
   checkpoint_unchanged(space, &probe);
 
   /* Recover a real journal suffix. Opening a clean root assigns incarnations
