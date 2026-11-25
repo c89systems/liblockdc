@@ -121,6 +121,8 @@ set(pouch_space_collection_cases
   workspace-faults walk walk-faults transform transform-concurrency)
 set(pouch_space_collection_fault_cases transform-faults transform-prepare-faults)
 set(pouch_space_collection_fault_timeout 180)
+# Each codec/durability pair has four consecutive failure modes.
+set(pouch_space_collection_fault_shard_starts 0 4 8 12)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   add_custom_target(pouch_space_smoke
@@ -188,8 +190,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
           pouch_space_collection_test 600 ${mode})
       endforeach()
       foreach(mode IN LISTS pouch_space_collection_fault_cases)
-        pouch_space_darwin_case(pouch_space_collection_${mode}
-          pouch_space_collection_test ${pouch_space_collection_fault_timeout} ${mode})
+        foreach(first IN LISTS pouch_space_collection_fault_shard_starts)
+          math(EXPR last "${first} + 4")
+          pouch_space_darwin_case(pouch_space_collection_${mode}_${first}
+            pouch_space_collection_test ${pouch_space_collection_fault_timeout}
+            ${mode} ${first} ${last})
+        endforeach()
       endforeach()
     endif()
     if(NOT CMAKE_CROSSCOMPILING)
@@ -462,15 +468,22 @@ if(LOCKDC_BUILD_TESTS)
   endforeach()
   add_test(NAME pouch_space_collection_storage COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(pouch_space_collection_storage PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space")
-  foreach(mode IN LISTS pouch_space_collection_cases pouch_space_collection_fault_cases)
-    set(timeout_seconds 600)
-    if(mode IN_LIST pouch_space_collection_fault_cases)
-      set(timeout_seconds ${pouch_space_collection_fault_timeout})
-    endif()
+  foreach(mode IN LISTS pouch_space_collection_cases)
     add_test(NAME pouch_space_collection_${mode}
       COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-    set_tests_properties(pouch_space_collection_${mode} PROPERTIES TIMEOUT ${timeout_seconds}
+    set_tests_properties(pouch_space_collection_${mode} PROPERTIES TIMEOUT 600
       LABELS "unit;local;pouch-space")
+  endforeach()
+  foreach(mode IN LISTS pouch_space_collection_fault_cases)
+    foreach(first IN LISTS pouch_space_collection_fault_shard_starts)
+      math(EXPR last "${first} + 4")
+      set(name pouch_space_collection_${mode}_${first})
+      add_test(NAME ${name} COMMAND pouch_space_collection_test
+        ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${first} ${last})
+      set_tests_properties(${name} PROPERTIES
+        TIMEOUT ${pouch_space_collection_fault_timeout} COST 30
+        LABELS "unit;local;pouch-space")
+    endforeach()
   endforeach()
   # SDK fixtures use separate temporary roots and process-local failure hooks.
   foreach(surface queue outbox xa query collection-query)
