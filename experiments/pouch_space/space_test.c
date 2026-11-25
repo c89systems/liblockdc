@@ -1273,15 +1273,19 @@ static void reopen_sanitization(void) {
   ps_options options = {0};
   ps_space *space = create(PS_MIB, 0, &io);
   unsigned char root[PS_ROOT_BYTES];
+  unsigned char readiness[PS_PAGE], preserved[PS_PAGE];
   int fd;
   OK(ps_close(space, &error));
   size_t offset = !memcmp(m.stable, "PSROOT1", 7) ? 0 : PS_PAGE;
   memcpy(root, m.stable + offset, sizeof(root));
-  fixture_put(root + 72, PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_FIXED_GRANTS, 4);
+  fixture_put(root + ROOT_LAYOUT_OFFSET,
+              PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_COMPACT_REVISIONS, 4);
   fixture_put(root + ROOT_CHECKSUM, crc32(0, root, ROOT_CHECKSUM), 4);
   fd = open(path, O_RDWR);
   CHECK(fd >= 0 &&
         pwrite(fd, root, sizeof(root), (off_t)offset) == (ssize_t)sizeof(root));
+  CHECK(pread(fd, readiness, sizeof(readiness), PS_READINESS_OFFSET) ==
+        (ssize_t)sizeof(readiness));
   CHECK(close(fd) == 0);
   m.writes = m.syncs = 0;
   options.io = &io;
@@ -1289,6 +1293,14 @@ static void reopen_sanitization(void) {
         !space);
   CHECK(!m.writes && !m.syncs);
   lc_error_cleanup(&error);
+  options.shared = 1;
+  CHECK(ps_open(path, 0, &options, &space, &error) == LC_ERR_PROTOCOL &&
+        !space);
+  lc_error_cleanup(&error);
+  fd = open(path, O_RDONLY);
+  CHECK(fd >= 0 && pread(fd, preserved, sizeof(preserved),
+                         PS_READINESS_OFFSET) == (ssize_t)sizeof(preserved));
+  CHECK(!memcmp(readiness, preserved, sizeof(readiness)) && close(fd) == 0);
   free(m.stable);
   clean();
   printf("reopen: bounded clean writes, sparse/stale tails, both sibling-root "

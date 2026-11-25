@@ -11,13 +11,14 @@
 #define PS_OWNED_RUN 4U
 #define PS_RUN_IDENTITY_BYTES 64U
 #define PS_RUN_HEADER 96U
-/* Required root geometry includes the coordination page and grant slots.
- * An opener that expects journal grants cannot recover this layout. */
+/* Required root layout covers coordination, grant slots and journal framing.
+ * An opener must recognize the layout before replaying or clearing records. */
 #define PS_ROOT_LAYOUT_FIXED_GRANTS UINT32_C(0x20000)
 #define PS_ROOT_LAYOUT_JOURNAL_WINDOW UINT32_C(0x40000)
+#define PS_ROOT_LAYOUT_COMPACT_REVISIONS UINT32_C(0x100000)
 #define PS_ROOT_LAYOUT                                                         \
   (PS_RUN_HEADER | UINT32_C(0x10000) | PS_ROOT_LAYOUT_FIXED_GRANTS |           \
-   PS_ROOT_LAYOUT_JOURNAL_WINDOW)
+   PS_ROOT_LAYOUT_JOURNAL_WINDOW | PS_ROOT_LAYOUT_COMPACT_REVISIONS)
 #define PS_OWNED_DESCRIPTOR_BYTES 104U
 typedef struct ps_owned_head ps_owned_head;
 typedef struct ps_owned_run ps_owned_run;

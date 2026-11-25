@@ -304,9 +304,11 @@ static void revision_candidate_images(void) {
   CHECK(fd >= 0 && pread(fd, complete, (size_t)PS_MIB, 0) == (ssize_t)PS_MIB &&
         !close(fd));
   unsigned char *frame = complete + offset;
-  CHECK(!memcmp(frame, "PSR1", 4) && frame_bytes > 192);
-  size_t second_at = 64 + (uint32_t)fixture_get64(frame + 64 + 4);
-  CHECK(second_at + 64 <= frame_bytes);
+  CHECK((uint32_t)fixture_get64(frame) == REVISION_MAGIC &&
+        frame_bytes == REVISION_HEADER_BYTES + 2 * REVISION_MEMBER_BYTES + 72);
+  size_t second_at = REVISION_HEADER_BYTES +
+                     (uint32_t)fixture_get64(frame + REVISION_HEADER_BYTES);
+  CHECK(second_at + REVISION_MEMBER_BYTES <= frame_bytes);
   /* Every physical byte prefix of the descriptor frame, with all payload
    * already persisted. Complete inner entries cannot escape their frame. */
   for (size_t cut = 0; cut <= frame_bytes; ++cut) {
@@ -330,27 +332,30 @@ static void revision_candidate_images(void) {
     unsigned char *group = candidate + offset;
     unsigned char *second = group + second_at;
     if (damage == 0)
-      second[60] ^= 1; /* inner checksum */
+      second[REVISION_MEMBER_BYTES - 1] ^= 1;
     else if (damage == 1) {
-      memcpy(second + 16, group + 64 + 16, 24); /* duplicate typed key */
-      fixture_entry_crc(second);
+      memcpy(second + 4, group + REVISION_HEADER_BYTES + 4, 24);
     } else if (damage == 2) {
-      fixture_put(second + 8, fixture_get64(second + 8) + 1, 8);
-      fixture_entry_crc(second);
+      fixture_put(group + 8, fixture_get64(group + 8) + 1, 8);
     } else if (damage == 3)
       fixture_put(group + 16, 0, 4);
     else if (damage == 4)
       fixture_put(group + 16, 1, 4); /* trailing second member */
     else if (damage == 5)
-      group[24] = 1; /* reserved header field */
+      group[20] = 2; /* invalid durability policy */
     else if (damage == 6) {
-      uint64_t payload = fixture_get64(second + 64);
+      uint64_t payload = fixture_get64(second + REVISION_MEMBER_BYTES);
       CHECK(payload >= PS_DATA && payload < PS_MIB);
       candidate[payload] ^= 1;
     } else {
-      fixture_put(second + 4, frame_bytes, 4); /* truncated last member */
+      fixture_put(second, frame_bytes, 4); /* truncated last member */
     }
-    fixture_entry_crc(group);
+    if (damage != 0)
+      fixture_put(group + REVISION_HEADER_BYTES - 4,
+                  crc32(crc32(0, group, REVISION_HEADER_BYTES - 4),
+                        group + REVISION_HEADER_BYTES,
+                        (uInt)(frame_bytes - REVISION_HEADER_BYTES)),
+                  4);
     memcpy(m.stable, candidate, (size_t)PS_MIB);
     m.stable_bytes = PS_MIB;
     crash(&m);
@@ -504,7 +509,8 @@ static void revision_rollover(void) {
   do {
     put(s, state(77), "f", 1, 1);
     OK(ps_status(s, &before, &error));
-  } while (PS_JOURNAL - before.journal_bytes >= 264);
+  } while (PS_JOURNAL - before.journal_bytes >=
+           REVISION_HEADER_BYTES + 2 * REVISION_MEMBER_BYTES + 72);
   OK(revision_write(s, 0, bytes, PS_CHUNK + 37, "revision two", 12, &error));
   OK(ps_status(s, &after, &error));
   CHECK(after.checkpoints == before.checkpoints + 1);
@@ -749,10 +755,11 @@ static void revision_derived_recovery(void) {
     put(s, state(99), "after", 5, 2);
     OK(ps_flush(s, &error));
     OK(ps_close(s, &error));
-    uint64_t member = PS_JOURNAL_OFFSET + before.journal_bytes + 64;
+    uint64_t member =
+        PS_JOURNAL_OFFSET + before.journal_bytes + REVISION_HEADER_BYTES;
     if (damaged)
-      member += (uint32_t)fixture_get64(m.stable + member + 4);
-    uint64_t payload = fixture_get64(m.stable + member + 64);
+      member += (uint32_t)fixture_get64(m.stable + member);
+    uint64_t payload = fixture_get64(m.stable + member + REVISION_MEMBER_BYTES);
     CHECK(payload >= PS_DATA && payload < PS_MIB);
     m.stable[payload] ^= 1;
     crash(&m);

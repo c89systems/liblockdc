@@ -29,6 +29,9 @@ typedef struct ps_catalog_index {
 #define ROOT_MAGIC LC_U64_WORDS(0x0031544fUL, 0x4f525350UL)
 #define EVENT_MAGIC ((lc_u64)0x31565350)
 #define REVISION_MAGIC UINT32_C(0x31525350)
+/* The root layout selects this revision encoding before any journal replay. */
+#define REVISION_HEADER_BYTES 28U
+#define REVISION_MEMBER_BYTES 48U
 #define BUCKETS 257U
 #define JOURNAL_OFFSET PS_JOURNAL_OFFSET
 #define JOURNAL_POSITION(cursor) (JOURNAL_OFFSET + ((cursor) % PS_JOURNAL))

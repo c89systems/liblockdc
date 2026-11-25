@@ -634,18 +634,18 @@ static void index_corrupt_generation(const char *directory) {
       const unsigned char *frame = disk.stable + PS_JOURNAL_OFFSET + at;
       size_t bytes = (uint32_t)index_fixture_u64(frame + 4);
       REQUIRE(bytes >= 64 && bytes <= stats.journal_bytes - at);
-      if (!memcmp(frame, "PSR1", 4)) {
-        size_t member = 64;
+      if ((uint32_t)index_fixture_u64(frame) == REVISION_MAGIC) {
+        size_t member = REVISION_HEADER_BYTES;
         while (member < bytes) {
           const unsigned char *record = frame + member;
-          size_t span = (uint32_t)index_fixture_u64(record + 4);
-          REQUIRE(span >= 64 && span <= bytes - member);
-          if ((uint32_t)index_fixture_u64(record + 16) ==
+          size_t span = (uint32_t)index_fixture_u64(record);
+          REQUIRE(span >= REVISION_MEMBER_BYTES && span <= bytes - member);
+          if ((uint32_t)index_fixture_u64(record + 4) ==
                   PS_QUERY_FIRST + 2 * LC_POUCH_INDEX_PACKED + 1 &&
-              index_fixture_u64(record + 24) == identity.owner &&
-              index_fixture_u64(record + 32) == sequence) {
-            REQUIRE(span >= 88);
-            payload = index_fixture_u64(record + 64);
+              index_fixture_u64(record + 12) == identity.owner &&
+              index_fixture_u64(record + 20) == sequence) {
+            REQUIRE(span >= REVISION_MEMBER_BYTES + 24);
+            payload = index_fixture_u64(record + REVISION_MEMBER_BYTES);
           }
           member += span;
         }

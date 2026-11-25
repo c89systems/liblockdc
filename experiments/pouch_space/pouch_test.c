@@ -15,6 +15,7 @@
 #include "pouch_internal.h"
 #include "readiness.h"
 #include "root_internal.h"
+#include "space_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -6562,24 +6563,26 @@ static uint32_t staged_revision_u32(const void *bytes) {
 static size_t staged_terminal_revision(const void *bytes, size_t length,
                                        off_t at) {
   const unsigned char *p = bytes;
-  size_t cursor = 64, members;
+  size_t cursor = REVISION_HEADER_BYTES, members;
   int terminal = 0;
-  if (at < PS_JOURNAL_OFFSET || at >= PS_DATA || length < 64 ||
-      memcmp(p, "PSR1", 4))
+  if (at < PS_JOURNAL_OFFSET || at >= PS_DATA ||
+      length < REVISION_HEADER_BYTES ||
+      staged_revision_u32(p) != REVISION_MAGIC)
     return 0;
   REQUIRE(staged_revision_u32(p + 4) == length);
   members = staged_revision_u32(p + 16);
   for (size_t i = 0; i < members; ++i) {
-    REQUIRE(length - cursor >= 64);
-    size_t member = staged_revision_u32(p + cursor + 4);
-    REQUIRE(member >= 64 && member <= length - cursor);
-    if (staged_revision_u32(p + cursor + 16) == PS_KEY_METADATA) {
-      if (member == 64)
+    REQUIRE(length - cursor >= REVISION_MEMBER_BYTES);
+    size_t member = staged_revision_u32(p + cursor);
+    REQUIRE(member >= REVISION_MEMBER_BYTES && member <= length - cursor);
+    if (staged_revision_u32(p + cursor + 4) == PS_KEY_METADATA) {
+      if (member == REVISION_MEMBER_BYTES)
         terminal = 1; /* Physical removal contains no extent or reserve. */
       else {
-        REQUIRE(member >= 72);
-        terminal |= !staged_revision_u32(p + cursor + 64) &&
-                    !staged_revision_u32(p + cursor + 68);
+        REQUIRE(member >= REVISION_MEMBER_BYTES + 8);
+        terminal |=
+            !staged_revision_u32(p + cursor + REVISION_MEMBER_BYTES) &&
+            !staged_revision_u32(p + cursor + REVISION_MEMBER_BYTES + 4);
       }
     }
     cursor += member;
@@ -6591,7 +6594,9 @@ static ssize_t staged_crash_write(void *context, int fd, const void *bytes,
                                   size_t length, off_t at) {
   (void)context;
   if (staged_crash_armed && staged_terminal_revision(bytes, length, at)) {
-    size_t first = 64 + staged_revision_u32((const unsigned char *)bytes + 68);
+    size_t first = REVISION_HEADER_BYTES +
+                   staged_revision_u32((const unsigned char *)bytes +
+                                       REVISION_HEADER_BYTES);
     REQUIRE(first < length);
     REQUIRE(pwrite(fd, bytes, first, at) == (ssize_t)first);
     _exit(77);
@@ -6679,10 +6684,10 @@ static ssize_t batch_model_write(void *context, int fd, const void *p, size_t n,
     m->terminal_members = members;
   }
   if (members && m->cut >= 3) {
-    boundary = m->cut == 3 ? 32 : 64;
+    boundary = m->cut == 3 ? REVISION_HEADER_BYTES / 2 : REVISION_HEADER_BYTES;
     for (int record = 0; record < m->cut - 4; ++record) {
-      REQUIRE(n - boundary >= 64);
-      boundary += staged_revision_u32((const unsigned char *)p + boundary + 4);
+      REQUIRE(n - boundary >= REVISION_MEMBER_BYTES);
+      boundary += staged_revision_u32((const unsigned char *)p + boundary);
     }
     REQUIRE(boundary < n);
     cut = 1;

@@ -38,6 +38,10 @@ The public storage semantics are defined in the
 
 Checksummed root selectors and a bounded rolling journal choose the accepted
 physical prefix. A copy-on-write directory binds typed identities to extents.
+Each revision batch has one checksum and one starting sequence. Its members
+retain typed ownership, extent checksums, and explicit lengths. The required
+root layout bit identifies this encoding before journal replay. Use a freshly
+created experimental container with this layout.
 Acknowledged durable operations survive recovery. NoSync work without a
 durability barrier can be lost. Recovery checks framing, ownership, and commit
 boundaries before admitting complete canonical publication groups. Before

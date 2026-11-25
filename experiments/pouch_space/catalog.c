@@ -141,52 +141,52 @@ size_t ps_catalog_record_bytes(const ps_entry *p) {
 }
 void ps_catalog_encode_record(unsigned char *wire, const ps_entry *p) {
   const ps_catalog_record *r = p->catalog;
-  ps_wire_put32(wire + 64, r->kind);
-  ps_wire_put32(wire + 68, (uint32_t)r->length);
-  ps_wire_put32(wire + 72, r->stream.kind);
-  ps_wire_put32(wire + 76, (uint32_t)r->value_length);
-  ps_wire_put64(wire + 80, r->stream.owner);
-  ps_wire_put64(wire + 88, r->stream.key);
-  ps_wire_put64(wire + 96, r->token);
+  ps_wire_put32(wire, r->kind);
+  ps_wire_put32(wire + 4, (uint32_t)r->length);
+  ps_wire_put32(wire + 8, r->stream.kind);
+  ps_wire_put32(wire + 12, (uint32_t)r->value_length);
+  ps_wire_put64(wire + 16, r->stream.owner);
+  ps_wire_put64(wire + 24, r->stream.key);
+  ps_wire_put64(wire + 32, r->token);
   if (r->length)
-    memcpy(wire + 104, r->name, r->length);
+    memcpy(wire + 40, r->name, r->length);
   if (r->value_length)
-    memcpy(wire + 104 + r->length, r->value, r->value_length);
+    memcpy(wire + 40 + r->length, r->value, r->value_length);
 }
 int ps_catalog_decode_record(ps_entry *p, const unsigned char *wire,
                              size_t bytes, lc_error *e) {
   size_t length, value_length;
   unsigned int kind, stream_kind;
   int rc;
-  if (bytes < 104)
+  if (bytes < 40)
     return cat_error(e, LC_ERR_PROTOCOL, "truncated catalog record");
-  length = ps_wire_get32(wire + 68);
-  value_length = ps_wire_get32(wire + 76);
-  kind = ps_wire_get32(wire + 64);
-  stream_kind = ps_wire_get32(wire + 72);
-  if (!arguments(kind, wire + 104, length) || length > bytes - 104 ||
-      value_length != bytes - 104 - length)
+  length = ps_wire_get32(wire + 4);
+  value_length = ps_wire_get32(wire + 12);
+  kind = ps_wire_get32(wire);
+  stream_kind = ps_wire_get32(wire + 8);
+  if (length > bytes - 40 || value_length != bytes - 40 - length ||
+      !arguments(kind, wire + 40, length))
     return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog record");
   if (kind == PS_CATALOG_MARKER) {
     if (!p->key.owner || !length || value_length > PS_CATALOG_MARKER_MAX ||
-        stream_kind || ps_wire_get64(wire + 80) || ps_wire_get64(wire + 88) ||
-        ps_wire_get64(wire + 96))
+        stream_kind || ps_wire_get64(wire + 16) || ps_wire_get64(wire + 24) ||
+        ps_wire_get64(wire + 32))
       return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog marker record");
   } else if (value_length ||
              (stream_kind == PS_STREAM
-                  ? !ps_wire_get64(wire + 96)
+                  ? !ps_wire_get64(wire + 32)
                   : stream_kind || kind != PS_CATALOG_NAMESPACE ||
                         p->key.owner || p->token != p->key.key ||
-                        ps_wire_get64(wire + 80) || ps_wire_get64(wire + 88) ||
-                        ps_wire_get64(wire + 96)))
+                        ps_wire_get64(wire + 16) || ps_wire_get64(wire + 24) ||
+                        ps_wire_get64(wire + 32)))
     return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog target record");
-  rc = attach_record(p, kind, wire + 104, length, wire + 104 + length,
+  rc = attach_record(p, kind, wire + 40, length, wire + 40 + length,
                      value_length, e);
   if (rc == LC_OK) {
-    p->catalog->stream.kind = ps_wire_get32(wire + 72);
-    p->catalog->stream.owner = ps_wire_get64(wire + 80);
-    p->catalog->stream.key = ps_wire_get64(wire + 88);
-    p->catalog->token = ps_wire_get64(wire + 96);
+    p->catalog->stream.kind = stream_kind;
+    p->catalog->stream.owner = ps_wire_get64(wire + 16);
+    p->catalog->stream.key = ps_wire_get64(wire + 24);
+    p->catalog->token = ps_wire_get64(wire + 32);
   }
   return rc;
 }

@@ -2464,48 +2464,54 @@ static int live_hint(uint32_t event) {
          event == PS_NAMESPACE_OWNER || event == PS_STREAM_EDIT ||
          event == PS_STREAM_COMPLETE || event == PS_STREAM_ADMITTED;
 }
+static void encode_entry_fields(unsigned char *fields, unsigned char *extra,
+                                const ps_entry *p, int event) {
+  size_t i;
+  ps_wire_put32(fields, p->key.kind);
+  ps_wire_put32(fields + 4, (uint32_t)event);
+  ps_wire_put64(fields + 8, p->key.owner);
+  ps_wire_put64(fields + 16, p->key.key);
+  ps_wire_put64(fields + 24, p->token);
+  if (live_hint((uint32_t)event))
+    ps_wire_put64(fields + 32, p->bytes);
+  if (event == PS_PUT || event == PS_SEAL) {
+    ps_wire_put64(fields + 32, p->bytes);
+    ps_wire_put32(fields + 40, (uint32_t)p->count);
+    if (p->key.kind == PS_OWNED_RUN) {
+      ps_wire_put64(extra, p->stream.run->capacity);
+      ps_wire_put32(extra + 8, (uint32_t)p->stream.run->mapped);
+      extra += 16;
+    }
+    if (p->key.kind == PS_KEY_METADATA) {
+      ps_wire_put64(extra, p->deletion_bytes);
+      extra += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
+    }
+    for (i = 0; i < p->count; ++i, extra += 24) {
+      ps_wire_put64(extra, p->extents[i].offset);
+      ps_wire_put64(extra + 8, p->extents[i].bytes);
+      ps_wire_put32(extra + 16, p->extents[i].crc);
+      ps_wire_put32(extra + 20, p->extents[i].flags);
+    }
+    if (p->key.kind == PS_STREAM) {
+      ps_wire_put32(fields + 40, p->stream.head->sealed ? STREAM_SEALED_FLAG
+                                 : p->stream.head->admitted
+                                     ? STREAM_ADMITTED_FLAG
+                                     : 0U);
+      ps_wire_put64(extra, p->stream.head->capacity);
+      ps_wire_put64(extra + 8, p->stream.head->runs);
+    }
+    if (p->key.kind == PS_CATALOG)
+      ps_catalog_encode_record(extra, p);
+  }
+}
 static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
                          int event) {
-  size_t i, bytes = event_bytes(p, event), first;
+  size_t bytes = event_bytes(p, event);
   memset(wire, 0, bytes);
   ps_wire_put32(wire, (uint32_t)EVENT_MAGIC);
   ps_wire_put32(wire + 4, (uint32_t)bytes);
   ps_wire_put64(wire + 8, seq);
-  ps_wire_put32(wire + 16, p->key.kind);
-  ps_wire_put32(wire + 20, (uint32_t)event);
-  ps_wire_put64(wire + 24, p->key.owner);
-  ps_wire_put64(wire + 32, p->key.key);
-  ps_wire_put64(wire + 40, p->token);
-  if (live_hint((uint32_t)event))
-    ps_wire_put64(wire + 48, p->bytes);
-  if (event == PS_PUT || event == PS_SEAL) {
-    ps_wire_put64(wire + 48, p->bytes);
-    ps_wire_put32(wire + 56, (uint32_t)p->count);
-    first = p->key.kind == PS_OWNED_RUN ? 80 : 64;
-    if (p->key.kind == PS_OWNED_RUN) {
-      ps_wire_put64(wire + 64, p->stream.run->capacity);
-      ps_wire_put32(wire + 72, (uint32_t)p->stream.run->mapped);
-    }
-    if (p->key.kind == PS_KEY_METADATA) {
-      ps_wire_put64(wire + 64, p->deletion_bytes);
-      first += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
-    }
-    for (i = 0; i < p->count; ++i) {
-      ps_wire_put64(wire + first + 24 * i, p->extents[i].offset);
-      ps_wire_put64(wire + first + 8 + 24 * i, p->extents[i].bytes);
-      ps_wire_put32(wire + first + 16 + 24 * i, p->extents[i].crc);
-      ps_wire_put32(wire + first + 20 + 24 * i, p->extents[i].flags);
-    }
-    if (p->key.kind == PS_STREAM) {
-      ps_wire_put32(wire + 56, p->stream.head->sealed     ? STREAM_SEALED_FLAG
-                               : p->stream.head->admitted ? STREAM_ADMITTED_FLAG
-                                                          : 0U);
-      ps_wire_put64(wire + 64, p->stream.head->capacity);
-      ps_wire_put64(wire + 72, p->stream.head->runs);
-    }
-    if (p->key.kind == PS_CATALOG)
-      ps_catalog_encode_record(wire, p);
-  }
+  encode_entry_fields(wire + 16, wire + 64, p, event);
   ps_wire_put32(wire + 60, (uint32_t)ps_crc32(checksum(wire, 60), wire + 64,
                                               (uInt)(bytes - 64)));
 }
@@ -2530,39 +2536,36 @@ static int valid_stream_span(uint64_t tail, uint64_t capacity, uint64_t runs) {
   return tail <= capacity && capacity <= LC_I64_MAX &&
          runs <= capacity / (PS_PAGE - PS_RUN_HEADER);
 }
-static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
-                        int temporary, ps_entry **out, int *event,
-                        lc_error *error) {
+static int decode_entry_fields(ps_space *s, const unsigned char *fields,
+                               const unsigned char *extra, size_t bytes,
+                               int temporary, ps_entry **out, int *event,
+                               lc_error *error) {
   size_t count, i, first;
   uint64_t sum = 0, offset, n;
   ps_entry *p;
   uint32_t type, kind, wire_count;
   *out = NULL;
-  if (bytes < 64 || ps_wire_get32(wire) != EVENT_MAGIC ||
-      ps_wire_get32(wire + 4) != bytes ||
-      ps_wire_get32(wire + 60) != entry_checksum(wire, bytes))
-    return err(error, LC_ERR_PROTOCOL, "invalid container metadata checksum");
-  type = ps_wire_get32(wire + 20);
-  kind = ps_wire_get32(wire + 16);
-  wire_count = ps_wire_get32(wire + 56);
+  type = ps_wire_get32(fields + 4);
+  kind = ps_wire_get32(fields);
+  wire_count = ps_wire_get32(fields + 40);
   count = kind == PS_STREAM || kind == PS_CATALOG ? 0 : wire_count;
-  first = kind == PS_OWNED_RUN && type == PS_PUT ? 80 : 64;
+  first = kind == PS_OWNED_RUN && type == PS_PUT ? 16 : 0;
   if (kind == PS_KEY_METADATA && type == PS_PUT)
     first += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
   if (count > (PS_JOURNAL - 64) / 24 ||
       (kind != PS_CATALOG &&
        bytes != (kind == PS_STREAM && (type == PS_PUT || type == PS_SEAL)
-                     ? 80
+                     ? 16
                      : first + count * 24)) ||
       (type != PS_PUT && type != PS_REMOVE && type != PS_SEAL))
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
   p = space_entry_new(s, kind, count, temporary);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot allocate container entry");
-  p->key.owner = ps_wire_get64(wire + 24);
-  p->key.key = ps_wire_get64(wire + 32);
-  p->token = ps_wire_get64(wire + 40);
-  p->bytes = ps_wire_get64(wire + 48);
+  p->key.owner = ps_wire_get64(fields + 8);
+  p->key.key = ps_wire_get64(fields + 16);
+  p->token = ps_wire_get64(fields + 24);
+  p->bytes = ps_wire_get64(fields + 32);
   *event = (int)type;
   if (!valid_key(p->key) || !p->token || p->token > s->token_limit ||
       (*event == PS_REMOVE &&
@@ -2573,9 +2576,9 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     goto invalid;
   if (p->key.kind == PS_CATALOG) {
     int rc;
-    if (p->bytes || wire_count || (*event == PS_REMOVE && bytes != 64))
+    if (p->bytes || wire_count || (*event == PS_REMOVE && bytes))
       goto invalid;
-    rc = *event == PS_PUT ? ps_catalog_decode_record(p, wire, bytes, error)
+    rc = *event == PS_PUT ? ps_catalog_decode_record(p, extra, bytes, error)
                           : LC_OK;
     if (rc != LC_OK) {
       ps_internal_entry_free(p);
@@ -2588,8 +2591,8 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     uint32_t flags = wire_count;
     p->stream.head->sealed = (flags & STREAM_SEALED_FLAG) != 0;
     p->stream.head->admitted = (flags & STREAM_ADMITTED_FLAG) != 0;
-    p->stream.head->capacity = ps_wire_get64(wire + 64);
-    p->stream.head->runs = ps_wire_get64(wire + 72);
+    p->stream.head->capacity = ps_wire_get64(extra);
+    p->stream.head->runs = ps_wire_get64(extra + 8);
     if (flags > STREAM_ADMITTED_FLAG ||
         (*event == PS_SEAL && !p->stream.head->sealed) ||
         !valid_stream_span(p->bytes, p->stream.head->capacity,
@@ -2599,12 +2602,12 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     return LC_OK;
   }
   if (p->key.kind == PS_OWNED_RUN && *event == PS_PUT) {
-    p->stream.run->capacity = ps_wire_get64(wire + 64);
-    p->stream.run->mapped = (int)ps_wire_get32(wire + 72);
+    p->stream.run->capacity = ps_wire_get64(extra);
+    p->stream.run->mapped = (int)ps_wire_get32(extra + 8);
     if (!p->stream.run->capacity ||
         p->stream.run->capacity > PS_MIB - PS_RUN_HEADER ||
         p->key.key > (uint64_t)LC_I64_MAX - p->stream.run->capacity ||
-        ps_wire_get32(wire + 72) > 1 || ps_wire_get32(wire + 76) ||
+        ps_wire_get32(extra + 8) > 1 || ps_wire_get32(extra + 12) ||
         (!p->stream.run->mapped &&
          (p->bytes < PS_RUN_HEADER ||
           p->stream.run->capacity != p->bytes - PS_RUN_HEADER)) ||
@@ -2615,9 +2618,9 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   }
   p->count = count;
   for (i = 0; i < count; ++i) {
-    offset = ps_wire_get64(wire + first + 24 * i);
-    n = ps_wire_get64(wire + first + 8 + 24 * i);
-    p->extents[i].flags = ps_wire_get32(wire + first + 20 + 24 * i);
+    offset = ps_wire_get64(extra + first + 24 * i);
+    n = ps_wire_get64(extra + first + 8 + 24 * i);
+    p->extents[i].flags = ps_wire_get32(extra + first + 20 + 24 * i);
     if (!n ||
         n > (p->key.kind == PS_OWNED_RUN && !p->stream.run->mapped
                  ? PS_MIB
@@ -2633,13 +2636,13 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
       goto invalid;
     p->extents[i].offset = offset;
     p->extents[i].bytes = n;
-    p->extents[i].crc = ps_wire_get32(wire + first + 16 + 24 * i);
+    p->extents[i].crc = ps_wire_get32(extra + first + 16 + 24 * i);
     sum += n;
   }
   if (sum != p->bytes)
     goto invalid;
   if (p->key.kind == PS_KEY_METADATA && type == PS_PUT) {
-    uint64_t deletion = ps_wire_get64(wire + 64);
+    uint64_t deletion = ps_wire_get64(extra);
     int rc;
     if (deletion > p->bytes && deletion - p->bytes > 512)
       goto invalid;
@@ -2654,6 +2657,17 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
 invalid:
   ps_internal_entry_free(p);
   return err(error, LC_ERR_PROTOCOL, "invalid container ownership descriptor");
+}
+static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
+                        int temporary, ps_entry **out, int *event,
+                        lc_error *error) {
+  *out = NULL;
+  if (bytes < 64 || ps_wire_get32(wire) != EVENT_MAGIC ||
+      ps_wire_get32(wire + 4) != bytes ||
+      ps_wire_get32(wire + 60) != entry_checksum(wire, bytes))
+    return err(error, LC_ERR_PROTOCOL, "invalid container metadata checksum");
+  return decode_entry_fields(s, wire + 16, wire + 64, bytes - 64, temporary,
+                             out, event, error);
 }
 static int owned_encoded_read(ps_space *s, ps_entry *p, uint64_t at,
                               void *bytes, size_t n, lc_error *e) {
@@ -5407,46 +5421,56 @@ static int revision_retirement_matches(const ps_entry *entry,
                                        uint64_t incarnation) {
   return entry && !entry->deleted && entry->token == incarnation;
 }
+static uint32_t revision_checksum(const unsigned char *wire, size_t bytes) {
+  return (uint32_t)ps_crc32(checksum(wire, REVISION_HEADER_BYTES - 4),
+                            wire + REVISION_HEADER_BYTES,
+                            (uInt)(bytes - REVISION_HEADER_BYTES));
+}
 /* Validate the entire candidate before changing any selected ownership. A
- * complete inner record is not independently recoverable inside a revision. */
+ * member inherits its sequence and integrity check from the entire frame. */
 static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
                            recovery_values *values, ps_entry ***out,
                            lc_error *error) {
   ps_entry **entries = NULL, *old;
-  size_t count, i, j, cursor = 64, member_bytes, added = 0;
+  size_t count, i, j, cursor = REVISION_HEADER_BYTES, member_bytes, added = 0;
   int event, rc = LC_OK;
+  if (bytes < REVISION_HEADER_BYTES || ps_wire_get32(wire) != REVISION_MAGIC)
+    return err(error, LC_ERR_PROTOCOL, "invalid container revision header");
   count = ps_wire_get32(wire + 16);
-  if (bytes < 64 || ps_wire_get32(wire) != REVISION_MAGIC ||
-      ps_wire_get32(wire + 4) != bytes || !count || count > (bytes - 64) / 64 ||
+  if (ps_wire_get32(wire + 4) != bytes || !count ||
+      count > (bytes - REVISION_HEADER_BYTES) / REVISION_MEMBER_BYTES ||
       count > LC_U64_MAX - s->sequence ||
       ps_wire_get64(wire + 8) != s->sequence + 1 ||
-      ps_wire_get32(wire + 20) > 1 || ps_wire_get64(wire + 24) ||
-      ps_wire_get64(wire + 32) || ps_wire_get64(wire + 40) ||
-      ps_wire_get64(wire + 48) || ps_wire_get32(wire + 56) ||
-      ps_wire_get32(wire + 60) !=
-          (uint32_t)ps_crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
+      ps_wire_get32(wire + 20) > 1 ||
+      ps_wire_get32(wire + REVISION_HEADER_BYTES - 4) !=
+          revision_checksum(wire, bytes))
     return err(error, LC_ERR_PROTOCOL, "invalid container revision frame");
   entries = lc_calloc_with_allocator(NULL, count, sizeof(*entries));
   if (!entries)
     return err(error, LC_ERR_NOMEM, "cannot allocate revision recovery owners");
   for (i = 0; rc == LC_OK && i < count; ++i) {
-    if (bytes - cursor < 64) {
+    const unsigned char *member = wire + cursor;
+    ps_key key = {0};
+    if (bytes - cursor < REVISION_MEMBER_BYTES) {
       rc = err(error, LC_ERR_PROTOCOL, "truncated revision member");
       break;
     }
-    member_bytes = ps_wire_get32(wire + cursor + 4);
-    if (member_bytes < 64 || member_bytes > bytes - cursor ||
-        ps_wire_get64(wire + cursor + 8) != s->sequence + 1 + i) {
+    member_bytes = ps_wire_get32(member);
+    if (member_bytes < REVISION_MEMBER_BYTES || member_bytes > bytes - cursor) {
       rc = err(error, LC_ERR_PROTOCOL, "invalid revision member boundary");
       break;
     }
-    rc = decode_entry(s, wire + cursor, member_bytes, 0, &entries[i], &event,
-                      error);
-    if (rc == LC_OK &&
-        (event == PS_REMOVE
-             ? entries[i]->key.kind != PS_KEY_METADATA
-             : event != PS_PUT || !ps_internal_immutable_key(entries[i]->key)))
+    key.kind = ps_wire_get32(member + 4);
+    event = (int)ps_wire_get32(member + 8);
+    if (event == PS_REMOVE
+            ? key.kind != PS_KEY_METADATA
+            : event != PS_PUT || !ps_internal_immutable_key(key)) {
       rc = err(error, LC_ERR_PROTOCOL, "invalid revision member kind");
+      break;
+    }
+    rc = decode_entry_fields(s, member + 4, member + REVISION_MEMBER_BYTES,
+                             member_bytes - REVISION_MEMBER_BYTES, 0,
+                             &entries[i], &event, error);
     for (j = 0; rc == LC_OK && j < i; ++j)
       if (same_key(entries[j]->key, entries[i]->key))
         rc = err(error, LC_ERR_PROTOCOL, "duplicate revision member key");
@@ -6392,6 +6416,10 @@ restart:
   rc = decode_token_limit(s, roots[0] + PS_TOKEN_RECORD_OFFSET,
                           roots[1] + PS_TOKEN_RECORD_OFFSET, &grant_limit,
                           &grant_slot, error);
+  /* Shared admission may reset the volatile page. Validate the disk layout
+   * before touching that page, including when no compatible root exists. */
+  if (rc == LC_OK && !s->readiness)
+    rc = ps_readiness_attach(s, error);
   if (rc == LC_OK)
     rc = ps_readiness_read(s, &certificate, error);
   if (rc == LC_OK)
@@ -6724,8 +6752,10 @@ static int projection_journal(ps_space *v, uint64_t checkpoint,
       /* An untouched journal may still start with a checked frame from the
        * previous generation. Once replay starts, require its end marker. */
       if (!v->journal && ps_wire_get64(p + 8) <= checkpoint &&
-          ps_wire_get32(p + 60) ==
-              (uint32_t)ps_crc32(checksum(p, 60), p + 64, (uInt)(bytes - 64)))
+          (magic == REVISION_MAGIC
+               ? ps_wire_get32(p + REVISION_HEADER_BYTES - 4) ==
+                     revision_checksum(p, bytes)
+               : ps_wire_get32(p + 60) == entry_checksum(p, bytes)))
         return LC_OK;
       if (ps_wire_get64(p + 8) > checkpoint &&
           ps_wire_get64(p + 8) <= certified) {
@@ -7477,11 +7507,8 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     if (rc == LC_OK)
       rc = sync_file(s, error);
 #endif
-  } else if (rc == LC_OK) {
-    rc = ps_readiness_attach(s, error);
-    if (rc == LC_OK)
-      rc = recover(s, &opening, error);
-  }
+  } else if (rc == LC_OK)
+    rc = recover(s, &opening, error);
   if (rc == LC_OK && s->maximum && s->capacity > s->maximum)
     rc = err(error, LC_ERR_INVALID,
              "committed capacity exceeds configured maximum");
@@ -7833,14 +7860,16 @@ static int publish_revision(ps_writer *const *writers, size_t count,
   ps_entry *p, *old;
   ps_entry **removed = NULL;
   unsigned char *wire = NULL;
-  size_t i, j, batch, pending, bytes = 64, cursor, prior, descriptor;
+  size_t i, j, batch, pending, bytes = REVISION_HEADER_BYTES, cursor, prior;
+  size_t descriptor, member;
+  const size_t max_members =
+      (PS_JOURNAL - REVISION_HEADER_BYTES) / REVISION_MEMBER_BYTES;
   uint64_t metadata, entries, growth = 0, added = 0, sequence = 0, deletion = 0;
   int rc = LC_OK, durable, forced;
   if (prefix)
     *prefix = 0;
-  if (!writers || !count || count > (PS_JOURNAL - 64) / 64 || !writers[0] ||
-      retire_count > (PS_JOURNAL - 64) / 64 - count ||
-      (retire_count && !retirements) ||
+  if (!writers || !count || count > max_members || !writers[0] ||
+      retire_count > max_members - count || (retire_count && !retirements) ||
       (flags & ~(PS_REVISION_FORCE_DURABLE | PS_REVISION_ADMIT_RESERVE)) ||
       (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC))
     return err(error, LC_ERR_INVALID, "revision requires immutable writers");
@@ -7868,7 +7897,7 @@ static int publish_revision(ps_writer *const *writers, size_t count,
       if (same_key(writers[j]->entry->key, key))
         return err(error, LC_ERR_INVALID, "revision keys must be distinct");
   }
-  bytes += retire_count * 64;
+  bytes += retire_count * REVISION_MEMBER_BYTES;
   for (i = 0; rc == LC_OK && i < count; i += batch) {
     pending = 0;
     for (batch = 0; batch < WRITER_FLUSH_BATCH && i + batch < count &&
@@ -7877,11 +7906,11 @@ static int publish_revision(ps_writer *const *writers, size_t count,
       pending += writers[i + batch]->used;
     rc = flush_writer_batch(writers + i, batch, error);
     for (j = i; rc == LC_OK && j < i + batch; ++j) {
-      descriptor = entry_bytes(writers[j]->entry);
-      if (descriptor > PS_JOURNAL - bytes)
+      member = entry_bytes(writers[j]->entry) - 64 + REVISION_MEMBER_BYTES;
+      if (member > PS_JOURNAL - bytes)
         rc = err(error, LC_ERR_INVALID, "revision metadata exceeds journal");
       else
-        bytes += descriptor;
+        bytes += member;
     }
   }
   if (rc == LC_OK) {
@@ -7960,25 +7989,30 @@ static int publish_revision(ps_writer *const *writers, size_t count,
   if (rc == LC_OK)
     rc = key_index_reserve(s, (size_t)added, error);
   if (rc == LC_OK) {
-    memset(wire, 0, 64);
+    memset(wire, 0, bytes);
     ps_wire_put32(wire, REVISION_MAGIC);
     ps_wire_put32(wire + 4, (uint32_t)bytes);
     ps_wire_put64(wire + 8, s->sequence + 1);
     ps_wire_put32(wire + 16, (uint32_t)(count + retire_count));
     ps_wire_put32(wire + 20, (uint32_t)durable);
-    cursor = 64;
+    cursor = REVISION_HEADER_BYTES;
     for (i = 0; i < count; ++i) {
-      encode_entry(wire + cursor, writers[i]->entry, s->sequence + 1 + i,
-                   PS_PUT);
-      cursor += entry_bytes(writers[i]->entry);
+      member = entry_bytes(writers[i]->entry) - 64 + REVISION_MEMBER_BYTES;
+      ps_wire_put32(wire + cursor, (uint32_t)member);
+      encode_entry_fields(wire + cursor + 4,
+                          wire + cursor + REVISION_MEMBER_BYTES,
+                          writers[i]->entry, PS_PUT);
+      cursor += member;
     }
     for (i = 0; i < retire_count; ++i) {
-      encode_entry(wire + cursor, removed[i], s->sequence + 1 + count + i,
-                   PS_REMOVE);
-      cursor += 64;
+      ps_wire_put32(wire + cursor, REVISION_MEMBER_BYTES);
+      encode_entry_fields(wire + cursor + 4,
+                          wire + cursor + REVISION_MEMBER_BYTES, removed[i],
+                          PS_REMOVE);
+      cursor += REVISION_MEMBER_BYTES;
     }
-    ps_wire_put32(wire + 60, (uint32_t)ps_crc32(checksum(wire, 60), wire + 64,
-                                                (uInt)(bytes - 64)));
+    ps_wire_put32(wire + REVISION_HEADER_BYTES - 4,
+                  revision_checksum(wire, bytes));
     rc = write_journal_frame(s, wire, bytes, error);
   }
   if (rc == LC_OK) {
