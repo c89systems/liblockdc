@@ -347,6 +347,8 @@ int ps_internal_healthy(ps_space *, lc_error *);
 int ps_internal_capture_begin(ps_space *, ps_coordination_guard **, lc_error *);
 /* Called under the space mutex, with or without allocator authority. */
 int ps_internal_token_range(ps_space *, lc_error *);
+int ps_internal_namespace_token_prepare(ps_space *, int *, lc_error *);
+int ps_internal_namespace_token_finish(ps_space *, uint64_t, int, lc_error *);
 /* Like capture for memory-only observation. A proven resident prefix can
  * return without allocator authority. Callers must not claim physical bytes. */
 int ps_internal_observe_begin(ps_space *, ps_coordination_guard **, lc_error *);

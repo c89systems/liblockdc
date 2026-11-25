@@ -3225,6 +3225,87 @@ static void nosync_close_recovery(enum nosync_recovery_action action) {
   clean();
 }
 
+static void namespace_grant_publication(void) {
+  const char previous[] = "previous", next[] = "next", later[] = "later";
+  for (unsigned int persisted = 0; persisted <= 4; ++persisted) {
+    model m;
+    ps_io io = model_init_capacity(&m, PS_DEFAULT_CAPACITY);
+    ps_options options = {0};
+    ps_catalog_info original, published, recovered, subsequent;
+    ps_catalog_view *view = NULL;
+    io.zero = model_zero;
+    ps_space *space = create(PS_DEFAULT_CAPACITY, 0, &io);
+    options.io = &io;
+    OK(ps_catalog_create_namespace(space, previous, sizeof(previous) - 1,
+                                   &original, &error));
+    size_t prefix = space->journal;
+    size_t syncs = m.syncs;
+    OK(ps_close(space, &error));
+    OK(ps_open(path, 0, &options, &space, &error));
+    CHECK(m.syncs == syncs && !space->token_end && !space->journal_start);
+    if (persisted < 4)
+      m.fail_sync_at = syncs + 1;
+    int rc = ps_catalog_create_namespace(space, next, sizeof(next) - 1,
+                                         &published, &error);
+    CHECK(m.syncs == syncs + 1);
+    if (persisted < 4) {
+      CHECK(rc == LC_ERR_TRANSPORT && !published.id && space->journal > prefix);
+      lc_error_cleanup(&error);
+      int fd = open(path, O_RDONLY);
+      CHECK(fd >= 0);
+      if (persisted & 1) {
+        off_t grant = PS_PAGE + PS_TOKEN_RECORD_OFFSET;
+        CHECK(pread(fd, m.stable + grant, PS_TOKEN_RECORD_BYTES, grant) ==
+              PS_TOKEN_RECORD_BYTES);
+      }
+      if (persisted & 2) {
+        off_t at = PS_JOURNAL_OFFSET + (off_t)prefix;
+        size_t bytes = space->journal - prefix;
+        CHECK(pread(fd, m.stable + at, bytes, at) == (ssize_t)bytes);
+      }
+      CHECK(close(fd) == 0);
+    } else {
+      OK(rc);
+      if (ps_native_io.zero) {
+        ps_stream *stream = stream_open(space, 1, 1, NULL, NULL);
+        ps_stream_writer *writer = NULL;
+        OK(ps_stream_begin(stream, &writer, &error));
+        OK(ps_stream_reserve_exact(writer, NULL, 4096, &error));
+        CHECK(m.zero_calls == 1 && m.syncs == syncs + 1);
+        ps_stream_writer_close(writer);
+        OK(ps_stream_close(stream, &error));
+      }
+    }
+    OK(ps_close(space, &error));
+    m.fail_sync_at = 0;
+    crash(&m);
+    OK(ps_open(path, 0, &options, &space, &error));
+    OK(ps_catalog_get(space, 0, PS_CATALOG_NAMESPACE, previous,
+                      sizeof(previous) - 1, &view, &error));
+    CHECK(view);
+    OK(ps_catalog_view_info(view, &recovered, &error));
+    CHECK(recovered.id == original.id);
+    ps_catalog_view_close(view);
+    view = NULL;
+    OK(ps_catalog_get(space, 0, PS_CATALOG_NAMESPACE, next, sizeof(next) - 1,
+                      &view, &error));
+    CHECK((view != NULL) == (persisted >= 3));
+    if (view) {
+      OK(ps_catalog_view_info(view, &recovered, &error));
+      CHECK(recovered.id > original.id);
+      if (persisted == 4)
+        CHECK(recovered.id == published.id);
+      ps_catalog_view_close(view);
+    }
+    OK(ps_catalog_create_namespace(space, later, sizeof(later) - 1, &subsequent,
+                                   &error));
+    CHECK(subsequent.id > recovered.id);
+    OK(ps_close(space, &error));
+    free(m.stable);
+    clean();
+  }
+}
+
 static void canonical_stream_exact_reservations(void) {
   const size_t spans[] = {4031,  4032,  4033,  20351, 20352,
                           20353, 85823, 85824, 85825};
@@ -7971,6 +8052,7 @@ static int run_portable_case(const char *mode) {
     nosync_close_recovery(NOSYNC_RECOVERY_MUTATE);
     nosync_close_recovery(NOSYNC_RECOVERY_WRITE_FAILURE);
     nosync_close_recovery(NOSYNC_RECOVERY_DURABLE_OPEN);
+    namespace_grant_publication();
     return 1;
   }
   if (!strcmp(mode, "reopen-sanitize")) {

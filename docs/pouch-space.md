@@ -49,6 +49,10 @@ proof for the exact journal and a bounded set of stream tails. When reusing
 that durability proof, recovery syncs newly discovered records outside its
 coverage before exposing them.
 Owners that reopen using a proof acquire an incarnation range on first use.
+On an exclusive root, the first namespace creation can share a barrier with
+its new incarnation range. Recovery admits the catalog entry only when the
+covering range is present. On NoSync roots with native zero-range support,
+that barrier can also prepare a bounded interval for subsequent stream grants.
 After a clean exclusive NoSync close, a checked journal can serve reads.
 The first persistent mutation or explicit flush stabilizes that recovered view.
 Replayed keys acquire a physical snapshot identity when a write or checkpoint

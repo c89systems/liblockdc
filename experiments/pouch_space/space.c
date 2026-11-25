@@ -4315,7 +4315,7 @@ static int grant_tokens(ps_space *s, int slot, uint64_t limit,
   }
   return rc;
 }
-int ps_internal_token_range(ps_space *s, lc_error *error) {
+static int token_range(ps_space *s, int *staged, lc_error *error) {
   ps_coordination_guard *guard = NULL;
   ps_readiness_certificate certificate;
   unsigned char first[PS_TOKEN_RECORD_BYTES], second[PS_TOKEN_RECORD_BYTES];
@@ -4355,12 +4355,80 @@ int ps_internal_token_range(ps_space *s, lc_error *error) {
       s->token_limit = limit;
     } else if (rc == LC_OK)
       rc = err(error, LC_ERR_PROTOCOL, "unassigned incarnation pool invalid");
-    if (rc == LC_OK)
-      rc = sync_file(s, error);
+    if (rc == LC_OK) {
+      if (staged)
+        *staged = 1;
+      else
+        rc = sync_file(s, error);
+    }
   }
   if (rc == LC_OK && s->readiness)
     rc = ps_readiness_assign_grant(s, error);
   return allocation_end(s, guard, rc, error);
+}
+int ps_internal_token_range(ps_space *s, lc_error *error) {
+  return token_range(s, NULL, error);
+}
+int ps_internal_namespace_token_prepare(ps_space *s, int *staged,
+                                        lc_error *error) {
+  *staged = 0;
+  /* The cold exclusive owner can write a grant and the first catalog
+   * identity together. The prior grant is already durable. Before the shared
+   * barrier, recovery accepts the catalog frame only with its covering grant.
+   */
+  return token_range(s, !s->readiness && s->reused_open_barrier ? staged : NULL,
+                     error);
+}
+int ps_internal_namespace_token_finish(ps_space *s, uint64_t sequence, int rc,
+                                       lc_error *error) {
+  ps_run **free_run = NULL, **link, *prepared = NULL;
+  int sync_rc;
+  if (rc == LC_OK && !s->durable && s->io.zero) {
+    /* Prepare one ordinary grant's worth of free space at the namespace
+     * barrier. Leave small intervals and already prepared space alone. */
+    for (link = &s->free; *link; link = &(*link)->next) {
+      ps_run *run = *link;
+      if (run->claimed || run->bytes < PS_MIB)
+        continue;
+      if (run->clean) {
+        free_run = NULL;
+        break;
+      }
+      if (!free_run)
+        free_run = link;
+    }
+    if (free_run) {
+      prepared = lc_calloc_with_allocator(NULL, 1, sizeof(*prepared));
+      if (prepared && zero_file_range(s, (*free_run)->offset, PS_MIB) != 0) {
+        lc_free_with_allocator(NULL, prepared);
+        prepared = NULL;
+      }
+    }
+  }
+  /* The namespace publisher still owns the container mutex. No other
+   * operation may issue or expose a token from the new range until it is
+   * durable, including after a catalog admission failure. */
+  if (rc == LC_OK && !prepared)
+    return wait_durable(s, sequence, error);
+  /* A group leader may already have captured the catalog sequence when
+   * zeroing completes. Only a subsequent barrier can certify these pages. */
+  sync_rc = healthy(s, rc == LC_OK ? error : NULL);
+  if (sync_rc == LC_OK)
+    sync_rc = sync_file(s, rc == LC_OK ? error : NULL);
+  if (rc == LC_OK && sync_rc == LC_OK) {
+    take_selected(free_run, &s->free_bytes, PS_MIB, &prepared->offset, NULL);
+    prepared->bytes = PS_MIB;
+    prepared->clean = 1;
+    free_insert(s, prepared);
+    mark_durable(s, sequence);
+    return LC_OK;
+  }
+  lc_free_with_allocator(NULL, prepared);
+  if (rc != LC_OK && sync_rc != LC_OK) {
+    lc_error_cleanup(error);
+    return healthy(s, error);
+  }
+  return rc == LC_OK ? sync_rc : rc;
 }
 static void destroy(ps_space *s) {
   ps_entry_allocation *block;

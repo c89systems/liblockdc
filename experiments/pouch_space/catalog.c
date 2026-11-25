@@ -358,7 +358,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
   ps_catalog_info info;
   uint64_t sequence = 0, growth = 0, added = 0, prior, next;
   int marker = kind == PS_CATALOG_MARKER;
-  int rc, installed = 0;
+  int rc, installed = 0, staged = 0;
   if (out)
     memset(out, 0, sizeof(*out));
   if (!s || !out || !arguments(kind, name, length) ||
@@ -396,7 +396,8 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
         old->catalog->kind == PS_CATALOG_NAMESPACE)
       rc = cat_error(e, LC_ERR_INVALID, "namespace ownership is immutable");
     if (rc == LC_OK)
-      rc = ps_internal_token_range(s, e);
+      rc = identity ? ps_internal_namespace_token_prepare(s, &staged, e)
+                    : ps_internal_token_range(s, e);
     if (rc == LC_OK && head && !head->stream.head->catalog_refs &&
         !head->stream.head->claim)
       rc = ps_internal_stream_claim(s, head->token, &claim, e);
@@ -435,11 +436,13 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
       information(s, p, &info);
     }
     rc = ps_internal_capture_end(s, guard, rc, e);
+    if (staged)
+      rc = ps_internal_namespace_token_finish(s, sequence, rc, e);
     pthread_mutex_unlock(&s->mutex);
   }
   if (!installed)
     ps_internal_entry_free(p);
-  if (rc == LC_OK)
+  if (rc == LC_OK && !staged)
     rc = ps_internal_durable(s, sequence, e);
   if (preparation || claim) {
     ps_coordination_unlock(preparation);
