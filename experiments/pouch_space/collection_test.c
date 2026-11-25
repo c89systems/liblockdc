@@ -594,7 +594,8 @@ static void projections(void) {
     row.segment = 1;
     row.record_offset = n * 64U;
     row.bytes = 9;
-    ok(lc_collection_order_append(&order, &row, 1, n * 64U + 64U, &e), &e);
+    ok(lc_collection_order_append(&order, &row, NULL, 1, n * 64U + 64U, &e),
+       &e);
     memset(ref.digest, 0, sizeof(ref.digest));
     memcpy(ref.digest, &n, sizeof(n));
     ref.position = ref.generation = n;

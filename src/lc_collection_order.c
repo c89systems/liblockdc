@@ -1,5 +1,6 @@
 #include "lc_collection_order.h"
 #include "lc_api_internal.h"
+#include "lc_collection_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +13,8 @@
 #define LC_CO_ROW_BYTES LC_COLLECTION_ORDER_ROW_BYTES
 #define LC_CO_PAGE_BYTES 4096U
 #define LC_CO_PAGE_HEADER_BYTES 64U
+#define LC_CO_SCRATCH_HEADER_BYTES                                             \
+  (LC_CO_PAGE_HEADER_BYTES + LC_COLLECTION_PAGE_PROOF_BYTES)
 #define LC_CO_ROOT_MAGIC 0x4c434f49UL
 #define LC_CO_PAGE_MAGIC 0x4c434f50UL
 
@@ -21,6 +24,7 @@ typedef struct lc_co_page {
   lc_u64 last;
   lc_u64 live;
   lc_u64 deleted_through;
+  unsigned char proof[LC_COLLECTION_PAGE_PROOF_BYTES];
 } lc_co_page;
 
 static int lc_co_error(lc_error *error, int code, const char *message) {
@@ -130,12 +134,17 @@ static int lc_co_page_offset(lc_u64 page, lc_u64 *offset, lc_error *error) {
   return LC_OK;
 }
 
-static int lc_co_row_offset(lc_u64 ordinal, lc_u64 *offset, lc_error *error) {
+static size_t lc_co_header_bytes(const lc_collection_order *order) {
+  return order->scratch ? LC_CO_SCRATCH_HEADER_BYTES : LC_CO_PAGE_HEADER_BYTES;
+}
+
+static int lc_co_row_offset(lc_collection_order *order, lc_u64 ordinal,
+                            lc_u64 *offset, lc_error *error) {
   int rc;
   rc =
       lc_co_page_offset(ordinal / LC_COLLECTION_ORDER_PAGE_ROWS, offset, error);
   if (rc == LC_OK) {
-    *offset += LC_CO_PAGE_HEADER_BYTES +
+    *offset += lc_co_header_bytes(order) +
                (ordinal % LC_COLLECTION_ORDER_PAGE_ROWS) * LC_CO_ROW_BYTES;
   }
   return rc;
@@ -232,7 +241,7 @@ int lc_collection_order_refresh(lc_collection_order *order, lc_error *error) {
     return rc;
   end = LC_CO_ROOT_BYTES;
   if (order->count > 0U) {
-    rc = lc_co_row_offset(order->count - 1U, &end, error);
+    rc = lc_co_row_offset(order, order->count - 1U, &end, error);
     if (rc != LC_OK) {
       return rc;
     }
@@ -385,7 +394,7 @@ static int lc_co_row_read(lc_collection_order *order, lc_u64 ordinal,
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection index ordinal is out of bounds");
   }
-  rc = lc_co_row_offset(ordinal, &offset, error);
+  rc = lc_co_row_offset(order, ordinal, &offset, error);
   if (rc == LC_OK) {
     rc = lc_co_io(order, offset, bytes, sizeof(bytes), 0, error);
   }
@@ -419,7 +428,7 @@ static int lc_co_row_write(lc_collection_order *order, lc_u64 ordinal,
   lc_co_put64(bytes + 56U, packed);
   memcpy(bytes + 64U, row->proof, sizeof(row->proof));
   lc_co_seal(bytes, sizeof(bytes));
-  rc = lc_co_row_offset(ordinal, &offset, error);
+  rc = lc_co_row_offset(order, ordinal, &offset, error);
   if (rc == LC_OK) {
     rc = lc_co_io(order, offset, bytes, sizeof(bytes), 1, error);
   }
@@ -427,7 +436,7 @@ static int lc_co_row_write(lc_collection_order *order, lc_u64 ordinal,
 }
 
 static int lc_co_page_decode(lc_collection_order *order, lc_u64 number,
-                             const unsigned char bytes[64], lc_co_page *page,
+                             const unsigned char *bytes, lc_co_page *page,
                              lc_error *error) {
   lc_u64 expected;
   if (order->count == 0U ||
@@ -435,7 +444,7 @@ static int lc_co_page_decode(lc_collection_order *order, lc_u64 number,
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection ordered page is out of bounds");
   }
-  if (!lc_co_valid(bytes, LC_CO_PAGE_HEADER_BYTES) ||
+  if (!lc_co_valid(bytes, lc_co_header_bytes(order)) ||
       lc_co_get64(bytes) != LC_CO_PAGE_MAGIC ||
       lc_co_get64(bytes + 48U) != 0U || bytes[56] != 0U || bytes[57] != 0U ||
       bytes[58] != 0U || bytes[59] != 0U) {
@@ -447,6 +456,8 @@ static int lc_co_page_decode(lc_collection_order *order, lc_u64 number,
   page->last = lc_co_get64(bytes + 24U);
   page->live = lc_co_get64(bytes + 32U);
   page->deleted_through = lc_co_get64(bytes + 40U);
+  if (order->scratch)
+    memcpy(page->proof, bytes + 60U, sizeof(page->proof));
   expected = order->count - number * LC_COLLECTION_ORDER_PAGE_ROWS;
   if (expected > LC_COLLECTION_ORDER_PAGE_ROWS) {
     expected = LC_COLLECTION_ORDER_PAGE_ROWS;
@@ -465,12 +476,12 @@ static int lc_co_page_decode(lc_collection_order *order, lc_u64 number,
 
 static int lc_co_page_read(lc_collection_order *order, lc_u64 number,
                            lc_co_page *page, lc_error *error) {
-  unsigned char bytes[64];
+  unsigned char bytes[LC_CO_SCRATCH_HEADER_BYTES];
   lc_u64 offset;
   int rc;
   rc = lc_co_page_offset(number, &offset, error);
   if (rc == LC_OK) {
-    rc = lc_co_io(order, offset, bytes, sizeof(bytes), 0, error);
+    rc = lc_co_io(order, offset, bytes, lc_co_header_bytes(order), 0, error);
   }
   return rc == LC_OK ? lc_co_page_decode(order, number, bytes, page, error)
                      : rc;
@@ -478,7 +489,7 @@ static int lc_co_page_read(lc_collection_order *order, lc_u64 number,
 
 static int lc_co_page_write(lc_collection_order *order, lc_u64 number,
                             const lc_co_page *page, lc_error *error) {
-  unsigned char bytes[64];
+  unsigned char bytes[LC_CO_SCRATCH_HEADER_BYTES];
   lc_u64 offset;
   int rc;
   memset(bytes, 0, sizeof(bytes));
@@ -488,16 +499,18 @@ static int lc_co_page_write(lc_collection_order *order, lc_u64 number,
   lc_co_put64(bytes + 24U, page->last);
   lc_co_put64(bytes + 32U, page->live);
   lc_co_put64(bytes + 40U, page->deleted_through);
-  lc_co_seal(bytes, sizeof(bytes));
+  if (order->scratch)
+    memcpy(bytes + 60U, page->proof, sizeof(page->proof));
+  lc_co_seal(bytes, lc_co_header_bytes(order));
   rc = lc_co_page_offset(number, &offset, error);
   if (rc == LC_OK) {
-    rc = lc_co_io(order, offset, bytes, sizeof(bytes), 1, error);
+    rc = lc_co_io(order, offset, bytes, lc_co_header_bytes(order), 1, error);
   }
   return rc;
 }
 
 static int lc_co_append(lc_collection_order *order,
-                        const lc_collection_order_row *row,
+                        const lc_collection_order_row *row, const char *etag,
                         lc_u64 replay_segment, lc_u64 replay_offset,
                         int recovered, lc_error *error) {
   lc_co_page page;
@@ -538,6 +551,19 @@ static int lc_co_append(lc_collection_order *order,
   } else {
     page.first = row->position;
   }
+  if (order->scratch && etag) {
+    unsigned char chain[LC_COLLECTION_PAGE_PROOF_BYTES + 24U + 64U];
+    /* ETags identify the logical payload through relocation and re-encoding.
+     * Chain them in ordinal order to distinguish reused NoSync positions. */
+    memcpy(chain, page.proof, sizeof(page.proof));
+    lc_co_put64(chain + sizeof(page.proof), row->position);
+    lc_co_put64(chain + sizeof(page.proof) + 8U, row->published_at);
+    lc_co_put64(chain + sizeof(page.proof) + 16U, row->bytes);
+    memcpy(chain + sizeof(page.proof) + 24U, etag, 64U);
+    rc = lc_collection_hash(chain, sizeof(chain), page.proof, error);
+    if (rc != LC_OK)
+      return rc;
+  }
   rc = lc_co_row_write(order, order->count, row, error);
   if (rc != LC_OK) {
     return rc;
@@ -572,17 +598,20 @@ static int lc_co_append(lc_collection_order *order,
 
 int lc_collection_order_append(lc_collection_order *order,
                                const lc_collection_order_row *row,
-                               lc_u64 replay_segment, lc_u64 replay_offset,
-                               lc_error *error) {
-  return lc_co_append(order, row, replay_segment, replay_offset, 0, error);
+                               const char *etag, lc_u64 replay_segment,
+                               lc_u64 replay_offset, lc_error *error) {
+  return lc_co_append(order, row, etag, replay_segment, replay_offset, 0,
+                      error);
 }
 
 int lc_collection_order_append_recovered(lc_collection_order *order,
                                          const lc_collection_order_row *row,
+                                         const char *etag,
                                          lc_u64 replay_segment,
                                          lc_u64 replay_offset,
                                          lc_error *error) {
-  return lc_co_append(order, row, replay_segment, replay_offset, 1, error);
+  return lc_co_append(order, row, etag, replay_segment, replay_offset, 1,
+                      error);
 }
 
 /* Returns the ordinal of the first position strictly greater than after.
@@ -880,7 +909,7 @@ int lc_collection_order_batch(lc_collection_order *order,
       if (page_rows > LC_COLLECTION_ORDER_PAGE_ROWS) {
         page_rows = LC_COLLECTION_ORDER_PAGE_ROWS;
       }
-      length = LC_CO_PAGE_HEADER_BYTES + (size_t)page_rows * LC_CO_ROW_BYTES;
+      length = lc_co_header_bytes(order) + (size_t)page_rows * LC_CO_ROW_BYTES;
       rc = lc_co_io(order, offset, iter->page, length, 0, error);
       if (rc == LC_OK) {
         rc = lc_co_page_decode(order, number, iter->page, &page, error);
@@ -923,9 +952,10 @@ int lc_collection_order_batch(lc_collection_order *order,
            iter->next / LC_COLLECTION_ORDER_PAGE_ROWS == number) {
       ordinal = iter->next;
       slot = (size_t)(ordinal % LC_COLLECTION_ORDER_PAGE_ROWS);
-      rc = lc_co_row_decode(
-          order, iter->page + LC_CO_PAGE_HEADER_BYTES + slot * LC_CO_ROW_BYTES,
-          &row, error);
+      rc = lc_co_row_decode(order,
+                            iter->page + lc_co_header_bytes(order) +
+                                slot * LC_CO_ROW_BYTES,
+                            &row, error);
       if (rc != LC_OK)
         return rc;
       if (iter->reverse) {
@@ -972,12 +1002,13 @@ int lc_collection_order_next(lc_collection_order *order,
 
 int lc_collection_order_rows(lc_collection_order *order, lc_u64 first,
                              lc_collection_order_row *rows, size_t capacity,
-                             size_t *count, lc_error *error) {
+                             size_t *count, unsigned char *proof,
+                             lc_error *error) {
   unsigned char bytes[LC_CO_PAGE_BYTES];
   lc_co_page page;
   lc_u64 number;
-  lc_u64 offset;
-  size_t slot;
+  lc_u64 offset, page_rows;
+  size_t slot, header;
   size_t size;
   size_t i;
   int rc;
@@ -986,28 +1017,30 @@ int lc_collection_order_rows(lc_collection_order *order, lc_u64 first,
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection order batch requires output");
   *count = 0U;
+  if (proof)
+    memset(proof, 0, LC_COLLECTION_PAGE_PROOF_BYTES);
   if (first >= order->count)
     return LC_OK;
   number = first / LC_COLLECTION_ORDER_PAGE_ROWS;
   slot = (size_t)(first % LC_COLLECTION_ORDER_PAGE_ROWS);
-  rc = lc_co_page_read(order, number, &page, error);
-  if (rc != LC_OK)
-    return rc;
+  header = lc_co_header_bytes(order);
+  page_rows = order->count - (first - slot);
+  if (page_rows > LC_COLLECTION_ORDER_PAGE_ROWS)
+    page_rows = LC_COLLECTION_ORDER_PAGE_ROWS;
   rc = lc_co_page_offset(number, &offset, error);
   if (rc == LC_OK)
-    rc =
-        lc_co_io(order, offset, bytes,
-                 LC_CO_PAGE_HEADER_BYTES + (size_t)page.count * LC_CO_ROW_BYTES,
-                 0, error);
+    rc = lc_co_io(order, offset, bytes,
+                  header + (size_t)page_rows * LC_CO_ROW_BYTES, 0, error);
+  if (rc == LC_OK)
+    rc = lc_co_page_decode(order, number, bytes, &page, error);
   if (rc != LC_OK)
     return rc;
   size = (size_t)page.count - slot;
   if (size > capacity)
     size = capacity;
   for (i = 0U; i < size; ++i) {
-    rc = lc_co_row_decode(
-        order, bytes + LC_CO_PAGE_HEADER_BYTES + (slot + i) * LC_CO_ROW_BYTES,
-        rows + i, error);
+    rc = lc_co_row_decode(order, bytes + header + (slot + i) * LC_CO_ROW_BYTES,
+                          rows + i, error);
     if (rc != LC_OK)
       return rc;
     if (i != 0U && rows[i].position <= rows[i - 1U].position)
@@ -1015,6 +1048,8 @@ int lc_collection_order_rows(lc_collection_order *order, lc_u64 first,
                          "collection order batch is not increasing");
   }
   *count = size;
+  if (proof && order->scratch && slot == 0U && size == page_rows)
+    memcpy(proof, page.proof, LC_COLLECTION_PAGE_PROOF_BYTES);
   return LC_OK;
 }
 
@@ -1054,7 +1089,7 @@ static int lc_co_ranges(lc_collection_order *order,
     rows = order->count - number * LC_COLLECTION_ORDER_PAGE_ROWS;
     if (rows > LC_COLLECTION_ORDER_PAGE_ROWS)
       rows = LC_COLLECTION_ORDER_PAGE_ROWS;
-    length = LC_CO_PAGE_HEADER_BYTES + (size_t)rows * LC_CO_ROW_BYTES;
+    length = lc_co_header_bytes(order) + (size_t)rows * LC_CO_ROW_BYTES;
     if (rc == LC_OK)
       rc = lc_co_io(order, offset, bytes, length, 0, error);
     if (rc == LC_OK)
@@ -1080,7 +1115,7 @@ static int lc_co_ranges(lc_collection_order *order,
       i = generation ? 0 : (size_t)(ordinal % LC_COLLECTION_ORDER_PAGE_ROWS);
     for (; rc == LC_OK && i < (size_t)page.count; ++i) {
       unsigned char *encoded =
-          bytes + LC_CO_PAGE_HEADER_BYTES + i * LC_CO_ROW_BYTES;
+          bytes + lc_co_header_bytes(order) + i * LC_CO_ROW_BYTES;
       rc = lc_co_row_decode(order, encoded, &row, error);
       if (rc != LC_OK)
         break;
@@ -1111,7 +1146,7 @@ static int lc_co_ranges(lc_collection_order *order,
     if (rc == LC_OK && changed) {
       lc_co_put64(bytes + 32U, page.live);
       lc_co_put64(bytes + 40U, page.live ? 0 : through);
-      lc_co_seal(bytes, LC_CO_PAGE_HEADER_BYTES);
+      lc_co_seal(bytes, lc_co_header_bytes(order));
       rc = lc_co_io(order, offset, bytes, length, 1, error);
 #ifdef LOCKDC_TEST_BUILD
       if (rc == LC_OK)

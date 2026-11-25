@@ -54,7 +54,7 @@ static void append(fixture *f, lc_u64 position) {
   row.segment = 1;
   row.record_offset = f->order.count * 100;
   row.bytes = 2;
-  assert_int_equal(lc_collection_order_append(&f->order, &row, 1,
+  assert_int_equal(lc_collection_order_append(&f->order, &row, NULL, 1,
                                               f->order.replay_offset + 100,
                                               &f->error),
                    LC_OK);
@@ -340,7 +340,7 @@ static void test_truncation_missing_and_invalid_mutations(void **state) {
   row.published_at = 2;
   row.segment = 1;
   assert_int_equal(
-      lc_collection_order_append(&f->order, &row, 1, 200, &f->error),
+      lc_collection_order_append(&f->order, &row, NULL, 1, 200, &f->error),
       LC_ERR_INVALID);
   lc_error_cleanup(&f->error);
   lc_error_init(&f->error);
@@ -380,9 +380,10 @@ test_snapshot_rebuild_keeps_interleaved_deletion_generations(void **state) {
   lc_collection_order_row row;
   int found;
   for (size_t i = 0; i < 3; ++i) {
-    assert_int_equal(lc_collection_order_append_recovered(
-                         &f->order, &rows[i], 1, (i + 1) * 100, &f->error),
-                     LC_OK);
+    assert_int_equal(
+        lc_collection_order_append_recovered(&f->order, &rows[i], NULL, 1,
+                                             (i + 1) * 100, &f->error),
+        LC_OK);
   }
   assert_true(f->order.generation == 10 && f->order.upper_position == 3);
   lc_collection_order_close(&f->order);
@@ -582,9 +583,9 @@ static void test_unit_locator_bounds_and_evidence(void **state) {
   row.unit_segment = 11;
   row.unit_offset = (lc_u64)0xffffffffUL;
   memset(row.proof, 0xa5, sizeof(row.proof));
-  assert_int_equal(
-      lc_collection_order_append(&f->order, &row, row.segment, 200, &f->error),
-      LC_OK);
+  assert_int_equal(lc_collection_order_append(&f->order, &row, NULL,
+                                              row.segment, 200, &f->error),
+                   LC_OK);
   lc_collection_order_close(&f->order);
   assert_int_equal(lc_collection_order_open(f->path, 0, &f->order, &f->error),
                    LC_OK);
@@ -616,9 +617,9 @@ static void test_unit_locator_bounds_and_evidence(void **state) {
                    sizeof(saved));
   row.position = row.published_at = 2;
   row.unit_offset = (lc_u64)0xffffffffUL + 1U;
-  assert_int_equal(
-      lc_collection_order_append(&f->order, &row, row.segment, 300, &f->error),
-      LC_ERR_PROTOCOL);
+  assert_int_equal(lc_collection_order_append(&f->order, &row, NULL,
+                                              row.segment, 300, &f->error),
+                   LC_ERR_PROTOCOL);
 }
 
 int main(void) {

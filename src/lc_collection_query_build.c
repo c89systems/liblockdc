@@ -40,6 +40,7 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
   lc_u64 generation;
   lc_collection_input record_input;
   char query_id[LC_XID_STRING_SIZE];
+  unsigned char proof[LC_COLLECTION_PAGE_PROOF_BYTES];
   size_t count, i;
   int rooted, rc;
   lc_collection_lock view_pin, commit_pin;
@@ -65,10 +66,12 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
       rc = lc_collection_refresh_view(collection, error);
       if (rc == LC_OK && ordinal < collection->order.count) {
         generation = collection->order.generation;
-        memcpy(query_id, collection->order.query_id, sizeof(query_id));
+        memcpy(query_id,
+               lc_collection_query_epoch(collection, &collection->order),
+               sizeof(query_id));
         rc = lc_collection_order_rows(&collection->order, ordinal, rows,
                                       LC_COLLECTION_ORDER_PAGE_ROWS, &count,
-                                      error);
+                                      proof, error);
         if (rc == LC_OK)
           rc = lc_collection_read_pin(collection, collection->head.snapshot,
                                       &view_pin, error);
@@ -76,10 +79,12 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
       lc_collection_capture_leave(collection, &commit_pin);
     }
   }
-  if (rc == LC_OK && count != 0U)
+  if (rc == LC_OK && count != 0U) {
     rc = lc_collection_index_init(
         &index, &collection->allocator, collection->id, query_id, ordinal,
         lc_collection_query_row_hash(rows, count), error);
+    memcpy(index.page_proof, proof, sizeof(proof));
+  }
   for (i = 0U; rc == LC_OK && i < count; ++i) {
     if (rows[i].deleted_at != 0U && rows[i].deleted_at <= generation) {
       rc = lc_collection_index_add(&index, NULL, error);

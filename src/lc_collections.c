@@ -865,10 +865,12 @@ int lc_collection_project_record(lc_collection_order *order,
     if (record->deleted && !snapshot)
       return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
                                    "collection delete has no committed append");
-    rc = snapshot ? lc_collection_order_append_recovered(
-                        order, &row, segment, record->next_offset, error)
-                  : lc_collection_order_append(order, &row, segment,
-                                               record->next_offset, error);
+    rc = snapshot
+             ? lc_collection_order_append_recovered(order, &row, record->etag,
+                                                    segment,
+                                                    record->next_offset, error)
+             : lc_collection_order_append(order, &row, record->etag, segment,
+                                          record->next_offset, error);
   } else if (current.published_at != row.published_at ||
              current.bytes != row.bytes) {
     return lc_collection_failure(

@@ -33,19 +33,41 @@ static void cq_seed(fixture *f, unsigned int count) {
     REQUIRE(result.position == i && !result.duplicate);
   }
 }
-static int cq_load(fixture *f, lc_collection_index *index, int *found) {
+static int cq_load_proof(fixture *f, lc_collection_index *index, int *found,
+                         const unsigned char *alternate) {
   lc_collection_handle *c = f->collection->impl;
   lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
+  unsigned char proof[LC_COLLECTION_PAGE_PROOF_BYTES];
   size_t count = 0U;
   int rc = lc_collection_prepare(c, &f->error);
   if (rc == LC_OK)
-    rc = lc_collection_order_rows(
-        &c->order, 0U, rows, LC_COLLECTION_ORDER_PAGE_ROWS, &count, &f->error);
+    rc = lc_collection_order_rows(&c->order, 0U, rows,
+                                  LC_COLLECTION_ORDER_PAGE_ROWS, &count, proof,
+                                  &f->error);
   if (rc == LC_OK)
-    rc = lc_collection_query_load(c, c->order.query_id, 0U,
-                                  lc_collection_query_row_hash(rows, count),
-                                  index, found, &f->error);
+    rc = lc_collection_query_load(c, lc_collection_query_epoch(c, &c->order),
+                                  0U, lc_collection_query_row_hash(rows, count),
+                                  alternate ? alternate : proof, index, found,
+                                  &f->error);
   return rc;
+}
+static int cq_load(fixture *f, lc_collection_index *index, int *found) {
+  return cq_load_proof(f, index, found, NULL);
+}
+
+static int cq_dummy(void *context, lc_sink *sink, lc_error *e) {
+  (void)context;
+  if (sink->write(sink, "{}", 2, e))
+    return LC_OK;
+  return e->code;
+}
+static void cq_obsolete(fixture *f) {
+  lc_collection_handle *c = f->collection->impl;
+  char epoch[LC_XID_STRING_SIZE];
+  ok(lc_xid_new(epoch, &f->error), &f->error);
+  ok(c->queries.replace(c->queries.context, epoch, 0U, 2U, cq_dummy, NULL, NULL,
+                        NULL, &f->error),
+     &f->error);
 }
 typedef struct cq_output {
   uint64_t positions;
@@ -294,6 +316,7 @@ static void collection_queries(const char *directory, int codec, int sync) {
   lc_collection_index index = {0}, stale = {0};
   lc_collection_delete_res deleted;
   lc_pouch_index_input pinned = {0};
+  char recovery_id[LC_XID_STRING_SIZE];
   int found = 0;
   setup(&f, directory, codec, sync, 0);
   cq_seed(&f, LC_COLLECTION_ORDER_PAGE_ROWS);
@@ -304,7 +327,8 @@ static void collection_queries(const char *directory, int codec, int sync) {
   lc_collection_handle *c = f.collection->impl;
   uint64_t owner = collection_owner_id(&f);
   REQUIRE(cq_artifacts(&f, owner) == 1U);
-  ok(c->queries.open(c->queries.context, c->order.query_id, 0U, &pinned,
+  ok(c->queries.open(c->queries.context,
+                     lc_collection_query_epoch(c, &c->order), 0U, &pinned,
                      &f.error),
      &f.error);
   REQUIRE(pinned.signature.present);
@@ -331,16 +355,26 @@ static void collection_queries(const char *directory, int codec, int sync) {
   ok(cq_build(&f, 0U), &f.error);
   ok(cq_load(&f, &stale, &found), &f.error);
   REQUIRE(found);
+  memcpy(recovery_id, c->order.query_id, sizeof(recovery_id));
+  cq_obsolete(&f);
   reopen(&f);
   c = f.collection->impl;
-  REQUIRE(strcmp(stale.query_id, c->order.query_id));
+  REQUIRE(strcmp(recovery_id, c->order.query_id));
+  ok(cq_load(&f, &index, &found), &f.error);
+  REQUIRE(found && !memcmp(index.page_proof, stale.page_proof,
+                           sizeof(index.page_proof)));
+  lc_collection_index_cleanup(&index);
   cq_verify(&f, cq_expected(LC_COLLECTION_ORDER_PAGE_ROWS, 1));
+  /* The same ordinals, row count and CRC cannot reuse a page from different
+   * payloads, even after a recovery has reused its positions. */
+  stale.page_proof[0] ^= 1U;
+  ok(cq_load_proof(&f, &index, &found, stale.page_proof), &f.error);
+  REQUIRE(!found);
   ok(lc_collection_query_store(c, &stale, &f.error), &f.error);
   ok(cq_load(&f, &index, &found), &f.error);
-  REQUIRE(!found);
+  REQUIRE(found);
   lc_collection_index_cleanup(&index);
   lc_collection_index_cleanup(&stale);
-  ok(cq_build(&f, 0U), &f.error);
   REQUIRE(cq_artifacts(&f, owner) == 2U);
   ok(lc_collection_query_cleanup(f.collection, NULL, &f.error), &f.error);
   REQUIRE(cq_artifacts(&f, owner) == 1U);
@@ -385,8 +419,10 @@ static size_t cq_trial_run(const char *directory, int codec, int sync,
     if (action == 1)
       ok(lc_collection_delete_entry(f.collection, 2U, &deleted, &f.error),
          &f.error);
-    else
+    else {
+      cq_obsolete(&f);
       reopen(&f);
+    }
   }
   ok(ps_flush(client_root(&f)->space, &f.error), &f.error);
   m.mode = mode;

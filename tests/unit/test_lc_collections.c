@@ -226,16 +226,18 @@ static int build_query(fixture *f, lc_u64 ordinal) {
 static int load_query(fixture *f, const char *query_id, int *found) {
   lc_collection_handle *handle = f->a->impl;
   lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
+  unsigned char proof[LC_COLLECTION_PAGE_PROOF_BYTES];
   size_t count;
   lc_collection_index_cleanup(&f->query_index);
   check(f, lc_collection_prepare(handle, &f->error));
   check(f, lc_collection_order_rows(&handle->order, 0, rows,
                                     LC_COLLECTION_ORDER_PAGE_ROWS, &count,
-                                    &f->error));
+                                    proof, &f->error));
   return lc_collection_query_load(handle,
-                                  query_id ? query_id : handle->order.query_id,
+                                  query_id ? query_id :
+                                  lc_collection_query_epoch(handle, &handle->order),
                                   0, lc_collection_query_row_hash(rows, count),
-                                  &f->query_index, found, &f->error);
+                                  proof, &f->query_index, found, &f->error);
 }
 
 static void

@@ -20,6 +20,11 @@ typedef struct query_publication {
   int encrypted;
 } query_publication;
 
+const char *lc_collection_query_epoch(const lc_collection_handle *collection,
+                                      const lc_collection_order *order) {
+  return order->scratch ? collection->id : order->query_id;
+}
+
 static int query_binding(lc_collection_handle *collection, const char *query_id,
                          lc_u64 ordinal, char binding[128], lc_error *e) {
   char number[32];
@@ -41,17 +46,21 @@ static int query_select(void *context, lc_pouch_index_commit_fn commit,
   query_publication *p = context;
   lc_collection_handle *c = p->collection;
   lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
+  unsigned char proof[LC_COLLECTION_PAGE_PROOF_BYTES];
   size_t count = 0U;
   int skip, rc = lc_collection_metadata_enter(c, 1, e);
   if (rc != LC_OK)
     return rc;
   rc = lc_collection_refresh_view(c, e);
-  skip = rc != LC_OK || strcmp(c->order.query_id, p->index->query_id) != 0;
+  skip = rc != LC_OK ||
+         strcmp(lc_collection_query_epoch(c, &c->order), p->index->query_id);
   if (!skip) {
     rc = lc_collection_order_rows(&c->order, p->index->exact.index_seq, rows,
-                                  LC_COLLECTION_ORDER_PAGE_ROWS, &count, e);
+                                  LC_COLLECTION_ORDER_PAGE_ROWS, &count, proof,
+                                  e);
     skip =
         rc != LC_OK || count != p->index->rows ||
+        memcmp(proof, p->index->page_proof, sizeof(proof)) != 0 ||
         lc_collection_query_row_hash(rows, count) != p->index->exact.row_hash;
   }
   if (rc == LC_OK && !skip)
@@ -98,8 +107,9 @@ int lc_collection_query_store(lc_collection_handle *collection,
 
 int lc_collection_query_load(lc_collection_handle *collection,
                              const char *query_id, lc_u64 ordinal,
-                             unsigned long row_hash, lc_collection_index *index,
-                             int *found, lc_error *error) {
+                             unsigned long row_hash, const unsigned char *proof,
+                             lc_collection_index *index, int *found,
+                             lc_error *error) {
   lc_pouch_index_input input;
   lc_error failure;
   char binding[128], *bytes = NULL;
@@ -123,7 +133,8 @@ int lc_collection_query_load(lc_collection_handle *collection,
     rc = lc_collection_index_decode(index, &collection->allocator,
                                     collection->id, query_id, ordinal, row_hash,
                                     bytes, length, &failure);
-  if (rc == LC_OK && input.signature.present)
+  if (rc == LC_OK && input.signature.present &&
+      memcmp(proof, index->page_proof, sizeof(index->page_proof)) == 0)
     *found = 1;
   else
     lc_collection_index_cleanup(index);

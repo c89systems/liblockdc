@@ -410,16 +410,19 @@ static int lc_cr_body_finish(lc_collection_reader *reader) {
 
 static int lc_cr_query_page(lc_collection_reader *reader,
                             const lc_collection_order_row *rows, size_t count,
-                            lc_u64 *possible, lc_u64 *proven) {
+                            const unsigned char *proof, lc_u64 *possible,
+                            lc_u64 *proven) {
   lc_collection_index index;
   int found;
   int rc;
   *possible = ((lc_u64)1U << count) - 1U;
   *proven = 0U;
   rc = lc_collection_query_load(
-      reader->call->collection, reader->order.query_id,
+      reader->call->collection,
+      lc_collection_query_epoch(reader->call->collection, &reader->order),
       reader->iter.page_number * LC_COLLECTION_ORDER_PAGE_ROWS,
-      lc_collection_query_row_hash(rows, count), &index, &found, reader->error);
+      lc_collection_query_row_hash(rows, count), proof, &index, &found,
+      reader->error);
   if (rc == LC_OK && found && index.rows == count) {
     if (reader->plan.prefix)
       rc = lc_collection_index_lookup_prefix(&index, reader->plan.keys,
@@ -501,6 +504,7 @@ int lc_collection_read_method(lc_collection *self,
   lql_stream_result result;
   lql_error query_error;
   lql_status status;
+  unsigned char page_proof[LC_COLLECTION_PAGE_PROOF_BYTES];
   unsigned char *chunk;
   const char *expression;
   size_t count;
@@ -674,12 +678,12 @@ int lc_collection_read_method(lc_collection *self,
         rc = lc_collection_order_rows(
             &reader->order,
             reader->iter.page_number * LC_COLLECTION_ORDER_PAGE_ROWS, physical,
-            LC_COLLECTION_ORDER_PAGE_ROWS, &physical_count, error);
+            LC_COLLECTION_ORDER_PAGE_ROWS, &physical_count, page_proof, error);
       lc_collection_metadata_leave(collection);
     }
     if (rc == LC_OK && count != 0U && reader->plan.count != 0U)
-      rc = lc_cr_query_page(reader, physical, physical_count, &possible,
-                            &proven);
+      rc = lc_cr_query_page(reader, physical, physical_count, page_proof,
+                            &possible, &proven);
     slot = 0U;
     for (i = 0U; rc == LC_OK && !reader->cancelled && i < count &&
                  (!opts->has_first_n || reader->remaining != 0U);

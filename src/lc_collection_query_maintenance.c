@@ -9,6 +9,7 @@ int lc_collection_query_maintain(lc_collection *self, lc_error *error) {
   lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
   lc_collection_index index;
   char query_id[LC_XID_STRING_SIZE];
+  unsigned char proof[LC_COLLECTION_PAGE_PROOF_BYTES];
   lc_u64 captured, ordinal, generation, deleted;
   size_t count, i;
   int rooted, found, rc;
@@ -40,10 +41,12 @@ int lc_collection_query_maintain(lc_collection *self, lc_error *error) {
       rc = lc_collection_refresh_view(collection, error);
       if (rc == LC_OK) {
         generation = collection->order.generation;
-        memcpy(query_id, collection->order.query_id, sizeof(query_id));
+        memcpy(query_id,
+               lc_collection_query_epoch(collection, &collection->order),
+               sizeof(query_id));
         rc = lc_collection_order_rows(&collection->order, ordinal, rows,
                                       LC_COLLECTION_ORDER_PAGE_ROWS, &count,
-                                      error);
+                                      proof, error);
       }
       lc_collection_metadata_leave(collection);
     }
@@ -55,7 +58,7 @@ int lc_collection_query_maintain(lc_collection *self, lc_error *error) {
         deleted |= (lc_u64)1U << i;
     rc = lc_collection_query_load(collection, query_id, ordinal,
                                   lc_collection_query_row_hash(rows, count),
-                                  &index, &found, error);
+                                  proof, &index, &found, error);
     if (rc == LC_OK && (!found || index.rows != count)) {
       lc_collection_index_cleanup(&index);
       rc = lc_collection_query_build(&call, ordinal, error);

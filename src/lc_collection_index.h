@@ -22,13 +22,14 @@ typedef struct lc_collection_index {
   int failed;
   int sealed;
   char query_id[LC_XID_STRING_SIZE];
+  unsigned char page_proof[LC_COLLECTION_PAGE_PROOF_BYTES];
 } lc_collection_index;
 
-/* Ordinal and hash identify the caller's captured canonical metadata page;
- * collection_id binds its incarnation; query_id binds the canonical recovery
- * history even if lost positions/generations are reused. Initialize empty
- * storage, then add rows in physical order. Destroy all initialized instances,
- * including on error. */
+/* Ordinal and hash identify the caller's captured canonical metadata page.
+ * The collection ID binds its incarnation. The query ID binds multifile
+ * recovery history. Container pages include an ordered payload proof.
+ * Initialize empty storage, then add rows in physical order. Destroy all
+ * initialized instances, including on error. */
 int lc_collection_index_init(lc_collection_index *index,
                              const lc_allocator *allocator,
                              const char *collection_id, const char *query_id,

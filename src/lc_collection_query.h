@@ -29,8 +29,11 @@ int lc_collection_query_store(lc_collection_handle *collection,
                               lc_collection_index *index, lc_error *error);
 int lc_collection_query_load(lc_collection_handle *collection,
                              const char *query_id, lc_u64 ordinal,
-                             unsigned long row_hash, lc_collection_index *index,
-                             int *found, lc_error *error);
+                             unsigned long row_hash, const unsigned char *proof,
+                             lc_collection_index *index, int *found,
+                             lc_error *error);
+const char *lc_collection_query_epoch(const lc_collection_handle *,
+                                      const lc_collection_order *);
 unsigned long lc_collection_query_row_hash(const lc_collection_order_row *rows,
                                            size_t count);
 /* Captures and indexes one physical page outside mutation authority. Validates

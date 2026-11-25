@@ -719,7 +719,7 @@ static int query_cleanup_one(void *context, const void *name, size_t length,
   if (rc != LC_OK)
     return rc;
   rc = lc_collection_refresh_view(c, e);
-  if (rc == LC_OK && strcmp(epoch, c->order.query_id)) {
+  if (rc == LC_OK && strcmp(epoch, lc_collection_query_epoch(c, &c->order))) {
     rc = ps_namespace_work_ensure(receiver->owner->ns,
                                   LC_POUCH_STORAGE_WORK_ORDINARY, 0, e);
     if (rc == LC_OK)

@@ -643,16 +643,17 @@ test_mixed_process_churn_crosses_rotation_and_index_pages(void **state) {
   lc_collection_call_end(&call);
   check(f, rc);
   lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
+  unsigned char proof[LC_COLLECTION_PAGE_PROOF_BYTES];
   lc_collection_index index = {0};
   size_t row_count;
   int found;
   check(f, lc_collection_order_rows(&handle->order, 0, rows,
                                     LC_COLLECTION_ORDER_PAGE_ROWS, &row_count,
-                                    &f->error));
+                                    proof, &f->error));
   check(f,
         lc_collection_query_load(handle, handle->order.query_id, 0,
                                  lc_collection_query_row_hash(rows, row_count),
-                                 &index, &found, &f->error));
+                                 proof, &index, &found, &f->error));
   assert_true(found && index.rows == LC_COLLECTION_ORDER_PAGE_ROWS);
   lc_collection_index_cleanup(&index);
   close_client(f);

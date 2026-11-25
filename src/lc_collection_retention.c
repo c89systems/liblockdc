@@ -68,7 +68,7 @@ int lc_collection_retention_maintain(lc_collection *self, int *dropped,
       if (rc == LC_OK)
         rc = lc_collection_order_rows(&collection->order, ordinal, rows,
                                       LC_COLLECTION_ORDER_PAGE_ROWS, &count,
-                                      error);
+                                      NULL, error);
       for (i = 0U; rc == LC_OK && i < count; ++i) {
         if (rows[i].deleted_at != 0U)
           continue;

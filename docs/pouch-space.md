@@ -67,6 +67,10 @@ allocated on write. Captured views retain their backing while in use.
 Recovery rebuilds these projections from canonical records. Within a live
 cohort, a certified collection tail stays admitted across physical
 checkpoints. An interrupted edit or a cold open still requires recovery.
+Collection query pages can survive cold recovery. Their name binds the
+collection and page ordinal. An ordered digest of canonical positions,
+publication generations, sizes, and payload ETags binds the postings to
+the recovered rows. A changed page uses canonical scans until rebuilt.
 
 Reclamation waits for durable retirement and release of outstanding physical
 ownership. OFD range locks retain reader extents and private writer

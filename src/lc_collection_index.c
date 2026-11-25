@@ -6,6 +6,8 @@
 #include <zlib.h>
 
 #define LC_CI_HEADER_BYTES 64U
+#define LC_CI_PROOF_HEADER_BYTES                                               \
+  (LC_CI_HEADER_BYTES + LC_COLLECTION_PAGE_PROOF_BYTES)
 
 static int lc_ci_error(lc_error *error, int rc, const char *message) {
   return lc_error_set(error, rc, 0L, message, NULL,
@@ -312,6 +314,8 @@ int lc_collection_index_prune(lc_collection_index *index, lc_u64 removed,
       &replacement, &index->allocator, index->exact.ns, index->query_id,
       index->exact.index_seq, index->exact.row_hash, error);
   if (rc == LC_OK) {
+    memcpy(replacement.page_proof, index->page_proof,
+           sizeof(replacement.page_proof));
     replacement.rows = index->rows;
     replacement.covered = index->covered & ~removed;
     replacement.exact.row_count = replacement.presence.row_count = index->rows;
@@ -333,7 +337,8 @@ int lc_collection_index_encode(lc_collection_index *index, char **bytes,
                                size_t *length, lc_error *error) {
   char *exact, *presence;
   unsigned char *encoded;
-  size_t exact_len, presence_len, total;
+  static const unsigned char empty_proof[LC_COLLECTION_PAGE_PROOF_BYTES] = {0};
+  size_t exact_len, presence_len, total, header;
   unsigned long crc;
   int rc;
   if (bytes != NULL)
@@ -352,7 +357,10 @@ int lc_collection_index_encode(lc_collection_index *index, char **bytes,
   if (rc == LC_OK)
     rc = lc_pouch_index_term_generation_encode(
         &index->presence, &index->allocator, &presence, &presence_len, error);
-  total = LC_CI_HEADER_BYTES + exact_len + presence_len + 4U;
+  header = memcmp(index->page_proof, empty_proof, sizeof(empty_proof))
+               ? LC_CI_PROOF_HEADER_BYTES
+               : LC_CI_HEADER_BYTES;
+  total = header + exact_len + presence_len + 4U;
   if (rc == LC_OK && total > LC_COLLECTION_INDEX_MAX_BYTES)
     rc = lc_ci_error(error, LC_ERR_INVALID,
                      "collection index page exceeds metadata limit");
@@ -365,15 +373,20 @@ int lc_collection_index_encode(lc_collection_index *index, char **bytes,
                        "failed to allocate encoded collection index");
   }
   if (rc == LC_OK) {
-    memset(encoded, 0, LC_CI_HEADER_BYTES);
+    memset(encoded, 0, header);
     memcpy(encoded, "LCQPAGE1", 8U);
     lc_ci_put64(encoded + 8U, index->rows);
     lc_ci_put64(encoded + 16U, index->covered);
     lc_ci_put64(encoded + 24U, exact_len);
     lc_ci_put64(encoded + 32U, presence_len);
     memcpy(encoded + 40U, index->query_id, LC_XID_STRING_SIZE - 1U);
-    memcpy(encoded + LC_CI_HEADER_BYTES, exact, exact_len);
-    memcpy(encoded + LC_CI_HEADER_BYTES + exact_len, presence, presence_len);
+    if (header == LC_CI_PROOF_HEADER_BYTES) {
+      encoded[60] = 1U;
+      memcpy(encoded + LC_CI_HEADER_BYTES, index->page_proof,
+             sizeof(index->page_proof));
+    }
+    memcpy(encoded + header, exact, exact_len);
+    memcpy(encoded + header + exact_len, presence, presence_len);
     crc = (unsigned long)crc32(0L, encoded, (uInt)(total - 4U));
     encoded[total - 4U] = (unsigned char)crc;
     encoded[total - 3U] = (unsigned char)(crc >> 8U);
@@ -423,6 +436,7 @@ int lc_collection_index_decode(lc_collection_index *index,
   const unsigned char *encoded;
   lc_pouch_index_term_limits limits;
   lc_u64 exact_len, presence_len, rows;
+  size_t header;
   unsigned long crc, stored;
   int rc;
   if (index == NULL)
@@ -447,15 +461,19 @@ int lc_collection_index_decode(lc_collection_index *index,
   rows = lc_ci_get64(encoded + 8U);
   exact_len = lc_ci_get64(encoded + 24U);
   presence_len = lc_ci_get64(encoded + 32U);
+  header = encoded[60] ? LC_CI_PROOF_HEADER_BYTES : LC_CI_HEADER_BYTES;
   if (memcmp(encoded, "LCQPAGE1", 8U) != 0 || crc != stored ||
       memcmp(encoded + 40U, query_id, LC_XID_STRING_SIZE - 1U) != 0 ||
-      rows > LC_COLLECTION_ORDER_PAGE_ROWS ||
-      exact_len > length - LC_CI_HEADER_BYTES - 4U ||
-      presence_len != length - LC_CI_HEADER_BYTES - 4U - exact_len)
+      rows > LC_COLLECTION_ORDER_PAGE_ROWS || encoded[60] > 1U ||
+      length < header + 4U || exact_len > length - header - 4U ||
+      presence_len != length - header - 4U - exact_len)
     return lc_ci_error(error, LC_ERR_PROTOCOL,
                        "collection index envelope is invalid");
   index->rows = (unsigned int)rows;
   memcpy(index->query_id, query_id, LC_XID_STRING_SIZE);
+  if (header == LC_CI_PROOF_HEADER_BYTES)
+    memcpy(index->page_proof, encoded + LC_CI_HEADER_BYTES,
+           sizeof(index->page_proof));
   index->covered = lc_ci_get64(encoded + 16U);
   if ((index->covered & ~lc_ci_mask(index->rows)) != 0U)
     return lc_ci_error(error, LC_ERR_PROTOCOL,
@@ -463,11 +481,11 @@ int lc_collection_index_decode(lc_collection_index *index,
   limits.max_terms = LC_COLLECTION_INDEX_MAX_TERMS;
   limits.max_term_bytes = LC_COLLECTION_INDEX_TERM_BYTES;
   rc = lc_pouch_index_term_generation_decode(
-      &index->allocator, bytes + LC_CI_HEADER_BYTES, (size_t)exact_len, ordinal,
+      &index->allocator, bytes + header, (size_t)exact_len, ordinal,
       (unsigned long)rows, row_hash, &limits, &index->exact, error);
   if (rc == LC_OK)
     rc = lc_pouch_index_term_generation_decode(
-        &index->allocator, bytes + LC_CI_HEADER_BYTES + (size_t)exact_len,
+        &index->allocator, bytes + header + (size_t)exact_len,
         (size_t)presence_len, ordinal, (unsigned long)rows, row_hash, &limits,
         &index->presence, error);
   if (rc == LC_OK)

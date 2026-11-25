@@ -376,7 +376,7 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
                      : LC_COLLECTION_ORDER_PAGE_ROWS;
       if (rc == LC_OK)
         rc = lc_collection_order_rows(&work->captured, ordinal, rows, capacity,
-                                      &count, error);
+                                      &count, NULL, error);
       lc_collection_metadata_leave(collection);
     }
     if (rc == LC_OK && count == 0U)

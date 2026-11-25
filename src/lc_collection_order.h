@@ -12,6 +12,7 @@
 #define LC_COLLECTION_ORDER_ROW_BYTES 104U
 #define LC_COLLECTION_ORDER_PAGE_BYTES 4096U
 #define LC_COLLECTION_ORDER_ROOT_BYTES 160U
+#define LC_COLLECTION_PAGE_PROOF_BYTES 32U
 
 typedef struct lc_collection_order_row {
   lc_u64 position;
@@ -100,14 +101,15 @@ int lc_collection_order_checkpoint(lc_collection_order *order,
  * bytes or claim durability independently of the canonical log. */
 int lc_collection_order_append(lc_collection_order *order,
                                const lc_collection_order_row *row,
-                               lc_u64 replay_segment, lc_u64 replay_offset,
-                               lc_error *error);
+                               const char *etag, lc_u64 replay_segment,
+                               lc_u64 replay_offset, lc_error *error);
 /* Rebuilds a newly owned projection from canonical snapshot records in
  * position order. Deletion generations need not follow that order; they are
  * retained in each row and the projection watermark takes their maximum.
  * Never use this to publish a new application append. */
 int lc_collection_order_append_recovered(lc_collection_order *order,
                                          const lc_collection_order_row *row,
+                                         const char *etag,
                                          lc_u64 replay_segment,
                                          lc_u64 replay_offset, lc_error *error);
 int lc_collection_order_delete(lc_collection_order *order, lc_u64 position,
@@ -164,6 +166,7 @@ int lc_collection_order_batch(lc_collection_order *order,
  * metadata authority and pins the referenced canonical generation. */
 int lc_collection_order_rows(lc_collection_order *order, lc_u64 first,
                              lc_collection_order_row *rows, size_t capacity,
-                             size_t *count, lc_error *error);
+                             size_t *count, unsigned char *proof,
+                             lc_error *error);
 
 #endif
