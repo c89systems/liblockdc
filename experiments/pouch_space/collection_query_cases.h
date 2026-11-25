@@ -421,6 +421,78 @@ static void collection_queries(const char *directory, int codec, int sync) {
   cq_concurrency(directory, codec, sync);
   cq_optional_failure(directory, codec, sync);
 }
+static void cq_replacement_recovery(const char *directory, int codec) {
+  fixture f;
+  disk_model disk = {0};
+  ps_io io = {&disk, disk_read, disk_write, disk_sync, disk_reserve, NULL};
+  lc_pouch_index_input pinned = {0};
+  lc_collection_delete_res deleted;
+  lc_pouch_maintenance_options maintenance = {0};
+  lc_collection_index index = {0};
+  ps_stats before, after;
+  int found;
+  disk.stable = calloc(1U, (size_t)PS_DEFAULT_CAPACITY);
+  disk.dirty = calloc((size_t)(PS_DEFAULT_CAPACITY / PS_PAGE), 1U);
+  disk.scratch = malloc(PS_PAGE);
+  REQUIRE(disk.stable && disk.dirty && disk.scratch);
+  setup_io(&f, directory, codec, 0, 0, &io);
+  cq_seed(&f, LC_COLLECTION_ORDER_PAGE_ROWS);
+  ok(cq_load(&f, &index, &found), &f.error);
+  REQUIRE(found && (index.covered & UINT64_C(2)));
+  lc_collection_index_cleanup(&index);
+  lc_collection_handle *c = f.collection->impl;
+  ps_space *space = client_root(&f)->space;
+  ok(ps_checkpoint(space, &f.error), &f.error);
+  ok(c->queries.open(c->queries.context,
+                     lc_collection_query_epoch(c, &c->order), 0U, &pinned,
+                     &f.error),
+     &f.error);
+  REQUIRE(pinned.signature.present);
+  unsigned long crc = cq_input_crc(&pinned, &f.error);
+  ok(lc_collection_delete_entry(f.collection, 2U, &deleted, &f.error),
+     &f.error);
+  ok(ps_status(space, &before, &f.error), &f.error);
+  REQUIRE(!before.retired_bytes);
+  maintenance.ns = "journal";
+  c->pouch->compaction_min_reclaimable_bytes = LC_U64_MAX;
+  ok(lc_pouch_maintenance_run(c->pouch, &maintenance, NULL, &f.error),
+     &f.error);
+  ok(ps_status(space, &after, &f.error), &f.error);
+  REQUIRE(after.retired_bytes && after.journal_bytes &&
+          after.checkpoints == before.checkpoints &&
+          after.syncs == before.syncs + 1U);
+  REQUIRE(cq_input_crc(&pinned, &f.error) == crc);
+  c->queries.close(c->queries.context, &pinned);
+  ok(ps_status(space, &after, &f.error), &f.error);
+  REQUIRE(after.retired_bytes);
+
+  /* Recover the journaled replacement without the recent close receipt. The
+   * prior checkpoint's page remains owned until the next real retirement. */
+  close_store(&f);
+  restore_disk(&disk, f.path);
+  open_client(&f, 0);
+  open_collection(&f, 0, &f.collection);
+  c = f.collection->impl;
+  space = client_root(&f)->space;
+  ok(cq_load(&f, &index, &found), &f.error);
+  REQUIRE(found && !(index.covered & UINT64_C(2)));
+  lc_collection_index_cleanup(&index);
+  cq_verify(&f, cq_expected(LC_COLLECTION_ORDER_PAGE_ROWS, 1));
+  ok(ps_status(space, &before, &f.error), &f.error);
+  REQUIRE(before.retired_bytes && before.journal_bytes);
+  maintenance.cleanup_only = 1;
+  ok(lc_pouch_maintenance_run(c->pouch, &maintenance, NULL, &f.error),
+     &f.error);
+  ok(ps_status(space, &after, &f.error), &f.error);
+  REQUIRE(after.checkpoints == before.checkpoints + 1U &&
+          !after.retired_bytes && !after.journal_bytes);
+  cq_verify(&f, cq_expected(LC_COLLECTION_ORDER_PAGE_ROWS, 1));
+  close_store(&f);
+  lc_error_cleanup(&f.error);
+  free(disk.scratch);
+  free(disk.dirty);
+  free(disk.stable);
+}
 static int cq_action(fixture *f, int action) {
   if (action == 1)
     return lc_collection_query_maintain(f->collection, &f->error);

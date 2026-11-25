@@ -277,9 +277,15 @@ int ps_flush(ps_space *, lc_error *);
  * copying or file shrinking. Growth and explicit repacking retain their own
  * mandatory checkpoint publication. */
 int ps_checkpoint(ps_space *, lc_error *);
-/* Settle canonical checkpoint work and reclaim unpinned runs. Shared cleanup
- * may leave live-only journal stamps for the next normal checkpoint. */
-int ps_checkpoint_cleanup(ps_space *, int allow_log_only, lc_error *);
+enum ps_cleanup_policy {
+  PS_CLEANUP_CHECKPOINT,
+  PS_CLEANUP_FLUSH,
+  PS_CLEANUP_DEFER_QUERY_RECLAIM
+};
+/* Settle completed work. Shared cleanup can leave live-only journal stamps.
+ * Exclusive NoSync maintenance can defer reclaiming replaced collection query
+ * pages to a later checkpoint. Their extents remain owned until retirement. */
+int ps_checkpoint_cleanup(ps_space *, enum ps_cleanup_policy, lc_error *);
 /* Explicit metadata maintenance: rewrite all current descriptors and their
  * directory references densely through the same durable root-retirement
  * protocol. Payloads, stream mappings and captured readers are unchanged.

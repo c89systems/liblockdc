@@ -83,8 +83,11 @@ those older frames if their clear was lost.
 During ordinary exclusive maintenance, an append-only prefix can stay in
 the journal and canonical streams when there is no physical retirement,
 metadata trimming, or allocation pressure. Maintenance still syncs that
-prefix before returning. Capacity admission and journal rollover can
-checkpoint it later.
+prefix before returning. Ordinary exclusive NoSync maintenance may also
+leave replaced collection index pages owned by the preceding checkpoint.
+Cleanup-only and forced maintenance reclaim them after retiring that
+checkpoint and releasing any readers. Capacity admission and journal
+rollover can checkpoint the prefix earlier.
 
 A selected namespace key checkpoint makes metadata-only work discoverable by
 maintenance. The first namespace index publication can include a maintenance

@@ -247,7 +247,7 @@ static void checkpoint_retire_select(int durable, int shared) {
     /* Also exercise interrupted exchanges between two retirement-selected
      * headers, in addition to exchanges from the original layout. */
     if (durable)
-      OK(ps_checkpoint_cleanup(s, 0, &error));
+      OK(ps_checkpoint_cleanup(s, PS_CLEANUP_CHECKPOINT, &error));
     else
       OK(ps_checkpoint(s, &error));
     size_t prior = fixture_get64(m.stable) == ROOT_MAGIC ? 0 : PS_PAGE;
@@ -263,11 +263,12 @@ static void checkpoint_retire_select(int durable, int shared) {
     if (cut == KEEP_PRIOR || cut == TORN_PRIOR)
       m.fail_sync_at = syncs + 2;
     if (m.fail_sync_at) {
-      CHECK(ps_checkpoint_cleanup(s, 1, &error) == LC_ERR_TRANSPORT);
+      CHECK(ps_checkpoint_cleanup(s, PS_CLEANUP_FLUSH, &error) ==
+            LC_ERR_TRANSPORT);
       lc_error_cleanup(&error);
       CHECK(m.syncs == m.fail_sync_at);
     } else {
-      OK(ps_checkpoint_cleanup(s, 1, &error));
+      OK(ps_checkpoint_cleanup(s, PS_CLEANUP_FLUSH, &error));
       CHECK(m.syncs == syncs + 2);
       CHECK(fixture_get64(m.stable + prior) == 0);
       CHECK(fixture_get64(m.stable + JOURNAL_OFFSET) != 0);

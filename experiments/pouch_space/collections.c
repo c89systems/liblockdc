@@ -1847,10 +1847,17 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
      * obligation. Capacity admission and journal rollover settle unrelated
      * work. Exclusive maintenance uses the cleanup checkpoint for the same
      * retirement work regardless of which operation selected it. */
-    if (rc == LC_OK && (scan_collections || reclaimed || !shared))
-      rc = !shared || (options->cleanup_only && !options->force)
-               ? ps_checkpoint_cleanup(root->space, !options->force, &local)
-               : ps_checkpoint(root->space, &local);
+    if (rc == LC_OK && (scan_collections || reclaimed || !shared)) {
+      if (!shared || (options->cleanup_only && !options->force)) {
+        enum ps_cleanup_policy policy = PS_CLEANUP_DEFER_QUERY_RECLAIM;
+        if (options->force)
+          policy = PS_CLEANUP_CHECKPOINT;
+        else if (options->cleanup_only)
+          policy = PS_CLEANUP_FLUSH;
+        rc = ps_checkpoint_cleanup(root->space, policy, &local);
+      } else
+        rc = ps_checkpoint(root->space, &local);
+    }
     if (rc != LC_OK) {
       first_rc = rc;
       first = local;

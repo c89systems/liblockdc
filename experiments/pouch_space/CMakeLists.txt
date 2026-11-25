@@ -761,6 +761,11 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_root_conversion-growth COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-growth)
   set_tests_properties(pouch_space_root_conversion-growth PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space")
   foreach(codec RANGE 0 3)
+    add_test(NAME pouch_space_collection_query-replacement-recovery_${codec}
+      COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR}
+        query-replacement-recovery ${codec} 0)
+    set_tests_properties(pouch_space_collection_query-replacement-recovery_${codec}
+      PROPERTIES TIMEOUT 60 LABELS "unit;local;pouch-space")
     foreach(mode maintenance-retention-cold maintenance-retention-writeback)
       set(name pouch_space_collection_${mode}_${codec})
       add_test(NAME ${name} COMMAND pouch_space_collection_sdk_test

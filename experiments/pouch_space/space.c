@@ -9278,16 +9278,21 @@ int ps_flush(ps_space *s, lc_error *error) {
 /* An exclusive root can keep append-only work in its replayable prefix.
  * Whole stream removal marks owned entries deleted in place, so the retired
  * list alone is insufficient to prove that no ownership needs retirement. */
-static int checkpoint_needs_retirement(ps_space *s) {
+static int checkpoint_needs_retirement(ps_space *s,
+                                       enum ps_cleanup_policy policy) {
   const ps_entry *p;
-  if (s->retired || ps_readiness_pressure(s))
+  if (ps_readiness_pressure(s))
     return 1;
+  for (p = s->retired; p; p = p->retired_next)
+    if (policy != PS_CLEANUP_DEFER_QUERY_RECLAIM || s->durable ||
+        p->key.kind != PS_COLLECTION_QUERY)
+      return 1;
   for (p = s->dirty; p; p = p->dirty_next)
     if (p->deleted)
       return 1;
   return 0;
 }
-static int checkpoint(ps_space *s, int cleanup, int allow_log_only,
+static int checkpoint(ps_space *s, int cleanup, enum ps_cleanup_policy policy,
                       lc_error *error) {
   ps_coordination_guard *guard;
   uint64_t bound;
@@ -9318,8 +9323,8 @@ static int checkpoint(ps_space *s, int cleanup, int allow_log_only,
      * the directory. Each stamp-only checkpoint advances the root generation
      * and invalidates those stamps. Canonical changes mark entries dirty,
      * including stream tails and admission metadata. */
-    if (allow_log_only && !s->readiness && !trim &&
-        !checkpoint_needs_retirement(s)) {
+    if (policy != PS_CLEANUP_CHECKPOINT && !s->readiness && !trim &&
+        !checkpoint_needs_retirement(s, policy)) {
       rc = ps_flush(s, error);
       if (rc == LC_OK)
         rc = pins_reclaim_current(s, error);
@@ -9341,10 +9346,11 @@ static int checkpoint(ps_space *s, int cleanup, int allow_log_only,
   return rc;
 }
 int ps_checkpoint(ps_space *s, lc_error *error) {
-  return checkpoint(s, 0, 0, error);
+  return checkpoint(s, 0, PS_CLEANUP_CHECKPOINT, error);
 }
-int ps_checkpoint_cleanup(ps_space *s, int allow_log_only, lc_error *error) {
-  return checkpoint(s, 1, allow_log_only, error);
+int ps_checkpoint_cleanup(ps_space *s, enum ps_cleanup_policy policy,
+                          lc_error *error) {
+  return checkpoint(s, 1, policy, error);
 }
 int ps_metadata_repack(ps_space *s, lc_error *error) {
   int rc;

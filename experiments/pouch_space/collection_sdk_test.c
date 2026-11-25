@@ -2246,6 +2246,7 @@ int main(int argc, char **argv) {
         !strcmp(argv[2], "root-conversion-crash") ||
         !strcmp(argv[2], "query") || !strcmp(argv[2], "query-io") ||
         !strcmp(argv[2], "query-allocation") ||
+        !strcmp(argv[2], "query-replacement-recovery") ||
         !strcmp(argv[2], "maintenance") ||
         !strcmp(argv[2], "maintenance-live") ||
         !strcmp(argv[2], "maintenance-retention-cold") ||
@@ -2308,7 +2309,10 @@ int main(int argc, char **argv) {
       query_mode = 1;
       if (!strcmp(argv[2], "query"))
         collection_queries(directory, codec, sync);
-      else
+      else if (!strcmp(argv[2], "query-replacement-recovery")) {
+        REQUIRE(!sync);
+        cq_replacement_recovery(directory, codec);
+      } else
         collection_query_faults(directory, codec, sync,
                                 !strcmp(argv[2], "query-allocation"));
     } else if (!strcmp(argv[2], "background") ||
