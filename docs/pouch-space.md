@@ -53,6 +53,8 @@ On an exclusive root, the first namespace creation can share a barrier with
 its new incarnation range. Recovery admits the catalog entry only when the
 covering range is present. On NoSync roots with native zero-range support,
 that barrier can also prepare a bounded interval for subsequent stream grants.
+Fresh shared roots make their already durable free-page zeros available to
+all owners in the first live cohort. Cold reopen clears that proof.
 After a clean exclusive NoSync close, a checked journal can serve reads.
 The first persistent mutation or explicit flush stabilizes that recovered view.
 Replayed keys acquire a physical snapshot identity when a write or checkpoint

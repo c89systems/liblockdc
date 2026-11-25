@@ -5,6 +5,7 @@
 #include "lc_api_internal.h"
 #include "lc_pouch_record.h"
 #include "owned.h"
+#include "readiness.h"
 #include "space.h"
 #include "space_internal.h"
 #include "stream.h"
@@ -3304,6 +3305,35 @@ static void namespace_grant_publication(void) {
     free(m.stable);
     clean();
   }
+}
+
+static void shared_creation_zero_proof(void) {
+  static const char value[] = "allocated";
+  ps_options options = {0};
+  ps_space *creator = NULL, *peer = NULL;
+  ps_entry *entry;
+  ps_ref ref;
+  uint64_t untouched;
+  options.initial_capacity = PS_DEFAULT_CAPACITY;
+  options.shared = 1;
+  OK(ps_open(path, 1, &options, &creator, &error));
+  untouched = creator->free->offset;
+  CHECK(ps_readiness_zero_prefix(creator, untouched, PS_PAGE) == PS_PAGE);
+  OK(ps_open(path, 0, &options, &peer, &error));
+  CHECK(ps_readiness_zero_prefix(peer, untouched, PS_PAGE) == PS_PAGE);
+  ref = put(peer, state(1), value, sizeof(value), 1);
+  entry = ps_internal_lookup(peer, state(1));
+  CHECK(entry && entry->count == 1);
+  CHECK(!ps_readiness_zero_prefix(creator, entry->extents[0].offset, PS_PAGE));
+  untouched = peer->free->offset;
+  CHECK(ps_readiness_zero_prefix(creator, untouched, PS_PAGE) == PS_PAGE);
+  OK(ps_close(creator, &error));
+  OK(ps_close(peer, &error));
+  OK(ps_open(path, 0, &options, &peer, &error));
+  CHECK(!ps_readiness_zero_prefix(peer, untouched, PS_PAGE));
+  expect(peer, state(1), &ref, value, sizeof(value));
+  OK(ps_close(peer, &error));
+  clean();
 }
 
 static void canonical_stream_exact_reservations(void) {
@@ -8053,6 +8083,7 @@ static int run_portable_case(const char *mode) {
     nosync_close_recovery(NOSYNC_RECOVERY_WRITE_FAILURE);
     nosync_close_recovery(NOSYNC_RECOVERY_DURABLE_OPEN);
     namespace_grant_publication();
+    shared_creation_zero_proof();
     return 1;
   }
   if (!strcmp(mode, "reopen-sanitize")) {

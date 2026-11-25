@@ -582,13 +582,13 @@ static void append_hint(const char *path) {
         clear(&e);
       } else {
         ok(rc, &e);
-        /* The hint shares the binding's barrier. A shared stream also
-         * synchronizes its first grant before allowing writes. */
+        /* The hint shares the binding's barrier. Both ownership modes can
+         * use the freshly created root's durable zeroed space. */
         uint64_t synced = scope_syncs(p, &e) - before;
-        if (synced != 1U + (unsigned int)shared)
+        if (synced != 1U)
           fprintf(stderr, "first append shared=%d barriers=%llu\n", shared,
                   (unsigned long long)synced);
-        REQUIRE(append.handle && synced == 1U + (unsigned int)shared);
+        REQUIRE(append.handle && synced == 1U);
         ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &present,
                                  &e),
            &e);

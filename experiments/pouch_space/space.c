@@ -7444,6 +7444,15 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     rc = metadata_protect(s, bound, 0, 0, error);
   if (rc == LC_OK)
     rc = ps_readiness_opened(s, error);
+  if (rc == LC_OK && create && s->readiness) {
+    ps_run *run;
+    /* The initial selector's barrier covered the new file's reserved
+     * zeros. Share that proof while creation still owns the allocator.
+     * Existing roots must establish it again for each cold cohort. */
+    for (run = s->free; run; run = run->next)
+      if (!run->claimed)
+        ps_readiness_zero_pages(s, run->offset, run->bytes, 1);
+  }
   rc = allocation_end(s, opening, rc, error);
   if (rc == LC_OK && !(create && hold_initialization))
     rc = ps_coordination_initialize(s->coordination, create, 0, error);

@@ -662,6 +662,7 @@ static void prepared_grants(void) {
   REQUIRE(read(ready[0], &observed, 1) == 1 && observed == 'O');
   ok(ps_owned_open(a, NULL, kx, 1, NULL, &x, &ix, &e), &e);
   ok(ps_owned_open(b, NULL, ky, 1, NULL, &y, &iy, &e), &e);
+  retain_preparation_after(a, a->capacity);
   uint64_t first = expect_zero_grant(a, NULL, x, &ix, 0, 0, 1);
   uint64_t funded = first + PS_PAGE;
   ok(ps_budget_open(b, &plan, &budget, &e), &e);
@@ -741,6 +742,7 @@ static void prepared_grant_fault(void) {
   ok(ps_open(path, 1, &options, &a, &e), &e);
   ok(ps_open(path, 0, NULL, &b, &e), &e);
   ok(ps_owned_open(a, NULL, key, 1, NULL, &head, &info, &e), &e);
+  retain_preparation_after(a, a->capacity);
   fault.armed = 1;
   REQUIRE(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, &e) ==
               LC_ERR_TRANSPORT &&
@@ -823,6 +825,7 @@ static void processes(void) {
     REQUIRE(close(ready[0]) == 0 && close(control[1]) == 0);
     ps_owned_run *run = NULL;
     int found = 0;
+    retain_preparation_after(s, s->capacity);
     ok(ps_owned_grant(head, NULL, 0, PS_MIB, &run, &found, &e), &e);
     REQUIRE(found && record.header == PS_DATA);
     /* Only the released peer's dirty range is unclaimed. A formerly clean
@@ -1132,6 +1135,7 @@ static void history(void) {
   REQUIRE(close(ready[0]) == 0 && close(control[1]) == 0);
   ps_owned_run *run = NULL;
   int found = 0;
+  retain_preparation_after(s, s->capacity);
   ok(ps_owned_grant(head, NULL, 0, PS_MIB, &run, &found, &e), &e);
   REQUIRE(found && record.header == PS_DEFAULT_CAPACITY - headroom);
   unsigned char bytes[257];
@@ -4886,6 +4890,7 @@ static void fragmented_preparation(void) {
   ok(ps_owned_open(b, NULL, ky, 1, NULL, &y, &iy, &e), &e);
   /* The low dirty hole fits this grant exactly. A wider dirty run can
    * prepare the same grant and a usable peer grant in one barrier. */
+  retain_preparation_after(a, a->capacity);
   uint64_t first = expect_zero_grant(a, NULL, x, &ix, 0, 0, 1);
   expect_zero_grant(b, NULL, y, &iy, 0, first + PS_PAGE, 0);
   REQUIRE(first > low + PS_PAGE);
@@ -4957,6 +4962,7 @@ static void checkpoint_preparation(enum checkpoint_preparation_case outcome) {
     ok(ps_delete(writer, key(id), &e), &e);
   ok(ps_checkpoint(writer, &e), &e);
   REQUIRE(!probe.ranges);
+  retain_preparation_after(writer, writer->capacity);
   capture_put(writer, 42, 65);
   REQUIRE(!pthread_mutex_lock(&writer->mutex));
   ok(ps_internal_capture_begin(writer, &guard, &e), &e);
@@ -6589,6 +6595,7 @@ static void shared_preparation(enum preparation_barrier when) {
   ok(ps_flush(b, &e), &e);
   ok(ps_open(path, 0, &ao, &a, &e), &e);
   capture_put(a, 1, 65);
+  retain_preparation_after(b, b->capacity);
   uint64_t a_syncs = status(a).syncs, b_syncs = status(b).syncs;
   durable_work flush = {a, &leader};
   if (when == READY_DURING_SYNC) {
@@ -6762,6 +6769,7 @@ static void shared_preparation_wait(int owner_dies) {
   ok(ps_flush(writer, &e), &e);
   ok(ps_open(path, 0, NULL, &peer, &e), &e);
   capture_put(peer, 1, 65);
+  retain_preparation_after(writer, writer->capacity);
   REQUIRE(!pipe(ready) && !pipe(lifetime));
   pid_t child = fork();
   REQUIRE(child >= 0);
@@ -6849,6 +6857,7 @@ static void preparation_leaves_peer_headroom(void) {
   plan.payload_bytes = available - 2 * PS_MIB;
   ok(ps_budget_open(peer, &plan, &pressure, &e), &e);
   REQUIRE(ps_maintenance_pressure_requested(writer));
+  retain_preparation_after(writer, writer->capacity);
 
   gate.attempted = 0;
   gate.hold_leadership = 1;
