@@ -75,9 +75,13 @@ static void xa_crash_seed_restore(const xa_crash_seed *seed, const char *path) {
 }
 static void xa_crashes(const char *directory) {
   static const int actions[2][5] = {{0, 3, 5, 6, 10}, {0, 5, 6, 7, 0}};
+  const char *side = getenv("POUCH_XA_CRASH_SIDE");
+  int test_side[2] = {!side || !strcmp(side, "before"),
+                      !side || !strcmp(side, "after")};
   char path[1400], sync_text[16], action_text[16], stop_text[32];
   lc_error e;
   size_t deaths = 0U;
+  REQUIRE(test_side[0] || test_side[1]);
   xa_crash_seed *seed = malloc(sizeof(*seed));
   REQUIRE(seed && (seed->bytes = malloc(PS_DEFAULT_CAPACITY)));
   lc_error_init(&e);
@@ -97,6 +101,8 @@ static void xa_crashes(const char *directory) {
         size_t sites = 0U;
         for (size_t stop = 0U; stop <= sites; ++stop)
           for (int after = 0; after < (stop ? 2 : 1); ++after) {
+            if (stop && !test_side[after])
+              continue;
             lc_client *client = NULL;
             lc_xa_store *journal = NULL, *other = NULL;
             if (!stop) {

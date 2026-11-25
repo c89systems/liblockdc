@@ -943,17 +943,19 @@ if(LOCKDC_BUILD_TESTS)
         continue()
       endif()
       if(mode STREQUAL "xa-crash")
-        # Keep the full before/after sweep for each action in an isolated root.
+        # Count the sites from the same seed for each side of the crash cut.
         foreach(profile RANGE 0 3)
           math(EXPR managed "${profile} % 2")
           math(EXPR last_action "4 - ${managed}")
           foreach(action RANGE 0 ${last_action})
-            set(name pouch_space_client_xa-crash_${codec}_${profile}_${action})
-            add_test(NAME ${name}
-              COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} xa-crash)
-            set_tests_properties(${name} PROPERTIES TIMEOUT 180 COST 90
-              LABELS "unit;local;pouch-space"
-              ENVIRONMENT "POUCH_XA_CODEC=${codec};POUCH_XA_CRASH_PROFILE=${profile};POUCH_XA_CRASH_ORDINAL=${action}")
+            foreach(side before after)
+              set(name pouch_space_client_xa-crash_${codec}_${profile}_${action}_${side})
+              add_test(NAME ${name}
+                COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} xa-crash)
+              set_tests_properties(${name} PROPERTIES TIMEOUT 180 COST 45
+                LABELS "unit;local;pouch-space"
+                ENVIRONMENT "POUCH_XA_CODEC=${codec};POUCH_XA_CRASH_PROFILE=${profile};POUCH_XA_CRASH_ORDINAL=${action};POUCH_XA_CRASH_SIDE=${side}")
+            endforeach()
           endforeach()
         endforeach()
         continue()
