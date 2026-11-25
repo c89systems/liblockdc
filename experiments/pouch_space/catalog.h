@@ -41,6 +41,12 @@ int ps_catalog_put(ps_space *, ps_budget *, uint64_t owner, unsigned int kind,
                    const void *name, size_t length, const ps_ref *expected,
                    ps_key stream, const ps_ref *target, ps_catalog_info *,
                    lc_error *);
+/* A foreground append may prepare its successor before the canonical route
+ * is selected. Exclusive NoSync keeps the binding in the same journal prefix
+ * as that selection. Catalog readers still select the durable prefix. */
+int ps_catalog_stage_segment(ps_space *, ps_budget *, uint64_t owner,
+                             const void *, size_t, ps_key, const ps_ref *,
+                             ps_catalog_info *, lc_error *);
 /* Bounded work markers live in an immutable catalog record. The name and
  * value together must fit one journal frame. Replacement is revision-checked.
  * Marker views preserve the selected durable bytes through removal. */

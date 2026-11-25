@@ -15,6 +15,7 @@
 #include "query_index.h"
 #include "readiness.h"
 #include "root_internal.h"
+#include "space_internal.h"
 #include <errno.h>
 #include <limits.h>
 #include <string.h>
@@ -227,8 +228,9 @@ static int append_begin(void *context, void *ns, uint64_t target,
                         const lc_pouch_storage_batch *batch,
                         lc_pouch_storage_append *out, lc_error *e) {
   ps_namespace_append *append = NULL;
+  ps_namespace *owner = ns;
   enum ps_namespace_append_mode physical;
-  int rc, work_pending;
+  int rc, maintenance, work_pending;
   (void)context;
   memset(out, 0, sizeof(*out));
   switch (mode) {
@@ -256,17 +258,18 @@ static int append_begin(void *context, void *ns, uint64_t target,
        mode == LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX) &&
       target)
     target = target > PS_FRAME_BYTES ? target - PS_FRAME_BYTES : 1;
-  rc = ps_namespace_work_stage_ordinary(
-      ns,
-      mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE ||
-          mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX,
-      &work_pending, e);
+  maintenance = mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE ||
+                mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX;
+  rc = ps_namespace_work_stage_ordinary(owner, maintenance, &work_pending, e);
   if (rc != LC_OK)
     return rc;
-  rc = ps_namespace_append_begin(ns, target, minimum, physical, batch, &append,
-                                 e);
-  if (rc == LC_OK && work_pending)
-    rc = ps_namespace_work_complete_ordinary(ns, e);
+  rc = ps_namespace_append_begin(owner, target, minimum, physical, batch,
+                                 &append, e);
+  /* The hint precedes the new route in the journal. An exclusive NoSync
+   * append can leave both for the next canonical durability boundary. */
+  if (rc == LC_OK && work_pending &&
+      (maintenance || !ps_internal_exclusive_nosync(owner->root->space)))
+    rc = ps_namespace_work_complete_ordinary(owner, e);
   if (rc != LC_OK) {
     ps_namespace_append_close(append);
     return rc;

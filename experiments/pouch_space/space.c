@@ -11531,6 +11531,9 @@ int ps_owned_retire(ps_owned_head *head, lc_error *error) {
 }
 ps_entry *ps_internal_lookup(ps_space *s, ps_key key) { return lookup(s, key); }
 int ps_internal_healthy(ps_space *s, lc_error *e) { return healthy(s, e); }
+int ps_internal_exclusive_nosync(ps_space *s) {
+  return s && !s->readiness && !s->durable;
+}
 int ps_internal_event(ps_space *s, ps_entry *p, int event, lc_error *e) {
   return append_event(s, p, event, e);
 }

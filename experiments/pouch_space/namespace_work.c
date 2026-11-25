@@ -213,19 +213,38 @@ static int select_work(const char *name, const ps_namespace_info *info,
                        void *context, lc_error *e) {
   discovery *d = context;
   ps_reader *hint = NULL;
+  ps_key key = key_for(info->owner, d->kind);
   char *copy;
+  int rc, present;
   /* Discover by selected identity. The maintenance pass validates the
    * payload, so a malformed hint cannot hide work in another namespace. */
-  int rc =
-      ps_read_open(d->space, key_for(info->owner, d->kind), NULL, &hint, e);
-  int present = rc == LC_OK;
+  rc = ps_read_open(d->space, key, NULL, &hint, e);
+  present = rc == LC_OK;
   ps_reader_close(hint);
   if (rc == LC_ERR_INVALID) {
     lc_error_cleanup(e);
-    rc = d->kind == LC_POUCH_STORAGE_WORK_ORDINARY
-             ? ps_key_checkpoint_present(d->space, info->owner, &present, e)
-             : LC_OK;
+    rc = LC_OK;
   }
+  if (rc == LC_OK && !present && d->kind == LC_POUCH_STORAGE_WORK_ORDINARY &&
+      ps_internal_exclusive_nosync(d->space)) {
+    ps_key route_key = {0, 1, PS_ROUTING};
+    ps_entry *entry, *route;
+    uint64_t durable;
+    /* A staged hint becomes discoverable when the namespace selects its
+     * first route. Failed admission can leave a hint with no selected route. */
+    route_key.owner = info->owner;
+    pthread_mutex_lock(&d->space->mutex);
+    rc = ps_internal_healthy(d->space, e);
+    entry = ps_internal_lookup(d->space, key);
+    route = ps_internal_lookup(d->space, route_key);
+    durable = __atomic_load_n(&d->space->durable_sequence, __ATOMIC_ACQUIRE);
+    present =
+        entry && !entry->deleted &&
+        (entry->publication_sequence <= durable || (route && !route->deleted));
+    pthread_mutex_unlock(&d->space->mutex);
+  }
+  if (rc == LC_OK && !present && d->kind == LC_POUCH_STORAGE_WORK_ORDINARY)
+    rc = ps_key_checkpoint_present(d->space, info->owner, &present, e);
   if (rc != LC_OK || !present)
     return rc;
   if (!d->first || strcmp(name, d->first) < 0) {

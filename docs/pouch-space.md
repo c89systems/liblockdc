@@ -72,6 +72,10 @@ A selected namespace key checkpoint makes metadata-only work discoverable by
 maintenance. The first namespace index publication can include a maintenance
 hint in the same durability barrier as its generation, manifest, and
 completed canonical prefix.
+Exclusive NoSync foreground appends frame a successor binding and maintenance
+hint before the route can select that segment. The route makes the hint
+discoverable to live maintenance. The next canonical durability barrier
+covers the binding, hint, and selected records in journal order.
 
 Collection order and append-ID projections use process-local memory pages
 allocated on write. Captured views retain their backing while in use.

@@ -577,23 +577,29 @@ static void append_hint(const char *path) {
       int rc = p->storage.ops->append_begin(p->storage.context, ns, 0, 48,
                                             LC_POUCH_STORAGE_APPEND_COMPLETE,
                                             NULL, &append, &e);
-      if (fail) {
+      if (fail && shared) {
         REQUIRE(rc == LC_ERR_TRANSPORT && !append.handle && !model.fail_sync);
         clear(&e);
       } else {
         ok(rc, &e);
-        /* The hint shares the binding's barrier. Both ownership modes can
-         * use the freshly created root's durable zeroed space. */
+        /* A fresh shared append certifies its preparation immediately. An
+         * exclusive NoSync append leaves it for the next barrier. */
         uint64_t synced = scope_syncs(p, &e) - before;
-        if (synced != 1U)
+        if (synced != (uint64_t)shared)
           fprintf(stderr, "first append shared=%d barriers=%llu\n", shared,
                   (unsigned long long)synced);
-        REQUIRE(append.handle && synced == 1U);
+        REQUIRE(append.handle && synced == (uint64_t)shared);
         ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &present,
                                  &e),
            &e);
-        REQUIRE(present);
+        REQUIRE(present == shared);
         p->storage.ops->append_close(p->storage.context, &append);
+        if (fail) {
+          REQUIRE(ps_flush(ps_root_space(ps_pouch_state_root(p)), &e) ==
+                      LC_ERR_TRANSPORT &&
+                  !model.fail_sync);
+          clear(&e);
+        }
       }
       p->storage.ops->namespace_close(p->storage.context, ns);
       lc_pouch_close(p);
@@ -603,6 +609,7 @@ static void append_hint(const char *path) {
       lc_pouch_state_read_result_cleanup(&allocator, &absent);
       ok(put(p, "hint", "key", &in, NULL, &result, &e), &e);
       lc_pouch_state_write_result_cleanup(&allocator, &result);
+      ok(lc_pouch_state_sync_namespace(p, "hint", &e), &e);
       ok(p->storage.ops->namespace_open(p->storage.context, "hint", 0, &ns, &e),
          &e);
       ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &present,
@@ -1124,6 +1131,72 @@ static void durable_scope_crash(const char *path) {
     lc_pouch_close(p);
     REQUIRE(live == 0 && unlink(image_path) == 0 && unlink(path) == 0);
   }
+  lc_error_cleanup(&e);
+}
+
+static void cold_append_crash(const char *path) {
+  char image_path[1400];
+  lc_error e = {0};
+  REQUIRE(snprintf(image_path, sizeof(image_path), "%s-image", path) <
+          (int)sizeof(image_path));
+  for (int codec = 0; codec <= 3; codec += 3)
+    for (int phase = 0; phase < 3; ++phase) {
+      scope_image image = {0};
+      ps_io io = {&image,           io_read,    io_write,
+                  scope_image_sync, io_reserve, NULL};
+      ps_pouch_state_options o = options(codec, 0);
+      lc_pouch *p = NULL;
+      lc_pouch_state_read_result r = {0};
+      int status;
+      image.scratch = lc_alloc_with_allocator(&allocator, PS_PAGE);
+      image.fd = open(image_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+      REQUIRE(image.scratch && image.fd >= 0);
+      o.initial_capacity = o.maximum_capacity = PS_MIB;
+      o.io = &io;
+      pid_t child = fork();
+      REQUIRE(child >= 0);
+      if (!child) {
+        ps_namespace *ns = NULL;
+        ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+        ok(ps_root_namespace_acquire(ps_pouch_state_root(p), "metadata", 1, &ns,
+                                     &e),
+           &e);
+        ps_namespace_release(ns);
+        metadata_hint_expect(p, 0, &e);
+        uint64_t syncs = scope_syncs(p, &e);
+        scope_put(p, "metadata", 7, &e);
+        read_value(p, "metadata", "key", 17, 7, 1, &e);
+        metadata_hint_expect(p, 1, &e);
+        REQUIRE(scope_syncs(p, &e) == syncs);
+        if (phase) {
+          image.fail_sync = phase == 2;
+          int rc = lc_pouch_state_sync_namespace(p, "metadata", &e);
+          if (image.fail_sync)
+            REQUIRE(rc == LC_ERR_TRANSPORT);
+          else
+            ok(rc, &e);
+        }
+        _exit(0);
+      }
+      REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0);
+      REQUIRE(close(image.fd) == 0);
+      lc_free_with_allocator(&allocator, image.scratch);
+      o.io = NULL;
+      ok(ps_pouch_state_open(image_path, 0, &allocator, &o, &p, &e), &e);
+      metadata_hint_expect(p, phase == 1, &e);
+      if (phase == 1)
+        read_value(p, "metadata", "key", 17, 7, 1, &e);
+      else {
+        ok(lc_pouch_state_read_metadata(p, "metadata", "key", &r, &e), &e);
+        REQUIRE(!r.found);
+        lc_pouch_state_read_result_cleanup(&allocator, &r);
+        scope_put(p, "metadata", 9, &e);
+        read_value(p, "metadata", "key", 17, 9, 1, &e);
+      }
+      lc_pouch_close(p);
+      REQUIRE(!live && !unlink(image_path) && !unlink(path));
+    }
   lc_error_cleanup(&e);
 }
 
@@ -7558,6 +7631,8 @@ int main(int argc, char **argv) {
     queue_enqueue_crash(r.path);
   else if (!strcmp(r.mode, "durable-scope-crash"))
     durable_scope_crash(r.path);
+  else if (!strcmp(r.mode, "cold-append-crash"))
+    cold_append_crash(r.path);
   else if (!strcmp(r.mode, "staging-crash"))
     staging_crash(r.path);
   else if (!strcmp(r.mode, "staging-crash-matrix")) {

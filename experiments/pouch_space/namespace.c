@@ -1017,7 +1017,7 @@ int ps_ns_finish_seal(struct ps_namespace_data *d, lc_error *e) {
   return rc;
 }
 static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
-                   lc_error *e) {
+                   int foreground, lc_error *e) {
   segment *s;
   ps_catalog_view *view = NULL;
   ps_owned_head *staged = NULL;
@@ -1068,10 +1068,17 @@ static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
     if (rc == LC_OK)
       target = info.ref;
   }
-  if (rc == LC_OK && !view)
-    rc = ps_catalog_put(d->ns->root->space, budget, d->ns->identity.owner,
-                        PS_CATALOG_SEGMENT, s->leaf, strlen(s->leaf), NULL,
-                        s->binding.stream, &target, &s->binding, e);
+  if (rc == LC_OK && !view) {
+    ps_space *space = d->ns->root->space;
+    if (foreground)
+      rc = ps_catalog_stage_segment(space, budget, d->ns->identity.owner,
+                                    s->leaf, strlen(s->leaf), s->binding.stream,
+                                    &target, &s->binding, e);
+    else
+      rc = ps_catalog_put(space, budget, d->ns->identity.owner,
+                          PS_CATALOG_SEGMENT, s->leaf, strlen(s->leaf), NULL,
+                          s->binding.stream, &target, &s->binding, e);
+  }
   if (staged) {
     ps_owned_close(staged);
     if (rc == LC_OK)
@@ -1224,7 +1231,7 @@ int ps_ns_select_successor(struct ps_namespace_data *d, ps_budget *budget,
   }
   next = d->active + 1;
   if (rc == LC_OK)
-    rc = prepare(d, budget, next, e);
+    rc = prepare(d, budget, next, 0, e);
   if (rc == LC_OK)
     rc = head_write(d, budget, next, e);
   if (rc == LC_OK)
@@ -1422,7 +1429,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     rc =
         ps_checkpoint_delta_fund(append->delta, append->budget, &checkpoint, e);
   if (rc == LC_OK && selected != d->active)
-    rc = prepare(d, append->budget, selected, e);
+    rc = prepare(d, append->budget, selected, !maintenance, e);
   if (rc == LC_OK) {
     s = ps_ns_find(d, PS_CATALOG_SEGMENT, selected);
     rc = begin_reserve(s->stream, append->budget, span, exact, &append->writer,

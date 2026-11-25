@@ -347,17 +347,19 @@ int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
+enum catalog_publication { CATALOG_BOUND, CATALOG_IDENTITY, CATALOG_STAGED };
 static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
                        unsigned int kind, const void *name, size_t length,
                        const ps_ref *expected, ps_key stream,
                        const ps_ref *target, const void *value,
-                       size_t value_length, ps_catalog_info *out, int identity,
-                       lc_error *e) {
+                       size_t value_length, ps_catalog_info *out,
+                       enum catalog_publication publication, lc_error *e) {
   ps_entry *p, *old, *head;
   ps_coordination_guard *guard, *claim = NULL, *preparation = NULL;
   ps_catalog_info info;
   uint64_t sequence = 0, growth = 0, added = 0, prior, next;
   int marker = kind == PS_CATALOG_MARKER;
+  int identity = publication == CATALOG_IDENTITY;
   int rc, installed = 0, staged = 0;
   if (out)
     memset(out, 0, sizeof(*out));
@@ -442,7 +444,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
   }
   if (!installed)
     ps_internal_entry_free(p);
-  if (rc == LC_OK && !staged)
+  if (rc == LC_OK && !staged && publication != CATALOG_STAGED)
     rc = ps_internal_durable(s, sequence, e);
   if (preparation || claim) {
     ps_coordination_unlock(preparation);
@@ -459,7 +461,16 @@ int ps_catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
                    const ps_ref *expected, ps_key stream, const ps_ref *target,
                    ps_catalog_info *out, lc_error *e) {
   return catalog_put(s, budget, owner, kind, name, length, expected, stream,
-                     target, NULL, 0, out, 0, e);
+                     target, NULL, 0, out, CATALOG_BOUND, e);
+}
+int ps_catalog_stage_segment(ps_space *s, ps_budget *budget, uint64_t owner,
+                             const void *name, size_t length, ps_key stream,
+                             const ps_ref *target, ps_catalog_info *out,
+                             lc_error *e) {
+  return catalog_put(
+      s, budget, owner, PS_CATALOG_SEGMENT, name, length, NULL, stream, target,
+      NULL, 0, out,
+      ps_internal_exclusive_nosync(s) ? CATALOG_STAGED : CATALOG_BOUND, e);
 }
 int ps_catalog_put_marker(ps_space *s, ps_budget *budget, uint64_t owner,
                           const void *name, size_t length,
@@ -468,13 +479,14 @@ int ps_catalog_put_marker(ps_space *s, ps_budget *budget, uint64_t owner,
                           lc_error *e) {
   ps_key stream = {0};
   return catalog_put(s, budget, owner, PS_CATALOG_MARKER, name, length,
-                     expected, stream, NULL, value, value_length, out, 0, e);
+                     expected, stream, NULL, value, value_length, out,
+                     CATALOG_BOUND, e);
 }
 int ps_catalog_create_namespace(ps_space *s, const void *name, size_t length,
                                 ps_catalog_info *out, lc_error *e) {
   ps_key stream = {0};
   return catalog_put(s, NULL, 0, PS_CATALOG_NAMESPACE, name, length, NULL,
-                     stream, NULL, NULL, 0, out, 1, e);
+                     stream, NULL, NULL, 0, out, CATALOG_IDENTITY, e);
 }
 int ps_catalog_remove_many(ps_space *s, uint64_t owner,
                            const ps_catalog_removal *items, size_t count,

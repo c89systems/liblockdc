@@ -341,6 +341,7 @@ int ps_internal_checkpoint_span(ps_reader *, const unsigned char **,
 /* Drop an unreturned capture before allowing another local adoption. */
 void ps_internal_values_discard_locked(ps_values *);
 int ps_internal_healthy(ps_space *, lc_error *);
+int ps_internal_exclusive_nosync(ps_space *);
 /* Capture selection and its first physical witness under the same canonical
  * authority. Captured handles subsequently retain their incarnation directly.
  */

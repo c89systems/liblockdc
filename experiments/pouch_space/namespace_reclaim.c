@@ -1,6 +1,7 @@
 #include "lc_api_internal.h"
 #include "lc_intcompat.h"
 #include "namespace_internal.h"
+#include "space_internal.h"
 #include <string.h>
 static int failure(lc_error *, const char *);
 static int plan_output(ps_budget_plan *plan, size_t name_bytes, uint64_t bytes,
@@ -411,6 +412,7 @@ int ps_namespace_reap(ps_namespace *ns, uint64_t *closed, uint64_t *pending,
               ? NULL
               : ps_ns_find(d, PS_CATALOG_SEGMENT, d->active + 1);
       if (unused && unused->unselected) {
+        ps_space *space = ns->root->space;
         ps_stream_info info;
         rc = ps_stream_status(unused->stream, &info, e);
         if (rc == LC_OK && (info.tail || info.sealed ||
@@ -419,6 +421,15 @@ int ps_namespace_reap(ps_namespace *ns, uint64_t *closed, uint64_t *pending,
           rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
                             "unselected namespace source has canonical state",
                             NULL, NULL, "pouch");
+        /* A failed NoSync producer may have framed the binding without a
+         * barrier. Certify it before the ordinary removal and retirement. */
+        if (rc == LC_OK && ps_internal_exclusive_nosync(space)) {
+          ps_catalog_view *binding = NULL;
+          rc = ps_catalog_get_segment_for_edit(
+              space, ns->identity.owner, unused->leaf, strlen(unused->leaf),
+              &binding, e);
+          ps_catalog_view_close(binding);
+        }
         if (rc == LC_OK) {
           pthread_mutex_lock(&d->mutex);
           rc = drop(d, unused, e);
