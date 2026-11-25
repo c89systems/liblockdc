@@ -289,6 +289,13 @@ if(LOCKDC_DEVELOPMENT_RUNTIME_LOADER)
   list(JOIN LOCKDC_DEVELOPMENT_RUNTIME_DIRS ":" allocator_public_library_path)
   list(APPEND allocator_public_probe_command "${LOCKDC_DEVELOPMENT_RUNTIME_LOADER}"
     --library-path "${allocator_public_library_path}")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET lc_shared)
+  # The production DSO's RUNPATH is relative to its own directory. Supply
+  # the separate build-tree dependency prefixes only to this test process.
+  get_target_property(allocator_public_runtime_dirs lc_allocator_public_exit_probe BUILD_RPATH)
+  list(JOIN allocator_public_runtime_dirs ":" allocator_public_library_path)
+  list(APPEND allocator_public_probe_command "${CMAKE_COMMAND}" -E env
+    "LD_LIBRARY_PATH=${allocator_public_library_path}")
 endif()
 list(APPEND allocator_public_probe_command $<TARGET_FILE:lc_allocator_public_exit_probe>)
 add_test(NAME lc_allocator_exit_probe COMMAND "${CMAKE_COMMAND}"

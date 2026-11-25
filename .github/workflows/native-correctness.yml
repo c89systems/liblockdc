@@ -137,6 +137,7 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
         run: |
+          if [ "$RUNNER_OS" = macOS ]; then export LOCKDC_TEST_COLLECTION_CALLBACK_TRACE=1; fi
           labels='^(e2e|release-artifact)$'
           excluded='package_archives_test|package_source_dist_dir_test|runtime_license_install_tree_test|lua_core_package_test|lua_postgres_package_test'
           if [ "$ARCH" != x86_64 ]; then

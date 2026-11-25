@@ -1109,9 +1109,18 @@ typedef struct callback_reader {
   pthread_barrier_t *barrier;
   size_t bytes;
   unsigned int entries;
+  unsigned int id;
+  int trace;
   int failed;
   int rc;
 } callback_reader;
+
+static void trace_callback_reader(const callback_reader *reader,
+                                  const char *phase) {
+  if (reader->trace)
+    fprintf(stderr, "collection reader %u entry %u: %s\n", reader->id,
+            reader->entries, phase);
+}
 
 static int callback_reader_sink(lc_sink *sink, const void *bytes, size_t size,
                                 lc_error *error) {
@@ -1136,15 +1145,18 @@ static int callback_reader_metadata(void *context,
     reader->failed = 1;
   /* Both callers are inside a callback on the same receiver. The third
    * participant closes its public reference during the final callback. */
+  trace_callback_reader(reader, "entered");
   pthread_barrier_wait(reader->barrier);
   lc_error_init(&nested);
   if (lc_collection_describe(reader->owner, &info, &nested) != LC_ERR_INVALID)
     reader->failed = 1;
   lc_error_cleanup(&nested);
   lc_error_init(&nested);
+  trace_callback_reader(reader, "describing peer");
   if (lc_collection_describe(reader->peer, &info, &nested) != LC_OK)
     reader->failed = 1;
   lc_error_cleanup(&nested);
+  trace_callback_reader(reader, "described peer");
   pthread_barrier_wait(reader->barrier);
   return LC_OK;
 }
@@ -1163,7 +1175,13 @@ static void *read_with_concurrent_callbacks(void *context) {
   sink.impl = reader;
   opts.on_metadata = callback_reader_metadata;
   opts.metadata_context = reader;
+  trace_callback_reader(reader, "starting read");
   reader->rc = lc_collection_read(reader->owner, &opts, &sink, &result, &error);
+  if (reader->rc != LC_OK || !result.complete)
+    fprintf(stderr, "collection reader %u failed after entry %u: %d (%s)\n",
+            reader->id, reader->entries, reader->rc,
+            error.message ? error.message : "");
+  trace_callback_reader(reader, "read ended");
   if (!result.complete || result.completed_records != 3)
     reader->failed = 1;
   lc_collection_read_res_cleanup(&result);
@@ -1185,6 +1203,8 @@ static void test_concurrent_callback_reentry_and_owner_close(void **state) {
     readers[i].owner = f->a;
     readers[i].peer = f->b;
     readers[i].barrier = &barrier;
+    readers[i].id = i;
+    readers[i].trace = getenv("LOCKDC_TEST_COLLECTION_CALLBACK_TRACE") != NULL;
     assert_int_equal(pthread_create(&threads[i], NULL,
                                     read_with_concurrent_callbacks,
                                     &readers[i]),
@@ -1193,8 +1213,10 @@ static void test_concurrent_callback_reentry_and_owner_close(void **state) {
   for (entry = 0; entry < 3; ++entry) {
     pthread_barrier_wait(&barrier);
     if (entry == 2) {
+      trace_callback_reader(&readers[0], "closing owner");
       lc_collection_close(f->a);
       f->a = NULL;
+      trace_callback_reader(&readers[0], "owner closed");
     }
     pthread_barrier_wait(&barrier);
   }
@@ -1966,6 +1988,7 @@ typedef struct catalog_contention {
   pthread_mutex_t mutex;
   pthread_cond_t condition;
   int signalled;
+  int probed;
   int started;
   int sent;
   int result;
@@ -1979,6 +2002,15 @@ static void catalog_before_root(void *context, lc_pouch *pouch) {
   pthread_mutex_lock(&work->mutex);
   work->signalled = 1;
   pthread_cond_signal(&work->condition);
+  while (!work->probed)
+    pthread_cond_wait(&work->condition, &work->mutex);
+  pthread_mutex_unlock(&work->mutex);
+}
+
+static void catalog_finish_probe(catalog_contention *work) {
+  pthread_mutex_lock(&work->mutex);
+  work->probed = 1;
+  pthread_cond_broadcast(&work->condition);
   pthread_mutex_unlock(&work->mutex);
 }
 
@@ -2029,8 +2061,8 @@ static size_t catalog_source_read(lc_source *self, void *bytes, size_t capacity,
                  NULL);
     return 0U;
   }
-  /* If catalog were acquired before root, the contender would hold it while
-   * waiting for this callback's root mutation guard. Probe without blocking. */
+  /* The contender has reached the root hook and is paused there. A lock
+   * already held at this point would prove catalog precedes root. */
   path = lc_pouch_path_join(&handle->allocator, handle->catalog_base,
                             ".catalog.lock");
   if (path == NULL) {
@@ -2049,6 +2081,7 @@ static size_t catalog_source_read(lc_source *self, void *bytes, size_t capacity,
   if (rc == 0)
     (void)flock(fd, LOCK_UN);
   close(fd);
+  catalog_finish_probe(work);
   if (rc != 0) {
     lc_error_set(error, LC_ERR_TIMEOUT, 0,
                  "inverted collection catalog/root lock order", NULL, NULL,
@@ -2085,8 +2118,10 @@ test_source_callback_catalog_contention_preserves_lock_order(void **state) {
   lc_collection_root_test_hook = catalog_before_root;
   lc_collection_root_test_context = &work;
   int rc = lc_collection_append(f->a, &request, &work.pub, &out, &f->error);
-  if (work.started)
+  if (work.started) {
+    catalog_finish_probe(&work);
     assert_int_equal(pthread_join(work.contender, NULL), 0);
+  }
   lc_collection_root_test_hook = NULL;
   lc_collection_root_test_context = NULL;
   assert_int_equal(pthread_cond_destroy(&work.condition), 0);
