@@ -148,7 +148,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     endforeach()
     foreach(mode
         commit crash-boundaries reopen reopen-ordering reopen-sanitize reopen-portable
-        checkpoint-idempotence checkpoint-initialization checkpoint-retire-select
+        checkpoint-idempotence checkpoint-initialization
         root-covered-admission root-obligations
         standing-capacity standing-deletion native-metadata-shared-reserve
         budget-capacity value-budget-capacity value-budget-concurrency value-budget-process
@@ -156,6 +156,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         namespace-repack namespace-repack-concurrency namespace-repack-shared-refresh
         namespace-repack-churn)
       pouch_space_darwin_case(pouch_space_${mode} pouch_space_test 240 ${mode})
+    endforeach()
+    foreach(mode checkpoint-retire-select checkpoint-retire-shared checkpoint-retire-live)
+      foreach(sync RANGE 0 1)
+        foreach(reader_shared RANGE 0 1)
+          pouch_space_darwin_case(pouch_space_${mode}_${sync}_${reader_shared}
+            pouch_space_test 60 ${mode} ${sync} ${reader_shared})
+        endforeach()
+      endforeach()
     endforeach()
     foreach(mode shared-authority shared-queue-delivery shared-queue-transaction
         shared-outbox-handoff shared-outbox-recovery shared-outbox-completion
@@ -1134,11 +1142,21 @@ if(LOCKDC_BUILD_TESTS)
     LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
-  foreach(mode checkpoint-idempotence checkpoint-initialization checkpoint-retire-select)
+  foreach(mode checkpoint-idempotence checkpoint-initialization)
     add_test(NAME pouch_space_${mode}
       COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 60
       LABELS "unit;local;pouch-space")
+  endforeach()
+  foreach(mode checkpoint-retire-select checkpoint-retire-shared checkpoint-retire-live)
+    foreach(sync RANGE 0 1)
+      foreach(reader_shared RANGE 0 1)
+        add_test(NAME pouch_space_${mode}_${sync}_${reader_shared}
+          COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${sync} ${reader_shared})
+        set_tests_properties(pouch_space_${mode}_${sync}_${reader_shared}
+          PROPERTIES TIMEOUT 60 LABELS "unit;local;pouch-space")
+      endforeach()
+    endforeach()
   endforeach()
   foreach(mode native-metadata native-metadata-faults native-metadata-concurrency native-metadata-shared-reserve)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})

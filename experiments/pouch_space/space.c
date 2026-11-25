@@ -3921,8 +3921,7 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
   ps_directory_pages changes;
   size_t i, zero_count = 0;
   int next = 1 - s->root, rc, removed, dense = 0;
-  int select_on_retire = cleanup && s->generation && !s->journal_image &&
-                         !ps_coordination_shared(s->coordination);
+  int select_on_retire = cleanup && s->generation;
   if (s->generation == LC_U64_MAX)
     return err(error, LC_ERR_INVALID,
                "container checkpoint generation exhausted");
@@ -3999,7 +3998,7 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
   /* With retirement-based selection, the predecessor and its full journal
    * stay intact through the barrier that persists the successor's pages and
    * selector. Once that barrier succeeds, the predecessor can be retired. */
-  if (rc == LC_OK && covered)
+  if (rc == LC_OK && (covered || select_on_retire))
     ps_readiness_begin(s, PS_READINESS_CHECKPOINT_RETIRE);
   if (rc == LC_OK)
     rc = transfer(s, zero, sizeof(zero), (uint64_t)s->root * PS_PAGE, 1, error);
@@ -4016,7 +4015,8 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
    * journal's first frame. Clearing them prepares live journal reuse. Cold
    * open also sanitizes this suffix if the clear was lost. */
   if (rc == LC_OK && s->journal && select_on_retire)
-    rc = clear_checkpoint_journal(s, s->journal_start, NULL, s->journal, error);
+    rc = clear_checkpoint_journal(s, s->journal_start, s->journal_image,
+                                  s->journal, error);
   if (rc != LC_OK) {
     if (rc == LC_ERR_PROTOCOL)
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
@@ -4590,6 +4590,10 @@ static int random_identity(unsigned char *bytes, lc_error *error) {
                  : err(error, LC_ERR_TRANSPORT,
                        "cannot obtain container identity entropy");
 }
+static int root_selects_on_retire(const unsigned char *p) {
+  return (ps_wire_get32(p + ROOT_LAYOUT_OFFSET) & ROOT_LAYOUT_RETIRE_SELECT) !=
+         0;
+}
 static int root_valid(const unsigned char *p) {
   uint64_t capacity = ps_wire_get64(p + 16);
   uint64_t offset = ps_wire_get64(p + 32), generation = ps_wire_get64(p + 40);
@@ -4607,8 +4611,7 @@ static int root_valid(const unsigned char *p) {
          ps_wire_get64(p + 48) && ps_wire_get64(p + 48) <= PS_MAX_INCARNATION &&
          ps_wire_get64(p + 48) % TOKEN_RANGE == 0 &&
          (layout == PS_ROOT_LAYOUT ||
-          (layout == (PS_ROOT_LAYOUT | ROOT_LAYOUT_RETIRE_SELECT) &&
-           !covered)) &&
+          layout == (PS_ROOT_LAYOUT | ROOT_LAYOUT_RETIRE_SELECT)) &&
          journal_start <= LC_U64_MAX - PS_JOURNAL && covered <= PS_JOURNAL &&
          covered <= journal_start &&
          checksum(p, ROOT_CHECKSUM) == ps_wire_get32(p + ROOT_CHECKSUM);
@@ -4629,6 +4632,15 @@ static int checkpoint_retirement(const ps_readiness_certificate *certificate,
     return err(error, LC_ERR_PROTOCOL,
                "checkpoint retirement disagrees with the selected root");
   return LC_OK;
+}
+static int
+checkpoint_select_prior(const unsigned char *successor,
+                        const ps_readiness_certificate *certificate) {
+  /* With both selectors present, only a live certificate can prove that
+   * the successor's pages have crossed the first barrier. */
+  return root_selects_on_retire(successor) &&
+         certificate->root < ps_wire_get64(successor + 8) &&
+         !(certificate->pending & PS_READINESS_CHECKPOINT_RETIRE);
 }
 static int canonical_certificate(ps_space *s, ps_readiness_certificate *out,
                                  lc_error *error) {
@@ -6435,7 +6447,7 @@ static int recover(ps_space *s, ps_coordination_guard **guard,
   size_t cursor = 0, bytes, first, last, journal_bound = PS_JOURNAL, marker;
   int a, b, event, rc, retire_sibling, retirement_needed, known_grant;
   int needs_prefix_sync = 0, grant_slot, moved = 0, certified, cold_covered;
-  int live_prefix = 0;
+  int live_prefix = 0, discard_successor;
   enum exclusive_proof exclusive = EXCLUSIVE_UNPROVED;
   roots[0] = superblocks;
   roots[1] = superblocks + PS_PAGE;
@@ -6456,15 +6468,6 @@ restart:
     rc = err(error, LC_ERR_PROTOCOL, "conflicting container roots");
     goto done;
   }
-  /* An exclusive cleanup may have written the selector before its pages
-   * persisted. The predecessor and its journal remain authoritative while
-   * its selector survives. No writer may reuse either image before retiring
-   * that selector behind a second barrier. */
-  if (a && b &&
-      (ps_wire_get32(root + ROOT_LAYOUT_OFFSET) & ROOT_LAYOUT_RETIRE_SELECT)) {
-    s->root = 1 - s->root;
-    root = roots[s->root];
-  }
   projection_select(s, root, s->root);
   rc = decode_token_limit(s, roots[0] + PS_TOKEN_RECORD_OFFSET,
                           roots[1] + PS_TOKEN_RECORD_OFFSET, &grant_limit,
@@ -6475,6 +6478,12 @@ restart:
     rc = ps_readiness_attach(s, error);
   if (rc == LC_OK)
     rc = ps_readiness_read(s, &certificate, error);
+  discard_successor =
+      rc == LC_OK && a && b && checkpoint_select_prior(root, &certificate);
+  if (discard_successor) {
+    root = roots[1 - s->root];
+    projection_select(s, root, 1 - s->root);
+  }
   if (rc == LC_OK)
     rc = checkpoint_retirement(&certificate, s->generation, s->sequence, error);
   if (rc != LC_OK)
@@ -6648,10 +6657,22 @@ restart:
     if (rc != LC_OK)
       goto done;
   }
-  /* A process can die with the new selector readable but unsynced. Fence
-   * it before erasing bytes needed by a still-valid predecessor. */
-  if (a && b && certificate.root < s->generation &&
-      !(certificate.pending & PS_READINESS_CHECKPOINT_RETIRE)) {
+  /* An apparently erased predecessor can still be visible after power
+   * loss. Make its retirement durable before clearing its journal. */
+  if (first < last && !discard_successor && root_selects_on_retire(root) &&
+      certificate.root < s->generation) {
+    ps_readiness_begin(s, PS_READINESS_RECOVERY | PS_READINESS_ROOT);
+    if (retire_sibling)
+      rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - s->root) * PS_PAGE, 1,
+                    error);
+    if (rc == LC_OK)
+      rc = sync_file(s, error);
+    if (rc != LC_OK)
+      goto done;
+    retire_sibling = 0;
+  } else if (a && b && !discard_successor && certificate.root < s->generation &&
+             !(certificate.pending & PS_READINESS_CHECKPOINT_RETIRE)) {
+    /* A conventional successor can be readable before its selector sync. */
     rc = sync_file(s, error);
     if (rc != LC_OK)
       goto done;
@@ -7237,7 +7258,7 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
   ps_space *v = NULL;
   struct stat st;
   int a, b, selected, rc;
-  int retiring_journal, retired_certificate;
+  int retiring_journal, retired_certificate, discard_successor;
   ps_readiness_certificate certificate;
   rc = canonical_certificate(s, &certificate, error);
   if (rc != LC_OK)
@@ -7264,6 +7285,11 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
     return err(error, LC_ERR_PROTOCOL,
                "conflicting checkpoint projection roots");
   }
+  discard_successor = a && b && checkpoint_select_prior(root, &certificate);
+  if (discard_successor) {
+    selected = 1 - selected;
+    root = roots + selected * PS_ROOT_BYTES;
+  }
   if (ps_wire_get64(root + 8) != certificate.root)
     ps_readiness_begin(s, PS_READINESS_ROOT);
   rc = checkpoint_retirement(&certificate, ps_wire_get64(root + 8),
@@ -7278,8 +7304,21 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
       retired_certificate || (ps_wire_get64(root + 8) > certificate.root &&
                               ps_wire_get64(root + 24) == certificate.ready &&
                               ps_wire_get32(root + ROOT_JOURNAL_COVERED));
-  if (ps_wire_get64(root + 8) == s->generation)
-    return canonical_journal(s, &certificate, 1, 1, error);
+  if (ps_wire_get64(root + 8) == s->generation) {
+    rc = canonical_journal(s, &certificate, 1, 1, error);
+    if (rc == LC_OK && certificate.root == s->generation &&
+        (discard_successor || (certificate.pending & PS_READINESS_ROOT))) {
+      if (memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero))) {
+        rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - selected) * PS_PAGE,
+                      1, error);
+        if (rc == LC_OK)
+          rc = sync_file(s, error);
+      }
+      if (rc == LC_OK)
+        ps_readiness_finish(s, PS_READINESS_ROOT);
+    }
+    return rc;
+  }
   if (ps_wire_get64(root + 8) < s->generation ||
       ps_wire_get64(root + 24) < s->sequence ||
       ps_wire_get64(root + 16) < s->capacity)
@@ -7346,8 +7385,8 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
   if (rc == LC_OK)
     rc = metadata_bound(v->metadata, v->live_entries, &v->metadata_workspace,
                         error);
-  if (rc == LC_OK && a && b && certificate.root < v->generation &&
-      !retired_certificate) {
+  if (rc == LC_OK && a && b && !discard_successor &&
+      certificate.root < v->generation && !retired_certificate) {
     rc = sync_file(s, error);
     if (rc == LC_OK && retiring_journal)
       ps_readiness_begin(s, PS_READINESS_CHECKPOINT_RETIRE);
@@ -7364,17 +7403,21 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
     rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - selected) * PS_PAGE, 1,
                   error);
   }
-  if (rc == LC_OK && retiring_journal) {
-    size_t covered = ps_wire_get32(root + ROOT_JOURNAL_COVERED);
-    rc = clear_checkpoint_journal(s, v->journal_start - covered,
-                                  v->journal_image, covered, error);
-    memset(v->journal_image, 0, 64);
-  }
   if (rc == LC_OK &&
       (!s->readiness || certificate.root < v->generation ||
        memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))) {
+    int fence_journal = retiring_journal && root_selects_on_retire(root);
     uint64_t prepared = ps_readiness_issued_tickets(s);
-    rc = sync_file(s, error);
+    if (fence_journal)
+      rc = sync_file(s, error);
+    if (rc == LC_OK && retiring_journal) {
+      size_t covered = ps_wire_get32(root + ROOT_JOURNAL_COVERED);
+      rc = clear_checkpoint_journal(s, v->journal_start - covered,
+                                    v->journal_image, covered, error);
+      memset(v->journal_image, 0, 64);
+    }
+    if (rc == LC_OK && !fence_journal)
+      rc = sync_file(s, error);
     if (rc == LC_OK) {
       ps_readiness_finish(s, PS_READINESS_CHECKPOINT_RETIRE);
       rc = ps_readiness_stabilize(s, v->sequence, v->generation, v->journal,

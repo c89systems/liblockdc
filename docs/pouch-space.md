@@ -82,11 +82,12 @@ Creation persists the empty selector and initial incarnation grant together.
 Recovery requires both before it can open the container. The parent directory
 is synced before initialization releases ownership.
 
-Exclusive cleanup syncs the replacement checkpoint pages and selector
-together. While the preceding selector is valid, recovery uses it and its
-intact journal. A second sync retires that selector before its pages can be
-reused. The live owner clears the old journal before reuse. Recovery discards
-those older frames if their clear was lost.
+Cleanup syncs the replacement checkpoint pages and selector together. When
+both selectors are valid, cold recovery uses the preceding selector and its
+intact journal. A live owner can finish an interrupted retirement after the
+shared readiness record confirms the first sync. A second sync makes the
+predecessor's retirement durable before the owner clears its covered journal
+and reuses its pages. Recovery discards older frames if their clear was lost.
 During ordinary exclusive maintenance, an append-only prefix can stay in
 the journal and canonical streams when there is no physical retirement,
 metadata trimming, or allocation pressure. Maintenance still syncs that

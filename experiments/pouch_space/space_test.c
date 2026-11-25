@@ -1279,7 +1279,7 @@ static void reopen_sanitization(void) {
   size_t offset = !memcmp(m.stable, "PSROOT1", 7) ? 0 : PS_PAGE;
   memcpy(root, m.stable + offset, sizeof(root));
   fixture_put(root + ROOT_LAYOUT_OFFSET,
-              PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_INLINE_CHECKPOINT, 4);
+              PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_SHARED_RETIRE, 4);
   fixture_put(root + ROOT_CHECKSUM, crc32(0, root, ROOT_CHECKSUM), 4);
   fd = open(path, O_RDWR);
   CHECK(fd >= 0 &&
@@ -8031,12 +8031,6 @@ static int run_portable_case(const char *mode) {
     checkpoint_initialization(1);
     return 1;
   }
-  if (!strcmp(mode, "checkpoint-retire-select")) {
-    for (int durable = 0; durable < 2; ++durable)
-      for (int shared = 0; shared < 2; ++shared)
-        checkpoint_retire_select(durable, shared);
-    return 1;
-  }
   if (!strcmp(mode, "namespace-repack")) {
     for (int durable = 0; durable < 2; ++durable)
       namespace_repack(durable);
@@ -8164,24 +8158,28 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 5) {
-#ifdef __linux__
     if (strlen(argv[3]) != 1 || argv[3][0] < '0' || argv[3][0] > '1' ||
         strlen(argv[4]) != 1 || argv[4][0] < '0' || argv[4][0] > '1')
       return 2;
     int durable = argv[3][0] - '0', profile = argv[4][0] - '0';
-    if (!strcmp(argv[2], "checkpoint-faults"))
+    if (!strcmp(argv[2], "checkpoint-retire-select") ||
+        !strcmp(argv[2], "checkpoint-retire-shared"))
+      checkpoint_retire_select(
+          durable, !strcmp(argv[2], "checkpoint-retire-shared"), profile);
+    else if (!strcmp(argv[2], "checkpoint-retire-live"))
+      checkpoint_retire_live(durable, profile);
+#ifdef __linux__
+    else if (!strcmp(argv[2], "checkpoint-faults"))
       checkpoint_faults(durable, profile);
     else if (!strcmp(argv[2], "grant-budget-faults"))
       canonical_stream_preparation_faults(profile, 1, durable);
+#endif
     else
       return 2;
     lc_error_cleanup(&error);
     printf("pouch-space %s %d %d: %zu observable checks passed\n", argv[2],
            durable, profile, checks);
     return 0;
-#else
-    return 2;
-#endif
   }
   if (argc == 3) {
     if (run_portable_case(argv[2])) {

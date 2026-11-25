@@ -233,7 +233,8 @@ static void checkpoint_initialization(int shared) {
   }
   clean();
 }
-static void checkpoint_retire_select(int durable, int shared) {
+static void checkpoint_retire_select(int durable, int writer_shared,
+                                     int reader_shared) {
   enum { COMPLETE, SELECTOR_ONLY, KEEP_PRIOR, TORN_PRIOR, LOST_SELECTED };
   for (int cut = COMPLETE; cut <= LOST_SELECTED; ++cut) {
     model m;
@@ -241,7 +242,12 @@ static void checkpoint_retire_select(int durable, int shared) {
     ps_options options = {0};
     ps_stats before, after;
     clean();
-    ps_space *s = create(PS_MIB, durable, &io);
+    options.initial_capacity = PS_MIB;
+    options.io = &io;
+    options.durable_sync = durable;
+    options.shared = writer_shared;
+    ps_space *s = NULL;
+    OK(ps_open(path, 1, &options, &s, &error));
     put(s, state(1), "prior", 5, 1);
     put(s, state(2), "deleted", 7, 1);
     /* Also exercise interrupted exchanges between two retirement-selected
@@ -252,11 +258,24 @@ static void checkpoint_retire_select(int durable, int shared) {
       OK(ps_checkpoint(s, &error));
     size_t prior = fixture_get64(m.stable) == ROOT_MAGIC ? 0 : PS_PAGE;
     size_t next = PS_PAGE - prior;
+    if (writer_shared) {
+      /* Exercise a covered prefix split across both ends of the ring. */
+      OK(ps_close(s, &error));
+      fixture_put(m.stable + prior + ROOT_JOURNAL_START, PS_JOURNAL - 64, 8);
+      fixture_put(m.stable + prior + ROOT_CHECKSUM,
+                  crc32(0, m.stable + prior, ROOT_CHECKSUM), 4);
+      crash(&m);
+      OK(ps_open(path, 0, &options, &s, &error));
+    }
+    size_t journal_prior =
+        JOURNAL_OFFSET +
+        fixture_get64(m.stable + prior + ROOT_JOURNAL_START) % PS_JOURNAL;
     put(s, state(1), "current", 7, 1);
     OK(ps_delete(s, state(2), &error));
     OK(ps_flush(s, &error));
     OK(ps_status(s, &before, &error));
     CHECK(before.journal_bytes > 0);
+    CHECK(!writer_shared || before.journal_bytes > 64);
     size_t syncs = m.syncs;
     if (cut == SELECTOR_ONLY)
       m.fail_sync_at = syncs + 1;
@@ -271,7 +290,7 @@ static void checkpoint_retire_select(int durable, int shared) {
       OK(ps_checkpoint_cleanup(s, PS_CLEANUP_FLUSH, &error));
       CHECK(m.syncs == syncs + 2);
       CHECK(fixture_get64(m.stable + prior) == 0);
-      CHECK(fixture_get64(m.stable + JOURNAL_OFFSET) != 0);
+      CHECK(fixture_get64(m.stable + journal_prior) != 0);
     }
     m.fail_sync_at = 0;
     if (cut == SELECTOR_ONLY) {
@@ -291,9 +310,7 @@ static void checkpoint_retire_select(int durable, int shared) {
     }
     OK(ps_close(s, &error));
     crash(&m);
-    options.io = &io;
-    options.durable_sync = durable;
-    options.shared = shared;
+    options.shared = reader_shared;
     s = NULL;
     if (cut == LOST_SELECTED) {
       CHECK(ps_open(path, 0, &options, &s, &error) == LC_ERR_PROTOCOL && !s);
@@ -317,6 +334,106 @@ static void checkpoint_retire_select(int durable, int shared) {
       OK(ps_close(s, &error));
     }
     free(m.stable);
+  }
+  clean();
+}
+
+enum checkpoint_retire_cut {
+  SUCCESSOR_TORN,
+  SUCCESSOR_WRITTEN,
+  SUCCESSOR_SYNCED,
+  PREDECESSOR_CLEARED,
+  PREDECESSOR_SYNCED
+};
+typedef struct checkpoint_retire_io {
+  enum checkpoint_retire_cut cut;
+  unsigned int syncs;
+  int armed;
+} checkpoint_retire_io;
+
+static ssize_t checkpoint_retire_write(void *ctx, int fd, const void *bytes,
+                                       size_t n, off_t offset) {
+  checkpoint_retire_io *io = ctx;
+  int selector =
+      io->armed && n == PS_ROOT_BYTES && (offset == 0 || offset == PS_PAGE);
+  uint64_t magic = selector ? fixture_get64(bytes) : 0;
+  if (magic == ROOT_MAGIC && io->cut == SUCCESSOR_TORN &&
+      ps_native_io.write(NULL, fd, bytes, n / 2, offset) == (ssize_t)(n / 2))
+    _exit(40 + io->cut);
+  if (selector && !magic && io->cut == SUCCESSOR_SYNCED)
+    _exit(40 + io->cut);
+  ssize_t written = ps_native_io.write(NULL, fd, bytes, n, offset);
+  if (selector && written == (ssize_t)n &&
+      ((magic == ROOT_MAGIC && io->cut == SUCCESSOR_WRITTEN) ||
+       (!magic && io->cut == PREDECESSOR_CLEARED)))
+    _exit(40 + io->cut);
+  return written;
+}
+static int checkpoint_retire_sync(void *ctx, int fd) {
+  checkpoint_retire_io *io = ctx;
+  int rc = ps_native_io.sync(NULL, fd);
+  if (!rc && io->armed && ++io->syncs == 2 && io->cut == PREDECESSOR_SYNCED)
+    _exit(40 + io->cut);
+  return rc;
+}
+static void checkpoint_retire_live(int durable, int join) {
+  ps_options options = {0};
+  options.shared = 1;
+  options.initial_capacity = PS_MIB;
+  options.durable_sync = durable;
+  for (int cut = SUCCESSOR_TORN; cut <= PREDECESSOR_SYNCED; ++cut) {
+    ps_space *resident = NULL, *peer = NULL;
+    ps_reader *reader = NULL;
+    clean();
+    OK(ps_open(path, 1, &options, &resident, &error));
+    put(resident, state(1), "prior", 5, 5);
+    put(resident, state(2), "deleted", 7, 7);
+    OK(ps_checkpoint(resident, &error));
+    OK(ps_read_open(resident, state(1), NULL, &reader, &error));
+    uint64_t generation = resident->generation;
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+      checkpoint_retire_io context = {cut, 0, 0};
+      ps_io io = ps_native_io;
+      io.context = &context;
+      io.write = checkpoint_retire_write;
+      io.sync = checkpoint_retire_sync;
+      options.io = &io;
+      OK(ps_open(path, 0, &options, &peer, &error));
+      put(peer, state(1), "current", 7, 7);
+      OK(ps_delete(peer, state(2), &error));
+      OK(ps_flush(peer, &error));
+      CHECK(peer->journal > 0 && peer->generation == generation);
+      context.armed = 1;
+      OK(ps_checkpoint_cleanup(peer, PS_CLEANUP_FLUSH, &error));
+      _exit(1); /* Every child must reach its cut. */
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 40 + cut);
+    if (join)
+      OK(ps_open(path, 0, &options, &peer, &error));
+    else {
+      OK(ps_refresh(resident, &error));
+      peer = resident;
+    }
+    CHECK(peer->generation == generation + (cut > SUCCESSOR_WRITTEN));
+    CHECK((peer->journal > 0) == (cut <= SUCCESSOR_WRITTEN));
+    expect(peer, state(1), NULL, "current", 7);
+    absent(peer, state(2));
+    read_value(reader, "prior", 5);
+    ps_reader_close(reader);
+    put(peer, state(3), "later", 5, 5);
+    OK(ps_flush(peer, &error));
+    if (join)
+      OK(ps_close(peer, &error));
+    OK(ps_close(resident, &error));
+    OK(ps_open(path, 0, &options, &peer, &error));
+    expect(peer, state(1), NULL, "current", 7);
+    absent(peer, state(2));
+    expect(peer, state(3), NULL, "later", 5);
+    OK(ps_close(peer, &error));
   }
   clean();
 }
