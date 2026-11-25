@@ -79,6 +79,22 @@ static void index_phase_end(index_phase *phase) {
   phase->cpu_seconds += now(CLOCK_THREAD_CPUTIME_ID) - phase->started_cpu;
   require(!pthread_setspecific(sync_phase_key, NULL), "finish index phase");
 }
+static int index_pressure_retry(worker *w, int rc, double *deadline,
+                                lc_error *e) {
+  const struct timespec delay = {0, 1000000L};
+  double current;
+  if (rc != LC_ERR_PENDING || !w->run->reclaim)
+    return 0;
+  current = now(CLOCK_MONOTONIC);
+  if (!*deadline)
+    *deadline = current + 5.0;
+  if (current >= *deadline)
+    return 0;
+  lc_error_cleanup(e);
+  lc_error_init(e);
+  (void)nanosleep(&delay, NULL);
+  return 1;
+}
 static int index_queries(worker *w, lc_client *client, int flush, lc_error *e) {
   static const char *const selectors[] = {
       "{\"exists\":\"/v\"}",
@@ -100,6 +116,7 @@ static int index_queries(worker *w, lc_client *client, int flush, lc_error *e) {
   request.mode = "sync";
   int rc = LC_OK;
   if (flush) {
+    double retry_until = 0;
     index_phase_begin(&w->index_phases[0]);
     /* Compare the same canonical recovery boundary when requested. Native
      * revision publication already stabilizes the completed prefix even on
@@ -109,8 +126,13 @@ static int index_queries(worker *w, lc_client *client, int flush, lc_error *e) {
     if (w->run->stable_index && !w->run->container && !w->run->sync)
       rc = lc_pouch_state_sync_namespace(((lc_client_handle *)client)->pouch,
                                          w->ns, e);
-    if (rc == LC_OK)
+    if (rc == LC_OK) {
       rc = lc_flush_index(client, &request, &result, e);
+      while (index_pressure_retry(w, rc, &retry_until, e)) {
+        lc_index_flush_res_cleanup(&result);
+        rc = lc_flush_index(client, &request, &result, e);
+      }
+    }
     if (rc == LC_OK)
       require(result.flushed && !result.pending, "completed index flush");
     if (rc == LC_OK) {
@@ -134,6 +156,7 @@ static int index_queries(worker *w, lc_client *client, int flush, lc_error *e) {
       lc_query_key_handler handler = {indexed_begin, indexed_chunk,
                                       indexed_end};
       indexed_keys keys = {0};
+      double retry_until = 0;
       keys.worker = w;
       lc_query_req_init(&query);
       query.ns = w->ns;
@@ -143,6 +166,12 @@ static int index_queries(worker *w, lc_client *client, int flush, lc_error *e) {
       else
         query.selector_json = selectors[i];
       rc = lc_query_keys(client, &query, &handler, &keys, &queried, e);
+      while (index_pressure_retry(w, rc, &retry_until, e)) {
+        keys.seen = 0U;
+        keys.length = 0U;
+        lc_query_res_cleanup(&queried);
+        rc = lc_query_keys(client, &query, &handler, &keys, &queried, e);
+      }
       if (rc == LC_OK)
         require(keys.seen == (w->revision && i == 2U ? 0U : expected) &&
                     queried.metadata_json &&

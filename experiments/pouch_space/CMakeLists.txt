@@ -783,12 +783,12 @@ if(LOCKDC_BUILD_TESTS)
   endforeach()
   if(LOCKDC_BUILD_BENCHMARKS)
     # Exercise every profile in both backend orders. The direct compare mode
-    # takes five samples for benchmarking.
+    # takes five samples for benchmarking. Isolate the sync-heavy comparison
+    # from the parallel fault sweeps using the same filesystem.
     add_test(NAME pouch_space_lease_compare
       COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} compare-correctness)
     set_tests_properties(pouch_space_lease_compare PROPERTIES
-      TIMEOUT 240 COST 60 LABELS "unit;local;pouch-space"
-      RESOURCE_LOCK pouch_space_comparison)
+      TIMEOUT 240 COST 60 RUN_SERIAL TRUE LABELS "unit;local;pouch-space")
   endif()
   foreach(crypto 0 1 2 3)
     add_test(NAME pouch_space_lease_process-${crypto} COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} process-${crypto})

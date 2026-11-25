@@ -4610,7 +4610,7 @@ static void canonical_stream_grown_tail(int native_zero) {
   ps_stats before, after;
   lc_pouch_record_header record = {0};
   unsigned char frame[107], readback[107], body[64];
-  uint64_t offset;
+  uint64_t offset, token;
   size_t i;
   int fd, found;
   if (native_zero)
@@ -4640,9 +4640,12 @@ static void canonical_stream_grown_tail(int native_zero) {
   CHECK(ps_native_io.sync(NULL, fd) == 0 && close(fd) == 0);
   space = reopen(&io);
   OK(ps_status(space, &before, &error));
-  CHECK(before.capacity == PS_MIB);
+  CHECK(before.capacity == PS_MIB && !before.syncs);
   OK(ps_owned_open(space, NULL, stream_key(1), 0, NULL, &head, &owned, &error));
   OK(ps_grow(space, PS_MIB, &error));
+  /* Clean reopen leaves the ID range acquisition to the first allocation.
+   * Cover it separately before measuring the new run's zeroing barrier. */
+  OK(ps_catalog_allocate_id(space, &token, &error));
   OK(ps_status(space, &before, &error));
   OK(ps_owned_grant(head, NULL, 0, PS_CHUNK, &run, &found, &error));
   CHECK(found && ps_owned_run_capacity(run) == PS_CHUNK - PS_RUN_HEADER);
@@ -4687,7 +4690,7 @@ static void canonical_stream_prepared_pool(int zero_mode) {
   ps_stream_info info;
   ps_stats before, after;
   unsigned char *old = malloc((size_t)PS_MIB);
-  uint64_t offset;
+  uint64_t offset, token;
   size_t i;
   CHECK(old != NULL);
   memset(old, 0x69, (size_t)PS_MIB);
@@ -4702,6 +4705,9 @@ static void canonical_stream_prepared_pool(int zero_mode) {
   OK(ps_close(space, &error));
   space = reopen(&io);
   stream = stream_open(space, 1, 0, NULL, NULL);
+  /* Count the shared preparation of zero ranges separately from the lazy
+   * incarnation range selected by this fresh owner. */
+  OK(ps_catalog_allocate_id(space, &token, &error));
   OK(ps_status(space, &before, &error));
   allocation_max = 0;
   measure_allocations = 1;
