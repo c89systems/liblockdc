@@ -1,5 +1,32 @@
 # liblockdc Pouch benchmarks
 
+## Single-file versus multifile
+
+Run the native Linux comparison on the filesystem you want to measure.
+
+```sh
+POUCH_SPACE_RUNS=5 bash scripts/compare_pouch_space.sh coverage "$PWD/build/pouch-comparison"
+```
+
+Each profile runs both backends on fresh roots with matching options and
+alternating execution order. The runner saves the raw logs, individual samples,
+and per-phase medians in a new directory. Times in `medians.tsv` are in
+milliseconds and ratios greater than one favor multifile. The NoSync and
+durable runs are separate. Reopen retains the OS page cache.
+
+| Area | Workloads |
+| --- | --- |
+| State and coordination | Acquire, held-key refusal, renewal, release and peer handoff, leased update and mutation, describe, query visibility and remove, point and bulk reads, scans, staging, durable scopes, compaction, namespace index publication and queries |
+| Attachments | 64 KiB upload, list, byte-checked download and delete |
+| Queues and transactions | Enqueue, stats, batch dequeue, payload read, visibility extension, deferral, redelivery with state, acknowledgement, watch observation from the same or a separate owner, joint state update and queue acknowledgement through prepare, commit, rollback and replay, and XA lifecycle |
+| Outbox | Dispatch, reconciliation, warm stateful delivery, and terminal command receipts |
+| Collections | Catalog, lease and metadata operations, direct pull, staged pull and push with independent owners of one collection, raw and selective reads, index build and reopen rebuild, encrypted/compressed append, suffix and scattered edits, append-only edits, retention and compaction |
+
+The bounded profiles measure operation costs and verify their results.
+Continuous background compaction and worker CPU use the separate
+[mixed collection soak](../docs/pouch-space.md#verification-and-performance).
+The paired suite reports timings without pass/fail performance thresholds.
+
 ## Native collections
 
 The native collection workload checks append results, raw and filtered JSONL
@@ -42,6 +69,10 @@ comparisons without contention on one journal. Append timing covers all entries,
 including caller setup/teardown; reads check the first caller's partition, and
 every partition's committed count/high-water mark is verified. Both flags default
 off. Compare matching `LEASE=0/1` runs with the same inputs and storage directory.
+`LOCKDC_COLLECTION_BENCH_PEERS=1` with `SHARED=1` opens another client for each
+additional writer. Use `STAGED=1` for staged pull, or `PUSH=1` for push append.
+`BUILD_INDEX=1` with `INDEX=1` times the explicit index maintenance pass before
+the first read and again after reopening.
 
 For optional diagnostics outside the benchmark gates, use
 `make compare-collection-layouts` to compare producer layouts, inode growth

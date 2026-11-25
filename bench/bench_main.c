@@ -1,5 +1,6 @@
 #include "../tests/support/lc_test_tmp.h"
 #include "bench_collections.h"
+#include "bench_pouch.h"
 #include "lc/lc.h"
 #include "lc_api_internal.h"
 #include "lc_pouch.h"
@@ -137,24 +138,38 @@ static int bench_stream_copy(long iterations) {
   return 0;
 }
 
-static int bench_pouch_root_path(char *buffer, size_t buffer_size,
-                                 const char *suffix) {
+static int bench_pouch_tmp_prefix(char *prefix, size_t size) {
+  const char *directory = getenv("LOCKDC_BENCH_DIRECTORY");
+  int written;
+  if (!directory)
+    directory = "/tmp";
+  if (directory[0] != '/')
+    return 0;
+  written = snprintf(prefix, size, "%s/liblockdc-pouch-bench-", directory);
+  return written >= 0 && (size_t)written < size;
+}
+
+int bench_pouch_root_path(char *buffer, size_t buffer_size,
+                          const char *suffix) {
   char template_path[512];
+  char prefix[512];
   int written;
 
-  written = snprintf(template_path, sizeof(template_path),
-                     BENCH_POUCH_TMP_PREFIX "%s-XXXXXX", suffix);
+  if (!bench_pouch_tmp_prefix(prefix, sizeof(prefix)))
+    return 1;
+  written = snprintf(template_path, sizeof(template_path), "%s%s-XXXXXX",
+                     prefix, suffix);
   if (written < 0 || (size_t)written >= sizeof(template_path)) {
     return 1;
   }
-  return lc_test_tmp_mkdtemp(template_path, buffer, buffer_size,
-                             BENCH_POUCH_TMP_PREFIX)
-             ? 0
-             : 1;
+  return lc_test_tmp_mkdtemp(template_path, buffer, buffer_size, prefix) ? 0
+                                                                         : 1;
 }
 
-static void bench_pouch_cleanup_root(const char *root) {
-  lc_test_tmp_cleanup_path(root, BENCH_POUCH_TMP_PREFIX);
+void bench_pouch_cleanup_root(const char *root) {
+  char prefix[512];
+  if (bench_pouch_tmp_prefix(prefix, sizeof(prefix)))
+    lc_test_tmp_cleanup_path(root, prefix);
 }
 
 static int bench_query_key_begin(void *context, lc_error *error) {
@@ -193,7 +208,7 @@ static int bench_pouch_client_open(const char *root, lc_client **out,
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.default_namespace = "bench";
-  return lc_client_open(&config, out, error);
+  return bench_open_pouch(&config, 1, 1, out, error);
 }
 
 static int bench_env_enabled(const char *name) {
@@ -222,7 +237,7 @@ static long bench_env_long(const char *name, long fallback, long minimum) {
 }
 
 static int bench_pouch_client_open_crypto(const char *root,
-                                          const char *crypto_key,
+                                          const char *crypto_key, int create,
                                           lc_client **out, lc_error *error) {
   lc_client_config config;
   const char *endpoints[1];
@@ -235,7 +250,7 @@ static int bench_pouch_client_open_crypto(const char *root,
   config.endpoint_count = 1U;
   config.default_namespace = "bench";
   config.pouch_crypto_key = crypto_key;
-  return lc_client_open(&config, out, error);
+  return bench_open_pouch(&config, create, 1, out, error);
 }
 
 static int bench_pouch_perf_fixture_open(bench_pouch_perf_fixture *fixture,
@@ -256,7 +271,7 @@ static int bench_pouch_perf_fixture_open(bench_pouch_perf_fixture *fixture,
       return rc;
     }
   }
-  return bench_pouch_client_open_crypto(fixture->root, fixture->crypto_key,
+  return bench_pouch_client_open_crypto(fixture->root, fixture->crypto_key, 1,
                                         &fixture->client, error);
 }
 
@@ -322,7 +337,7 @@ static int bench_outbox_remote_probe(lc_client *client, const char *ns,
 }
 
 static int bench_outbox_fixture_client_open(const bench_outbox_fixture *fixture,
-                                            int pouch_shared_writer,
+                                            int pouch_shared_writer, int create,
                                             lc_client **out, lc_error *error) {
   const char *endpoint;
   const char *failover_endpoint;
@@ -363,7 +378,7 @@ static int bench_outbox_fixture_client_open(const bench_outbox_fixture *fixture,
     config.endpoint_count = 1U;
     config.default_namespace = fixture->ns;
     config.timeout_ms = 30000L;
-    return lc_client_open(&config, out, error);
+    return bench_open_pouch(&config, create, 1, out, error);
   }
   endpoint = getenv("LOCKDC_OUTBOX_BENCH_ENDPOINT");
   if (endpoint == NULL || endpoint[0] == '\0') {
@@ -532,7 +547,7 @@ static int bench_outbox_fixture_open(bench_outbox_fixture *fixture,
         &fixture->client, error);
   }
   if (fixture->is_pouch) {
-    return bench_outbox_fixture_client_open(fixture, pouch_shared_writer,
+    return bench_outbox_fixture_client_open(fixture, pouch_shared_writer, 1,
                                             &fixture->client, error);
   }
   config.default_namespace = fixture->ns;
@@ -565,7 +580,8 @@ static int bench_outbox_fixture_reopen(bench_outbox_fixture *fixture,
     fixture->client->close(fixture->client);
     fixture->client = NULL;
   }
-  return bench_outbox_fixture_client_open(fixture, 0, &fixture->client, error);
+  return bench_outbox_fixture_client_open(fixture, 0, 0, &fixture->client,
+                                          error);
 }
 
 static int bench_outbox_seed_record(lc_client *client, const char *ns,
@@ -1222,8 +1238,8 @@ static int bench_outbox_dispatcher_child(const bench_outbox_fixture *fixture,
   }
   if (rc == LC_OK) {
     result.failure_stage = 3;
-    rc = bench_outbox_fixture_client_open(fixture, fixture->is_pouch, &client,
-                                          &error);
+    rc = bench_outbox_fixture_client_open(fixture, fixture->is_pouch, 0,
+                                          &client, &error);
   }
   if (rc == LC_OK &&
       snprintf(owner, sizeof(owner), "outbox-benchmark-dispatcher-%lu",
@@ -1969,7 +1985,7 @@ static int bench_pouch_perf_full_text_reopen_keys(long iterations) {
     fixture.client = NULL;
   }
   if (rc == LC_OK) {
-    rc = bench_pouch_client_open_crypto(fixture.root, fixture.crypto_key,
+    rc = bench_pouch_client_open_crypto(fixture.root, fixture.crypto_key, 0,
                                         &fixture.client, &error);
   }
   if (rc == LC_OK) {
@@ -2046,7 +2062,7 @@ static int bench_pouch_perf_flush_reopen(long iterations) {
     fixture.client = NULL;
   }
   if (rc == LC_OK) {
-    rc = bench_pouch_client_open_crypto(fixture.root, fixture.crypto_key,
+    rc = bench_pouch_client_open_crypto(fixture.root, fixture.crypto_key, 0,
                                         &fixture.client, &error);
   }
   start = bench_now_seconds();
@@ -2210,6 +2226,7 @@ done:
   return rc;
 }
 
+#ifndef LOCKDC_POUCH_SPACE_BENCH
 static int bench_pouch_open(long iterations) {
   lc_error error;
   char root[512];
@@ -2277,6 +2294,7 @@ done:
   lc_error_cleanup(&error);
   return rc;
 }
+#endif
 
 static int bench_pouch_query_iprefix_index_keys(long iterations) {
   static const bench_pouch_query_case query_case = {
@@ -2464,8 +2482,18 @@ static const bench_case *bench_cases(void) {
   static const bench_case cases[] = {
       {"stream-copy", 1000L, bench_stream_copy},
       {"collections", 1024L, bench_collections},
+#ifdef LOCKDC_POUCH_SPACE_BENCH
+      {"pouch-lease", 64L, bench_pouch_lease},
+      {"pouch-state-api", 32L, bench_pouch_state_api},
+      {"pouch-attachment", 32L, bench_pouch_attachment},
+      {"pouch-queue-delivery", 16L, bench_pouch_queue_delivery},
+      {"pouch-queue-watch", 16L, bench_pouch_queue_watch},
+      {"pouch-transaction", 16L, bench_pouch_transaction},
+      {"collection-control", 16L, bench_collection_control},
+#else
       {"pouch-open", 1000L, bench_pouch_open},
       {"pouch-namespace", 1000L, bench_pouch_namespace},
+#endif
       {"pouch-perf-index-docs", 128L, bench_pouch_perf_index_docs},
       {"pouch-perf-get-body", 1024L, bench_pouch_perf_get_body},
       {"pouch-perf-full-text-keys", 128L, bench_pouch_perf_full_text_keys},
@@ -2633,8 +2661,9 @@ int main(int argc, char **argv) {
   iterations = argc > 1 ? strtol(argv[1], NULL, 10) : 0L;
   name = argc > 2 ? argv[2] : "all";
   failed = 0;
-  lc_test_tmp_cleanup_stale("/tmp", "liblockdc-pouch-bench-",
-                            BENCH_POUCH_TMP_PREFIX);
+  if (!getenv("LOCKDC_BENCH_DIRECTORY"))
+    lc_test_tmp_cleanup_stale("/tmp", "liblockdc-pouch-bench-",
+                              BENCH_POUCH_TMP_PREFIX);
 
   if (strcmp(name, "all") == 0) {
     for (bench = bench_cases(); bench->name != NULL; ++bench) {

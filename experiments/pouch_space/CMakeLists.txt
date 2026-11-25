@@ -226,6 +226,48 @@ if(LOCKDC_BUILD_BENCHMARKS)
   # Count comparisons as correctness checks in CTest. Keep them ordered
   # against one another and schedule them before the short-test tail.
   set(pouch_space_comparison_schedule RESOURCE_LOCK pouch_space_comparison COST 12)
+  add_executable(pouch_space_sdk_bench
+    ${CMAKE_SOURCE_DIR}/bench/bench_main.c
+    ${CMAKE_SOURCE_DIR}/bench/bench_collections.c
+    ${CMAKE_SOURCE_DIR}/bench/bench_pouch.c
+    ${CMAKE_SOURCE_DIR}/bench/bench_pouch_ops.c
+    ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  add_executable(pouch_space_edit_probe
+    ${CMAKE_SOURCE_DIR}/bench/collection_edit_probe.c
+    ${CMAKE_SOURCE_DIR}/bench/bench_pouch.c)
+  foreach(target pouch_space_sdk_bench pouch_space_edit_probe)
+    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(${target} PRIVATE LOCKDC_POUCH_SPACE_BENCH=1)
+    target_link_libraries(${target} PRIVATE pouch_space_experiment)
+  endforeach()
+  lc_configure_c_test_target(pouch_space_sdk_bench)
+  lc_configure_c_target(pouch_space_edit_probe)
+  if(LOCKDC_BUILD_TESTS)
+    set(benchmark_env
+      "LOCKDC_TMP_AUTO_CLEANUP_STALE_SECONDS=-1"
+      "LOCKDC_BENCH_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}"
+      "LOCKDC_COLLECTION_BENCH_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}"
+      "LOCKDC_COLLECTION_BENCH_WRITERS=2"
+      "LOCKDC_COLLECTION_BENCH_SHARED=1"
+      "LOCKDC_COLLECTION_BENCH_PEERS=1"
+      "LOCKDC_COLLECTION_BENCH_PUSH=1"
+      "LOCKDC_COLLECTION_BENCH_BUILD_INDEX=1")
+    foreach(backend multifile single-file)
+      foreach(workload collections pouch-lease pouch-state-api pouch-attachment
+          pouch-queue-delivery pouch-queue-watch pouch-transaction collection-control)
+        set(test_name pouch_space_sdk_bench_${backend}_${workload})
+        set(rows 2)
+        if(workload STREQUAL "collections")
+          set(rows 48)
+        endif()
+        add_test(NAME ${test_name} COMMAND pouch_space_sdk_bench ${rows} ${workload})
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 30
+          LABELS "unit;local;pouch-space"
+          ENVIRONMENT "${benchmark_env};LOCKDC_BENCH_BACKEND=${backend}"
+          RESOURCE_LOCK pouch_space_comparison)
+      endforeach()
+    endforeach()
+  endif()
   add_executable(pouch_space_control_compare control_compare.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_control_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_control_compare PRIVATE pouch_space_experiment)

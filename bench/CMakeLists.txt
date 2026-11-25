@@ -5,6 +5,7 @@ endif()
 add_executable(lockdc_bench
     bench_main.c
     bench_collections.c
+    bench_pouch.c
     ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c
 )
 target_include_directories(lockdc_bench PRIVATE
@@ -17,7 +18,8 @@ lc_enable_coverage_if_requested(lockdc_bench)
 
 # Fresh-process public-API driver for tests/e2e/pouch_replay.py.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_executable(lockdc_collection_edit_probe EXCLUDE_FROM_ALL collection_edit_probe.c)
+  add_executable(lockdc_collection_edit_probe EXCLUDE_FROM_ALL
+      collection_edit_probe.c bench_pouch.c)
   target_link_libraries(lockdc_collection_edit_probe PRIVATE lc_static)
   lc_configure_c_target(lockdc_collection_edit_probe)
 

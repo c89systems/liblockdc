@@ -1,6 +1,7 @@
 /* Disposable public-API diagnostic, deliberately excluded from benchmark gates.
  * The caller owns/removes the fresh root. No private state or key is printed.
  */
+#include "bench_pouch.h"
 #include "lc/lc.h"
 #include <errno.h>
 #include <stdio.h>
@@ -91,7 +92,7 @@ static void open_root(probe *p, const char *mode, int durable, int create) {
   config.endpoint_count = 1;
   config.default_namespace = "journal";
   config.pouch_settings = &settings;
-  check(p, lc_client_open(&config, &p->client, &p->error));
+  check(p, bench_open_pouch(&config, create, 0, &p->client, &p->error));
   lc_collection_config_init(&collection);
   collection.name = "events";
   check(p, create ? lc_client_create_collection(p->client, &collection,
@@ -123,6 +124,8 @@ int main(int argc, char **argv) {
   lc_collection_edit_range range;
   lc_collection_read_opts opts;
   lc_collection_read_res read;
+  lc_collection_edit_status_res receipt;
+  lc_collection_info info;
   lc_source *source = NULL;
   lc_sink sink;
   struct stat st;
@@ -132,6 +135,7 @@ int main(int argc, char **argv) {
   static const char alphabet[] =
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
   unsigned long count, cut, size, i, writes, reads;
+  uint64_t expected_tail;
   probe_io before, after, edit_before, edit_after;
   double wall, cpu, append_wall, append_cpu, edit_wall, edit_cpu, read_wall,
       read_cpu, after_wall, after_cpu;
@@ -236,6 +240,19 @@ int main(int argc, char **argv) {
   read_cpu = stamp(CLOCK_PROCESS_CPUTIME_ID) - cpu;
   io_snapshot(&after);
   reads = after.read_chars - before.read_chars;
+  expected_tail = p->edited.upper_position - opts.after;
+  for (i = 0; i < req.range_count; ++i) {
+    uint64_t boundary = req.ranges[i].after;
+    if (boundary < opts.after)
+      boundary = opts.after;
+    if (req.ranges[i].through > boundary)
+      expected_tail -= req.ranges[i].through - boundary;
+  }
+  if (!read.complete || read.completed_records != expected_tail ||
+      p->bytes != expected_tail * (size + 1U)) {
+    fprintf(stderr, "collection edit probe: edited tail differs\n");
+    return 1;
+  }
   wall = stamp(CLOCK_MONOTONIC);
   cpu = stamp(CLOCK_PROCESS_CPUTIME_ID);
   for (i = 0; i < PROBE_APPEND_COUNT; ++i) {
@@ -244,6 +261,19 @@ int main(int argc, char **argv) {
   }
   after_wall = stamp(CLOCK_MONOTONIC) - wall;
   after_cpu = stamp(CLOCK_PROCESS_CPUTIME_ID) - cpu;
+  close_root(p);
+  open_root(p, mode, durable, 0);
+  check(p, lc_collection_edit_status(p->collection, req.operation_id, &receipt,
+                                     &p->error));
+  check(p, lc_collection_describe(p->collection, &info, &p->error));
+  if (!receipt.found || receipt.result.deleted_count != cut ||
+      receipt.result.replacement.position != p->edited.replacement.position ||
+      info.live_count != p->edited.live_count + PROBE_APPEND_COUNT ||
+      info.upper_position != p->edited.upper_position + PROBE_APPEND_COUNT) {
+    fprintf(stderr,
+            "collection edit probe: reopened receipt or result differs\n");
+    return 1;
+  }
   printf("%s,%s,%s,%lu,%lu,%lu,%.9f,%.9f,%.9f,%.9f,%lu,%.9f,%.9f,%lu,%lu,%.9f,%"
          ".9f,%lu,%lu,%lu\n",
          mode, argv[6], style, count, cut, size,

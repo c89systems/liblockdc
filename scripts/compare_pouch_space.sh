@@ -10,8 +10,8 @@ configure_args=()
 if [[ "$mode" == *-reopen ]]; then preopen_args=(--reopen); fi
 case "$mode" in
   smoke) preset=debug; configure_args+=(-DLOCKDC_BUILD_TESTS=ON) ;;
-  measure|rollover|streams|streams-long|streams-reopen|streams-long-reopen) preset=x86_64-linux-gnu-release ;;
-  *) echo 'usage: compare_pouch_space.sh [smoke|measure|rollover|streams|streams-long|streams-reopen|streams-long-reopen] [ABSOLUTE_DIRECTORY]' >&2; exit 2 ;;
+  coverage|measure|rollover|streams|streams-long|streams-reopen|streams-long-reopen) preset=x86_64-linux-gnu-release ;;
+  *) echo 'usage: compare_pouch_space.sh [smoke|coverage|measure|rollover|streams|streams-long|streams-reopen|streams-long-reopen] [ABSOLUTE_DIRECTORY]' >&2; exit 2 ;;
 esac
 case "$storage" in /*) ;; *) echo 'storage directory must be absolute' >&2; exit 2 ;; esac
 case "$runs" in 3|5|7|9) ;; *) echo 'POUCH_SPACE_RUNS must be 3, 5, 7, or 9' >&2; exit 2 ;; esac
@@ -24,6 +24,14 @@ if [ "$mode" = smoke ]; then
   cmake --build --preset "$preset" --target pouch_space_smoke
   ctest --test-dir "$root/build/$preset" -R '^pouch_space_' \
     --output-on-failure --no-tests=error --parallel 1
+  exit 0
+fi
+if [ "$mode" = coverage ]; then
+  cmake --build --preset "$preset" --target pouch_space_sdk_bench pouch_space_edit_probe \
+    pouch_space_compare pouch_space_lifecycle_compare
+  mkdir -p -- "$storage"
+  bash scripts/compare_pouch_workloads.sh "$root/build/$preset/experiments/pouch_space" \
+    "$storage" "$runs"
   exit 0
 fi
 cmake --build --preset "$preset" --target pouch_space_compare
