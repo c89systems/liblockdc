@@ -9275,10 +9275,23 @@ int ps_flush(ps_space *s, lc_error *error) {
   return sequence ? wait_durable(s, sequence, error)
                   : settle_recovery(s, error);
 }
-static int checkpoint(ps_space *s, int cleanup, lc_error *error) {
+/* An exclusive root can keep append-only work in its replayable prefix.
+ * Whole stream removal marks owned entries deleted in place, so the retired
+ * list alone is insufficient to prove that no ownership needs retirement. */
+static int checkpoint_needs_retirement(ps_space *s) {
+  const ps_entry *p;
+  if (s->retired || ps_readiness_pressure(s))
+    return 1;
+  for (p = s->dirty; p; p = p->dirty_next)
+    if (p->deleted)
+      return 1;
+  return 0;
+}
+static int checkpoint(ps_space *s, int cleanup, int allow_log_only,
+                      lc_error *error) {
   ps_coordination_guard *guard;
   uint64_t bound;
-  int rc;
+  int rc, trim;
   if (!s)
     return err(error, LC_ERR_INVALID, "checkpoint requires container");
   pthread_mutex_lock(&s->mutex);
@@ -9293,6 +9306,7 @@ static int checkpoint(ps_space *s, int cleanup, lc_error *error) {
   if (rc == LC_OK)
     s->metadata_workspace = bound;
   if (rc == LC_OK) {
+    trim = metadata_trim_needed(s);
     /* Namespace maintenance shares one physical checkpoint. A completed root
      * needs no new root selection merely because another namespace visits it.
      * Keep unpublished preparation outside this boundary; completed readiness
@@ -9304,11 +9318,16 @@ static int checkpoint(ps_space *s, int cleanup, lc_error *error) {
      * the directory. Each stamp-only checkpoint advances the root generation
      * and invalidates those stamps. Canonical changes mark entries dirty,
      * including stream tails and admission metadata. */
-    if (s->dirty || metadata_trim_needed(s) ||
-        ((!cleanup || !s->readiness) &&
-         (s->journal ||
-          __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE) !=
-              __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE))))
+    if (allow_log_only && !s->readiness && !trim &&
+        !checkpoint_needs_retirement(s)) {
+      rc = ps_flush(s, error);
+      if (rc == LC_OK)
+        rc = pins_reclaim_current(s, error);
+    } else if (s->dirty || trim ||
+               ((!cleanup || !s->readiness) &&
+                (s->journal ||
+                 __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE) !=
+                     __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE))))
       rc = checkpoint_select(s, 0, cleanup, error);
     else {
       rc = pins_reclaim_current(s, error);
@@ -9322,10 +9341,10 @@ static int checkpoint(ps_space *s, int cleanup, lc_error *error) {
   return rc;
 }
 int ps_checkpoint(ps_space *s, lc_error *error) {
-  return checkpoint(s, 0, error);
+  return checkpoint(s, 0, 0, error);
 }
-int ps_checkpoint_cleanup(ps_space *s, lc_error *error) {
-  return checkpoint(s, 1, error);
+int ps_checkpoint_cleanup(ps_space *s, int allow_log_only, lc_error *error) {
+  return checkpoint(s, 1, allow_log_only, error);
 }
 int ps_metadata_repack(ps_space *s, lc_error *error) {
   int rc;

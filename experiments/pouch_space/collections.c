@@ -1849,7 +1849,7 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
      * retirement work regardless of which operation selected it. */
     if (rc == LC_OK && (scan_collections || reclaimed || !shared))
       rc = !shared || (options->cleanup_only && !options->force)
-               ? ps_checkpoint_cleanup(root->space, &local)
+               ? ps_checkpoint_cleanup(root->space, !options->force, &local)
                : ps_checkpoint(root->space, &local);
     if (rc != LC_OK) {
       first_rc = rc;

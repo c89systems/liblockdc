@@ -279,7 +279,7 @@ int ps_flush(ps_space *, lc_error *);
 int ps_checkpoint(ps_space *, lc_error *);
 /* Settle canonical checkpoint work and reclaim unpinned runs. Shared cleanup
  * may leave live-only journal stamps for the next normal checkpoint. */
-int ps_checkpoint_cleanup(ps_space *, lc_error *);
+int ps_checkpoint_cleanup(ps_space *, int allow_log_only, lc_error *);
 /* Explicit metadata maintenance: rewrite all current descriptors and their
  * directory references densely through the same durable root-retirement
  * protocol. Payloads, stream mappings and captured readers are unchanged.

@@ -4529,7 +4529,7 @@ static void maintenance_checkpoint_batch(const char *path, int sync) {
     ps_writer_close(value);
   }
   ok(ps_flush(space, &e), &e);
-  ok(ps_checkpoint_cleanup(background, &e), &e);
+  ok(ps_checkpoint_cleanup(background, 1, &e), &e);
   ok(ps_status(background, &after, &e), &e);
   REQUIRE(after.checkpoints == checkpointed.checkpoints + 2 &&
           !after.journal_bytes);

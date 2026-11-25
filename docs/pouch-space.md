@@ -77,6 +77,11 @@ together. While the preceding selector is valid, recovery uses it and its
 intact journal. A second sync retires that selector before its pages can be
 reused. The live owner clears the old journal before reuse. Recovery discards
 those older frames if their clear was lost.
+During ordinary exclusive maintenance, an append-only prefix can stay in
+the journal and canonical streams when there is no physical retirement,
+metadata trimming, or allocation pressure. Maintenance still syncs that
+prefix before returning. Capacity admission and journal rollover can
+checkpoint it later.
 
 A selected namespace key checkpoint makes metadata-only work discoverable by
 maintenance. The first namespace index publication can include a maintenance
