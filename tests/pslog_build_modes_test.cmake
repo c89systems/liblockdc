@@ -20,10 +20,7 @@ endif()
 
 include("${LOCKDC_ROOT}/tests/bootlin_runtime_test_support.cmake")
 
-if(LOCKDC_SYSTEM_NAME STREQUAL "Linux")
-    if(NOT DEFINED LOCKDC_CMAKE_SYSROOT OR LOCKDC_CMAKE_SYSROOT STREQUAL "")
-        message(FATAL_ERROR "LOCKDC_CMAKE_SYSROOT is required for Linux development runtime checks")
-    endif()
+if(LOCKDC_SYSTEM_NAME STREQUAL "Linux" AND LOCKDC_CMAKE_SYSROOT)
     if(NOT DEFINED LOCKDC_CMAKE_READELF OR LOCKDC_CMAKE_READELF STREQUAL "")
         message(FATAL_ERROR "LOCKDC_CMAKE_READELF is required for Linux development runtime checks")
     endif()
@@ -57,7 +54,7 @@ function(append_toolchain_arg out_var)
     if(DEFINED LOCKDC_TOOLCHAIN_FILE AND NOT LOCKDC_TOOLCHAIN_FILE STREQUAL "")
         list(APPEND args -DCMAKE_TOOLCHAIN_FILE=${LOCKDC_TOOLCHAIN_FILE})
     endif()
-    if(LOCKDC_SYSTEM_NAME STREQUAL "Linux")
+    if(lockdc_bootlin_runtime_loader)
         list(APPEND args
             -DLOCKDC_BOOTLIN_RUNTIME_LOADER=${lockdc_bootlin_runtime_loader}
             -DLOCKDC_BOOTLIN_RUNTIME_DIRS=${lockdc_bootlin_runtime_dirs_arg})
@@ -66,7 +63,7 @@ function(append_toolchain_arg out_var)
 endfunction()
 
 function(assert_bootlin_development_executable binary_path)
-    if(NOT LOCKDC_SYSTEM_NAME STREQUAL "Linux")
+    if(NOT lockdc_bootlin_runtime_loader)
         return()
     endif()
     execute_process(
@@ -85,7 +82,7 @@ endfunction()
 function(write_shared_consumer_project project_dir)
     file(MAKE_DIRECTORY "${project_dir}")
     set(lockdc_consumer_runtime_config "")
-    if(LOCKDC_SYSTEM_NAME STREQUAL "Linux")
+    if(lockdc_bootlin_runtime_loader)
         string(APPEND lockdc_consumer_runtime_config
             "set(CMAKE_SKIP_BUILD_RPATH TRUE)\n"
             "add_link_options(\n"
@@ -103,6 +100,7 @@ function(write_shared_consumer_project project_dir)
         "add_subdirectory(\"${LOCKDC_ROOT}\" lockdc-src)\n"
         "add_executable(shared_consumer main.c)\n"
         "target_link_libraries(shared_consumer PRIVATE lc_shared)\n"
+        "lc_add_build_tree_shared_dependency_lookup(shared_consumer)\n"
         "if(CMAKE_SYSTEM_NAME STREQUAL \"Linux\")\n"
         "  target_link_options(shared_consumer PRIVATE \"LINKER:-rpath,$<TARGET_FILE_DIR:lc_shared>\")\n"
         "endif()\n"

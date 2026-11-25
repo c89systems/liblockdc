@@ -33,6 +33,8 @@ native_credentials() {
 
 start_native_services() {
   local port attempt
+  # Remote runner CPU spikes are unrelated to the fixture's API scenarios.
+  local qrf_flags=(--qrf-cpu-soft-limit 0 --qrf-cpu-hard-limit 0)
   local lockd="$fixture_bin/lockd"
   local minio_url="http://127.0.0.1:$LOCKDC_MINIO_API_PORT"
   local access_key=lockddev secret_key=lockddevpass
@@ -61,31 +63,35 @@ start_native_services() {
     --address "127.0.0.1:$LOCKDC_MINIO_API_PORT" \
     --console-address "127.0.0.1:$LOCKDC_MINIO_CONSOLE_PORT"
   for ((attempt=0; attempt<60; attempt++)); do
-    if curl --fail --silent --max-time 2 "$minio_url/minio/health/ready" >/dev/null; then
+    if curl --fail --silent --max-time 2 "$minio_url/minio/health/ready" >/dev/null &&
+       "$fixture_bin/mc" --config-dir "$mc_config" alias set local \
+         "$minio_url" "$access_key" "$secret_key" >"$workspace/logs/native-minio-mc.log" 2>&1; then
       break
     fi
     sleep 1
   done
   if [ "$attempt" -eq 60 ]; then
     echo "Timed out waiting for MinIO at $minio_url" >&2
+    if [ -f "$workspace/logs/native-minio-mc.log" ]; then
+      cat "$workspace/logs/native-minio-mc.log" >&2
+    fi
     return 1
   fi
-  "$fixture_bin/mc" --config-dir "$mc_config" alias set local "$minio_url" "$access_key" "$secret_key"
   "$fixture_bin/mc" --config-dir "$mc_config" mb --ignore-existing local/lockd-client-s3
   "$fixture_bin/mc" --config-dir "$mc_config" anonymous set none local/lockd-client-s3
 
   start_native_service lockd-disk-a env LOCKD_CONFIG_DIR="$disk_config" LOCKD_OTLP_ENDPOINT= \
-    "$lockd" --store "disk://$workspace/state/disk" --listen-proto tcp \
+    "$lockd" "${qrf_flags[@]}" --store "disk://$workspace/state/disk" --listen-proto tcp \
     --listen "127.0.0.1:$LOCKDC_DISK_A_PORT"
   start_native_service lockd-disk-b env LOCKD_CONFIG_DIR="$disk_config" LOCKD_OTLP_ENDPOINT= \
-    "$lockd" --store "disk://$workspace/state/disk" --listen-proto tcp \
+    "$lockd" "${qrf_flags[@]}" --store "disk://$workspace/state/disk" --listen-proto tcp \
     --listen "127.0.0.1:$LOCKDC_DISK_B_PORT"
   start_native_service lockd-s3 env LOCKD_CONFIG_DIR="$s3_config" LOCKD_OTLP_ENDPOINT= \
     LOCKD_S3_ACCESS_KEY_ID="$access_key" LOCKD_S3_SECRET_ACCESS_KEY="$secret_key" \
-    "$lockd" --store "s3://127.0.0.1:$LOCKDC_MINIO_API_PORT/lockd-client-s3/liblockdc?insecure=1&path-style=1" \
+    "$lockd" "${qrf_flags[@]}" --store "s3://127.0.0.1:$LOCKDC_MINIO_API_PORT/lockd-client-s3/liblockdc?insecure=1&path-style=1" \
     --listen-proto tcp --listen "127.0.0.1:$LOCKDC_S3_PORT"
   start_native_service lockd-mem env LOCKD_CONFIG_DIR="$mem_config" LOCKD_OTLP_ENDPOINT= \
-    "$lockd" --disable-mtls --connguard-enabled=false --store mem:// \
+    "$lockd" "${qrf_flags[@]}" --disable-mtls --connguard-enabled=false --store mem:// \
     --listen-proto unix --listen "$LOCKDC_E2E_MEM_SOCKET"
   native_mem_started=true
 }

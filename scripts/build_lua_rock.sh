@@ -62,6 +62,10 @@ detect_lockdc_release_target() {
       fi
       printf '%s-linux-%s' "$arch" "$libc"
       ;;
+    Darwin)
+      [ "$arch" = aarch64 ] || return 1
+      printf '%s' arm64-apple-darwin
+      ;;
     *)
       return 1
       ;;

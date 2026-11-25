@@ -512,6 +512,19 @@ static lc_pouch *churn_maintenance_owner(fixture *f, lc_error *e) {
   return worker;
 }
 
+static void churn_wait_checkpoint(ps_space *space, lc_error *e) {
+  double start = real_clock(CLOCK_MONOTONIC);
+  for (;;) {
+    ps_stats stats;
+    ok(ps_status(space, &stats, e), e);
+    if (stats.checkpoints)
+      return;
+    REQUIRE(real_clock(CLOCK_MONOTONIC) - start < 24);
+    const struct timespec pause = {0, 100000000};
+    (void)nanosleep(&pause, NULL);
+  }
+}
+
 static void shared_autonomous_capacity(const char *directory, int codec,
                                        int sync, int unpaced) {
   enum { CYCLES = 16, BURST = 4 };
@@ -547,6 +560,10 @@ static void shared_autonomous_capacity(const char *directory, int codec,
 
   for (uint64_t cycle = 1; cycle <= CYCLES; ++cycle) {
     size_t writer = cycle % 2, peer = 1 - writer;
+    /* Keep the final write outstanding until the real worker has published
+     * a checkpoint, even on hosts that finish a burst within one poll. */
+    if (unpaced && cycle == CYCLES)
+      churn_wait_checkpoint(space, &e);
     double cycle_start = real_clock(CLOCK_MONOTONIC);
     snprintf(scenario, sizeof(scenario), "codec=%d sync=%d cycle=%llu", codec,
              sync, (unsigned long long)cycle);
@@ -727,7 +744,9 @@ static void shared_concurrent_capacity(const char *directory, int codec,
     gate_destroy(&lanes[i].first_read);
   }
   double work = real_clock(CLOCK_MONOTONIC) - started;
-  ok(ps_status(ps_root_space(ps_pouch_state_root(worker)), &stats, &e), &e);
+  ps_space *space = ps_root_space(ps_pouch_state_root(worker));
+  churn_wait_checkpoint(space, &e);
+  ok(ps_status(space, &stats, &e), &e);
   REQUIRE(stats.capacity == PS_DEFAULT_CAPACITY && stats.checkpoints > 0);
   lc_pouch_close(worker);
   for (size_t i = 0; i < 2; ++i) {

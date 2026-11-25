@@ -763,10 +763,15 @@ function(lc_add_release_privacy_scan target)
 endfunction()
 
 function(lc_add_build_tree_shared_dependency_lookup target)
-    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD|Darwin)$")
         return()
     endif()
+    get_target_property(target_type ${target} TYPE)
+    if(target_type STREQUAL "EXECUTABLE" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(${target} PRIVATE "LINKER:--disable-new-dtags")
+    endif()
     foreach(lockdc_external_library_dir
+        "${LOCKDC_EXTERNAL_ROOT}/cpkt/install/lib"
         "${LOCKDC_EXTERNAL_ROOT}/curl/install/lib"
         "${LOCKDC_EXTERNAL_ROOT}/openssl/install/lib"
         "${LOCKDC_EXTERNAL_ROOT}/nghttp2/install/lib"
@@ -776,7 +781,12 @@ function(lc_add_build_tree_shared_dependency_lookup target)
         "${LOCKDC_EXTERNAL_ROOT}/libssh2/install/lib"
         "${LOCKDC_EXTERNAL_ROOT}/zlib/install/lib"
     )
-        if(EXISTS "${lockdc_external_library_dir}")
+        if(NOT EXISTS "${lockdc_external_library_dir}")
+            continue()
+        endif()
+        if(target_type STREQUAL "EXECUTABLE")
+            set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "${lockdc_external_library_dir}")
+        elseif(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
             target_link_options(${target} INTERFACE
                 "$<BUILD_INTERFACE:LINKER:-rpath-link,${lockdc_external_library_dir}>"
             )

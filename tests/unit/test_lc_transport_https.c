@@ -159,7 +159,7 @@ typedef struct https_testserver {
   size_t handled_count;
   long response_delay_ms;
   int allow_response_write_failure;
-  volatile sig_atomic_t stop_requested;
+  int stop_requested;
   char failure_message[1024];
 } https_testserver;
 
@@ -1344,9 +1344,12 @@ static void *https_testserver_main(void *context) {
     addr_len = (socklen_t)sizeof(addr);
     client_fd =
         accept(server->listener_fd, (struct sockaddr *)&addr, &addr_len);
+    if (__atomic_load_n(&server->stop_requested, __ATOMIC_ACQUIRE)) {
+      if (client_fd >= 0)
+        close(client_fd);
+      break;
+    }
     if (client_fd < 0) {
-      if (server->stop_requested)
-        break;
       set_failure(server, "accept failed: %s", strerror(errno));
       break;
     }
@@ -1683,10 +1686,19 @@ static void https_testserver_stop(https_testserver *server) {
  * connection. Wake its blocking accept without classifying that designed early
  * stop as a server failure. */
 static void https_testserver_stop_early(https_testserver *server) {
-  if (server->listener_fd >= 0) {
-    server->stop_requested = 1;
-    (void)shutdown(server->listener_fd, SHUT_RDWR);
-  }
+  struct sockaddr_in address = {0};
+  int rc;
+  int wake = socket(AF_INET, SOCK_STREAM, 0);
+  assert_true(wake >= 0);
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server->port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  __atomic_store_n(&server->stop_requested, 1, __ATOMIC_RELEASE);
+  do {
+    rc = connect(wake, (struct sockaddr *)&address, sizeof(address));
+  } while (rc < 0 && errno == EINTR);
+  assert_true(rc == 0 || errno == ECONNREFUSED);
+  assert_int_equal(close(wake), 0);
   https_testserver_stop(server);
 }
 

@@ -5399,6 +5399,13 @@ test_marker_refresh_uses_directory_fast_path_and_force(void **state) {
   make_peer_marker_path(root, "default", "writer-000000000009.marker",
                         peer_path, sizeof(peer_path));
   write_text_file(peer_path, "writer_pid=9\nsequence=1\n");
+  /* Give the directory a distinct seconds-resolution timestamp even when
+   * the filesystem leaves its directory size unchanged across creations. */
+  char *markers = lc_pouch_path_join(NULL, namespace_path, "markers");
+  struct timespec updated[] = {{0, UTIME_OMIT}, {before_dir.mtime + 1, 0}};
+  assert_non_null(markers);
+  assert_int_equal(utimensat(AT_FDCWD, markers, updated, 0), 0);
+  lc_free_with_allocator(NULL, markers);
   rc = lc_pouch_namespace_marker_directory_snapshot_read(NULL, namespace_path,
                                                          &after_dir, &error);
   assert_int_equal(rc, LC_OK);
@@ -24330,8 +24337,10 @@ test_client_queue_mutations_touch_notification_marker(void **state) {
   char root[512];
   char endpoint[560];
   char marker_path[1024];
+#ifdef __linux__
   uint64_t enqueue_sequence;
   uint64_t dequeue_sequence;
+#endif
   int rc;
 
   (void)state;
@@ -24360,9 +24369,14 @@ test_client_queue_mutations_touch_notification_marker(void **state) {
 
   make_queue_notify_path(root, "team/notify", "jobs-main", marker_path,
                          sizeof(marker_path));
+#ifdef __linux__
   assert_file_contains(marker_path, "queue=jobs-main");
   enqueue_sequence = read_marker_sequence(marker_path, NULL);
   assert_true(enqueue_sequence > (uint64_t)0U);
+#else
+  assert_int_equal(access(marker_path, F_OK), -1);
+  assert_int_equal(errno, ENOENT);
+#endif
 
   dequeue_req.ns = "team/notify";
   dequeue_req.queue = "jobs-main";
@@ -24371,8 +24385,13 @@ test_client_queue_mutations_touch_notification_marker(void **state) {
   rc = client->dequeue(client, &dequeue_req, &message, &error);
   assert_int_equal(rc, LC_OK);
   assert_non_null(message);
+#ifdef __linux__
   dequeue_sequence = read_marker_sequence(marker_path, NULL);
   assert_true(dequeue_sequence > enqueue_sequence);
+#else
+  assert_int_equal(access(marker_path, F_OK), -1);
+  assert_int_equal(errno, ENOENT);
+#endif
 
   message->close(message);
   lc_enqueue_res_cleanup(&enqueue_res);

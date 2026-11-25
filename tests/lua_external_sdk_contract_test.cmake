@@ -84,7 +84,7 @@ execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
         "PATH=${fake_path}"
         "LOCKDC_PREFIX=${fake_prefix}"
-        /bin/sh "${script_path}" /bin/true "" -shared o so "${LOCKDC_ROOT}/include" "${LOCKDC_VERSION}"
+        bash "${script_path}" /bin/true "" -shared o so "${LOCKDC_ROOT}/include" "${LOCKDC_VERSION}"
     WORKING_DIRECTORY "${LOCKDC_ROOT}"
     RESULT_VARIABLE static_only_result
     OUTPUT_VARIABLE static_only_stdout

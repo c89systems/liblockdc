@@ -1734,7 +1734,7 @@ static int queue_watch_e2e_handler(void *context, const lc_watch_event *event,
   }
   if (event->available) {
     watch->available_count += 1;
-    watch->saw_available = 1;
+    __atomic_store_n(&watch->saw_available, 1, __ATOMIC_RELEASE);
     if (event->head_message_id != NULL) {
       snprintf(watch->head_message_id, sizeof(watch->head_message_id), "%s",
                event->head_message_id);
@@ -1748,7 +1748,7 @@ static int queue_watch_e2e_handler(void *context, const lc_watch_event *event,
     return 0;
   } else {
     watch->unavailable_count += 1;
-    watch->saw_unavailable = 1;
+    __atomic_store_n(&watch->saw_unavailable, 1, __ATOMIC_RELEASE);
     if (event->head_message_id != NULL) {
       snprintf(watch->unavailable_head_message_id,
                sizeof(watch->unavailable_head_message_id), "%s",
@@ -1802,6 +1802,17 @@ static void *queue_watch_e2e_enqueue_thread(void *arg) {
   return NULL;
 }
 
+static int queue_watch_e2e_wait(const int *seen, lc_error *error) {
+  for (unsigned attempt = 0; attempt < 500; ++attempt) {
+    if (__atomic_load_n(seen, __ATOMIC_ACQUIRE))
+      return LC_OK;
+    usleep(10000U);
+  }
+  error->code = LC_ERR_TRANSPORT;
+  error->message = strdup("queue watcher did not observe the previous state");
+  return LC_ERR_TRANSPORT;
+}
+
 static void *queue_watch_e2e_enqueue_dequeue_thread(void *arg) {
   queue_watch_e2e_context *watch;
   lc_client *client;
@@ -1822,12 +1833,13 @@ static void *queue_watch_e2e_enqueue_dequeue_thread(void *arg) {
   lc_enqueue_req_init(&enqueue_req);
   lc_dequeue_req_init(&dequeue_req);
   memset(&enqueue_res, 0, sizeof(enqueue_res));
-  usleep(200000U);
-
   open_tcp_client(watch->endpoint, watch->bundle_path, &client,
                   &watch->enqueue_error);
-  watch->enqueue_rc = lc_source_from_memory(payload, sizeof(payload), &src,
-                                            &watch->enqueue_error);
+  watch->enqueue_rc =
+      queue_watch_e2e_wait(&watch->saw_unavailable, &watch->enqueue_error);
+  if (watch->enqueue_rc == LC_OK)
+    watch->enqueue_rc = lc_source_from_memory(payload, sizeof(payload), &src,
+                                              &watch->enqueue_error);
   if (watch->enqueue_rc == LC_OK) {
     enqueue_req.queue = watch->queue_name;
     enqueue_req.content_type = "text/plain";
@@ -1841,8 +1853,11 @@ static void *queue_watch_e2e_enqueue_dequeue_thread(void *arg) {
   }
   lc_enqueue_res_cleanup(&enqueue_res);
 
-  if (watch->enqueue_rc == LC_OK) {
-    usleep(200000U);
+  watch->dequeue_rc = watch->enqueue_rc;
+  if (watch->dequeue_rc == LC_OK)
+    watch->dequeue_rc =
+        queue_watch_e2e_wait(&watch->saw_available, &watch->dequeue_error);
+  if (watch->dequeue_rc == LC_OK) {
     dequeue_req.queue = watch->queue_name;
     dequeue_req.owner = "lc-e2e-watch-worker";
     dequeue_req.visibility_timeout_seconds = 30L;
@@ -1853,8 +1868,6 @@ static void *queue_watch_e2e_enqueue_dequeue_thread(void *arg) {
       watch->dequeue_rc = message->ack(message, &watch->dequeue_error);
       message = NULL;
     }
-  } else {
-    watch->dequeue_rc = watch->enqueue_rc;
   }
 
   if (message != NULL) {

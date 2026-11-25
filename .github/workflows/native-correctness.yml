@@ -10,7 +10,6 @@ permissions:
 
 env:
   LOCKDC_CTEST_PARALLEL_LEVEL: "1"
-  LOCKDC_TMP_AUTO_CLEANUP_STALE_SECONDS: "-1"
   HOMEBREW_NO_AUTO_UPDATE: "1"
 
 jobs:
@@ -118,6 +117,7 @@ jobs:
           bash scripts/deps.sh "$DEPS"
           cmake --preset "$PRESET" -B build/native-correctness \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLOCKDC_DIST_DIR="$PWD/build/native-correctness/dist" \
             -DLOCKDC_BUILD_E2E_TESTS=ON -DLOCKDC_E2E_LUA_BUILD_TREE=ON \
             -DLOCKDC_BUILD_EXAMPLES=ON \
             -DLOCKDC_BUILD_BENCHMARKS=ON -DLOCKDC_INSTALL=ON \
@@ -126,7 +126,7 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then
             probe="$PWD/build/native-correctness/experiments/pouch_space/pouch_space_platform_test"
             volume=$("$probe" --describe-volume "$PWD/build/tmp")
-            printf 'Test source %s on %s / %s\n' "$GITHUB_SHA" "$ARCH" "$volume"
+            printf 'Test source %s on %s / %s\n' "$GITHUB_SHA" "$(uname -m)" "$volume"
             case "$volume" in
               'filesystem=apfs '*) ;;
               *) echo 'The native test directory must be on APFS' >&2; exit 1 ;;

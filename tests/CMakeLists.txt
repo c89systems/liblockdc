@@ -234,7 +234,7 @@ set_tests_properties(bootlin_toolchain_contract_test PROPERTIES
   TIMEOUT 10
 )
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSROOT)
   add_test(NAME bootlin_development_runtime_contract_test
     COMMAND "${CMAKE_COMMAND}"
       -DLOCKDC_BINARY_DIR=${CMAKE_BINARY_DIR}

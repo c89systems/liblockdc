@@ -978,6 +978,27 @@ static void stream_verify_records(fixture *f, size_t records) {
   lc_collection_read_res_cleanup(&result);
 }
 static void stream_verify(fixture *f) { stream_verify_records(f, 1); }
+
+static uint64_t stream_materialized_bytes(int fd, off_t size) {
+  static const unsigned char zero[4096];
+  unsigned char page[sizeof(zero)];
+  uint64_t bytes = 0;
+  for (off_t at = 0; at < size;) {
+    size_t count = (size - at < (off_t)sizeof(page))
+                       ? (size_t)(size - at)
+                       : sizeof(page);
+    ssize_t got;
+    do {
+      got = pread(fd, page, count, at);
+    } while (got < 0 && errno == EINTR);
+    assert_int_equal(got, (ssize_t)count);
+    if (memcmp(page, zero, count))
+      bytes += count;
+    at += (off_t)count;
+  }
+  return bytes;
+}
+
 #ifdef __linux__
 static unsigned long long stream_io(const char *wanted) {
   FILE *fp = fopen("/proc/self/io", "r");
@@ -1054,6 +1075,8 @@ static void run_stream_allocation_guard(fixture *f, int conversion) {
     if (!conversion)
       assert_true(handle->head.active > 1);
     status_is(f, req.append_id, LC_COLLECTION_APPEND_ABSENT);
+    uint64_t before_bytes =
+        stream_materialized_bytes(handle->active_fd, before.st_size);
 #ifdef __linux__
     unsigned long long reads = stream_io("rchar:"),
                        writes = stream_io("wchar:");
@@ -1064,10 +1087,10 @@ static void run_stream_allocation_guard(fixture *f, int conversion) {
     assert_true(stream_io("wchar:") - writes < 131072);
 #endif
     assert_int_equal(fstat(handle->active_fd, &after), 0);
-    /* A final bounded codec fragment may reserve a sparse canonical range.
-     * Its address space is not a payload copy: guard allocated blocks as well
-     * as the actual process reads/writes above. */
-    assert_true((after.st_blocks - before.st_blocks) * 512 < 131072);
+    /* Count pages with actual encoded data. Block accounting can also
+     * include speculative or unwritten reservations on an open file. */
+    assert_true(stream_materialized_bytes(handle->active_fd, after.st_size) <
+                before_bytes + 131072);
     assert_int_equal(result.bytes, STREAM_BYTES + 8);
     lc_collection_writer_close(f->pending);
     f->pending = NULL;
