@@ -181,9 +181,11 @@ int ps_owned_write_suffix(ps_owned_head *, ps_owned_run *, uint64_t offset,
                           const void *, size_t, lc_error *);
 /* Independently checked finalized bytes for bounded relocation. The identity
  * header is immutable; its separate completion footer joins canonical byte
- * readiness, without a per-record ownership journal event. Caller excludes
- * writes to [0, bytes) while completing/checking it. scratch has PS_CHUNK
- * bytes. Canonical grants can span up to PS_STREAM_PIECE_BYTES physical bytes.
+ * readiness, without a per-record ownership journal event. A partial piece
+ * can store its footer just after the completed bytes on the same page.
+ * Caller excludes writes to [0, bytes) while completing/checking it.
+ * scratch has PS_CHUNK bytes. Canonical grants can span up to
+ * PS_STREAM_PIECE_BYTES physical bytes.
  * Other owned users may retain larger grants and do not use this
  * capability. Inspect validates the footer only; verify also reads and checks
  * those bytes. Uncovered recovery may rebuild a footer after canonical
@@ -214,6 +216,11 @@ int ps_owned_piece_inspect_initial(ps_owned_run *, uint64_t bytes,
                                    lc_error *);
 int ps_owned_piece_verify(ps_owned_run *, uint64_t bytes, void *scratch,
                           lc_error *);
+/* Copy the checked tail footer into the fixed header for a compact sealed
+ * read. pre_sync reports whether the fixed copy is the only valid proof. */
+int ps_owned_piece_anchor_footer(ps_owned_run *, uint64_t bytes,
+                                 const ps_piece_checksum *, int *pre_sync,
+                                 lc_error *);
 /* Clear an owned unpublished suffix, preserving reservation and bytes outside
  * the range. scratch points to PS_CHUNK bytes for the bounded fallback. */
 int ps_owned_clear(ps_owned_run *, uint64_t offset, uint64_t bytes,
@@ -247,6 +254,7 @@ int ps_owned_recovered(ps_owned_head *, uint64_t tail, lc_error *);
  * head removal and atomically retires its complete run directory. Held handles
  * retain payload pins through durable root retirement. */
 int ps_owned_seal(ps_owned_head *, lc_error *);
+int ps_owned_seal_prepared(ps_owned_head *, int pre_sync, lc_error *);
 /* Revalidate absence of durable catalog references/views and exclude new
  * bindings until this exclusive owner closes. Used before cascading a closed
  * logical owner's child metadata; failure never authorizes child removal.

@@ -709,11 +709,25 @@ static int stream_transition_begin(ps_stream *s, int retirement,
 }
 static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
   ps_coordination_guard *edit = NULL;
+  ps_owned_mapping run;
+  size_t at;
+  int pre_sync = 0;
   int rc = stream_transition_begin(s, retirement, &edit, error);
   if (rc != LC_OK)
     return rc;
-  rc = retirement ? ps_owned_retire(s->head, error)
-                  : ps_owned_seal(s->head, error);
+  if (retirement)
+    rc = ps_owned_retire(s->head, error);
+  else {
+    if (!s->sealed && s->tail &&
+        stream_mapping_next(s, s->tail - 1, &run, &at)) {
+      if (run.base < s->tail)
+        rc = ps_owned_piece_anchor_footer(run.handle, s->tail - run.base,
+                                          &s->checksum, &pre_sync, error);
+      ps_owned_run_close(run.handle);
+    }
+    if (rc == LC_OK)
+      rc = ps_owned_seal_prepared(s->head, pre_sync, error);
+  }
   return stream_transition_end(s, edit, retirement, rc, error);
 }
 int ps_stream_seal(ps_stream *s, lc_error *error) {

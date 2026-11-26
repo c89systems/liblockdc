@@ -7709,7 +7709,7 @@ static void stream_header_capture(int durable) {
   stream_recovery recovery = {0};
   char *body = malloc(PS_CHUNK);
   char last;
-  off_t partial = 0;
+  off_t partial = 0, alternate = 0;
   REQUIRE(body);
   memset(body, 'a', PS_CHUNK);
   options.durable_sync = durable;
@@ -7731,8 +7731,10 @@ static void stream_header_capture(int durable) {
               probe.count < sizeof(probe.offsets) / sizeof(probe.offsets[0]));
       probe.offsets[probe.count++] = (off_t)p->extents[0].offset;
       if (p->key.key < info.tail &&
-          p->stream.run->capacity > info.tail - p->key.key)
+          p->stream.run->capacity > info.tail - p->key.key) {
         partial = (off_t)p->extents[0].offset;
+        alternate = partial + PS_RUN_HEADER + (off_t)(info.tail - p->key.key);
+      }
     }
   REQUIRE(probe.count == info.runs && probe.count > 1 && partial);
   ok(ps_stream_close(stream, &e), &e);
@@ -7792,18 +7794,28 @@ static void stream_header_capture(int durable) {
   }
   allocation_fail = 0;
 
-  /* Both checks still apply to a live join, including the sealed partial run.
-   */
+  /* Reject a damaged identity or the loss of both sealed footer copies. */
   for (size_t i = 0; i < 2; ++i) {
     off_t at = partial + (i ? PS_RUN_IDENTITY_BYTES : 0);
-    unsigned char original, damaged;
+    unsigned char original, damaged, other = 0;
     REQUIRE(pread(writer->fd, &original, 1, at) == 1);
     damaged = original ^ 1;
     REQUIRE(pwrite(writer->fd, &damaged, 1, at) == 1);
+    if (i) {
+      ok(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
+                        &stream, &e),
+         &e);
+      ok(ps_stream_close(stream, &e), &e);
+      REQUIRE(pread(writer->fd, &other, 1, alternate) == 1 && other == 'L');
+      damaged = other ^ 1;
+      REQUIRE(pwrite(writer->fd, &damaged, 1, alternate) == 1);
+    }
     REQUIRE(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
                            &stream, &e) == LC_ERR_PROTOCOL &&
             !stream);
     lc_error_cleanup(&e);
+    if (i)
+      REQUIRE(pwrite(writer->fd, &other, 1, alternate) == 1);
     REQUIRE(pwrite(writer->fd, &original, 1, at) == 1);
   }
   ok(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,

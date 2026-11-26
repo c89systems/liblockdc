@@ -7669,6 +7669,111 @@ static ps_space *piece_reopen(int durable, const ps_io *io) {
   OK(ps_open(path, 0, &options, &space, &error));
   return space;
 }
+static void piece_tail_footer(int fixed_footer) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *space;
+  ps_stream *stream;
+  ps_stream_info info;
+  ps_stats stats;
+  unsigned char body[2 * PS_PAGE + 80];
+  unsigned char footer[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES];
+  uint64_t first, next, tail, base, physical, fixed;
+  const ps_entry *piece;
+  int fd;
+  memset(body, 0x65, sizeof(body));
+  clean();
+  space = create(3 * PS_MIB, 1, &io);
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  OK(canonical_append(stream, body, sizeof(body), 317, 1, &first, &error));
+  OK(ps_stream_status(stream, &info, &error));
+  CHECK(info.runs == 2);
+  tail = info.tail;
+  base = PS_PAGE - PS_RUN_HEADER;
+  piece =
+      ps_internal_lookup(space, key(PS_OWNED_RUN, info.ref.incarnation, base));
+  CHECK(piece && piece->count == 1);
+  physical = piece->extents[0].offset + PS_RUN_HEADER + tail - base;
+  fixed = piece->extents[0].offset + PS_RUN_IDENTITY_BYTES;
+  OK(ps_checkpoint(space, &error));
+  CHECK(physical + sizeof(footer) <= m.stable_bytes);
+  CHECK(!memcmp(m.stable + physical, "LCPSPIEC", 8) &&
+        memcmp(m.stable + fixed, "LCPSPIEC", 8));
+  memcpy(footer, m.stable + physical, sizeof(footer));
+  if (fixed_footer) {
+    /* An existing file may have its partial checksum at the old position. */
+    memcpy(m.stable + fixed, footer, sizeof(footer));
+    memset(m.stable + physical, 0, sizeof(footer));
+  } else {
+    m.fail_sync_at = m.syncs + 1;
+    CHECK(canonical_append(stream, body, 64, 7, 2, &next, &error) ==
+          LC_ERR_TRANSPORT);
+    CHECK(next == tail && m.syncs == m.fail_sync_at);
+    lc_error_cleanup(&error);
+    m.fail_sync_at = 0;
+    /* Keep only the new record header. The interrupted append has destroyed
+     * the previous checksum, while its own canonical record is incomplete. */
+    fd = open(path, O_RDONLY);
+    CHECK(fd >= 0 && pread(fd, m.stable + physical, sizeof(footer),
+                           (off_t)physical) == sizeof(footer));
+    CHECK(close(fd) == 0 &&
+          memcmp(footer, m.stable + physical, sizeof(footer)));
+  }
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  crash(&m);
+  space = piece_reopen(1, &io);
+  stream = stream_open(space, 1, 0, &info.ref, NULL);
+  OK(ps_stream_status(stream, &info, &error));
+  CHECK(info.tail == tail);
+  stream_expect(stream, first, body, sizeof(body), 1);
+  OK(canonical_append(stream, body, 64, 7, 3, &next, &error));
+  CHECK(next == tail);
+  OK(ps_status(space, &stats, &error));
+  if (fixed_footer) {
+    /* With the adjacent footer missing, stabilize the fixed copy before
+     * selecting it. The appender still has the checked checksum in memory. */
+    unsigned char zero[sizeof(footer)] = {0};
+    fd = open(path, O_RDWR);
+    CHECK(fd >= 0 && pwrite(fd, zero, sizeof(zero),
+                            (off_t)(physical + 64 + 43)) == sizeof(zero));
+    CHECK(close(fd) == 0);
+    size_t syncs = m.syncs;
+    OK(ps_stream_seal(stream, &error));
+    CHECK(m.syncs == syncs + 2);
+  } else {
+    /* Persist the seal event before its new fixed footer. The earlier
+     * durability barrier already covered the tail and its adjacent proof. */
+    uint64_t journal =
+        PS_JOURNAL_OFFSET +
+        (space->journal_start + stats.journal_bytes) % PS_JOURNAL;
+    CHECK(journal + 80 <= PS_DATA);
+    m.fail_sync_at = m.syncs + 1;
+    CHECK(ps_stream_seal(stream, &error) == LC_ERR_TRANSPORT &&
+          m.syncs == m.fail_sync_at);
+    lc_error_cleanup(&error);
+    m.fail_sync_at = 0;
+    fd = open(path, O_RDONLY);
+    CHECK(fd >= 0 && pread(fd, m.stable + journal, 80, (off_t)journal) == 80);
+    CHECK(close(fd) == 0 && memcmp(m.stable + fixed, "LCPSPIEC", 8));
+  }
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  crash(&m);
+  space = piece_reopen(1, &io);
+  m.read_bytes = 0;
+  stream = stream_open(space, 1, 0, &info.ref, NULL);
+  OK(ps_stream_status(stream, &info, &error));
+  CHECK(info.sealed &&
+        m.read_bytes ==
+            info.runs * PS_RUN_HEADER + (!fixed_footer ? sizeof(footer) : 0));
+  stream_expect(stream, first, body, sizeof(body), 1);
+  stream_expect(stream, next, body, 64, 3);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  free(m.stable);
+  clean();
+}
 static void piece_incremental(int durable) {
   model m;
   ps_io io = model_init(&m);
@@ -8096,6 +8201,8 @@ static int run_portable_case(const char *mode) {
     bounded_pieces(0, 0);
     bounded_pieces(0, 1);
     bounded_pieces(1, 1);
+    piece_tail_footer(0);
+    piece_tail_footer(1);
     piece_incremental(0);
     piece_incremental(1);
     append_growth_high_water();

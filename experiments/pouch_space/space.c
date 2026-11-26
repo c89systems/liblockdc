@@ -11260,6 +11260,35 @@ static int owned_piece_crc(ps_space *s, uint64_t offset, uint64_t length,
   }
   return LC_OK;
 }
+#define PS_PIECE_RECONSTRUCTED (((lc_u64)1) << 63)
+static uint64_t piece_tail_footer(uint64_t offset, uint64_t capacity,
+                                  uint64_t bytes) {
+  uint64_t tail = offset + PS_RUN_HEADER + bytes, page_offset = tail % PS_PAGE;
+  size_t footer_bytes = PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES;
+  /* Keep the footer on a page already dirtied by the append. */
+  return tail - offset > PS_PAGE && page_offset &&
+                 page_offset <= PS_PAGE - footer_bytes &&
+                 capacity - bytes >= footer_bytes
+             ? tail
+             : 0;
+}
+static void piece_footer_encode(unsigned char *footer, uint64_t bytes,
+                                uint64_t incarnation, uint32_t crc,
+                                int reconstructed) {
+  memcpy(footer, "LCPSPIEC", 8);
+  ps_wire_put64(footer + 8,
+                bytes | (reconstructed ? PS_PIECE_RECONSTRUCTED : 0));
+  ps_wire_put32(footer + 16, crc);
+  ps_wire_put64(footer + 20, incarnation);
+  ps_wire_put32(footer + 28, checksum(footer, 28));
+}
+static int piece_footer_matches(const unsigned char *footer, uint64_t bytes,
+                                uint64_t incarnation) {
+  return !memcmp(footer, "LCPSPIEC", 8) &&
+         (ps_wire_get64(footer + 8) & ~PS_PIECE_RECONSTRUCTED) == bytes &&
+         ps_wire_get64(footer + 20) == incarnation &&
+         ps_wire_get32(footer + 28) == checksum(footer, 28);
+}
 static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
                        int operation, uint64_t prior,
                        const ps_piece_checksum *prefix, ps_piece_checksum *out,
@@ -11267,10 +11296,9 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
                        lc_error *error) {
   unsigned char footer[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES];
   ps_space *s;
-  uint64_t offset;
+  uint64_t offset, adjacent;
   uint32_t crc;
-  uint64_t reconstructed = ((lc_u64)1) << 63;
-  int rc;
+  int rc, found = 0;
   if (!run || !bytes || bytes > ps_owned_run_capacity(run) ||
       ps_owned_run_capacity(run) > PS_STREAM_PIECE_BYTES ||
       (operation && !scratch && !suffix) || prior > bytes ||
@@ -11293,6 +11321,7 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
     return rc;
   }
   offset = run->entry->extents[0].offset;
+  adjacent = piece_tail_footer(offset, ps_owned_run_capacity(run), bytes);
   rc = healthy(s, error);
   if (rc == LC_OK && operation == 2) {
     crc = prior ? prefix->crc : 0;
@@ -11302,15 +11331,11 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
       rc = owned_piece_crc(s, offset + PS_RUN_HEADER + prior, bytes - prior,
                            scratch, &crc, error);
     if (rc == LC_OK) {
-      memcpy(footer, "LCPSPIEC", 8);
-      ps_wire_put64(footer + 8,
-                    bytes |
-                        (prefix && prefix->reconstructed ? reconstructed : 0));
-      ps_wire_put32(footer + 16, crc);
-      ps_wire_put64(footer + 20, run->entry->token);
-      ps_wire_put32(footer + 28, checksum(footer, 28));
-      rc = transfer(s, footer, sizeof(footer), offset + PS_RUN_IDENTITY_BYTES,
-                    1, error);
+      piece_footer_encode(footer, bytes, run->entry->token, crc,
+                          prefix && prefix->reconstructed);
+      rc = transfer(s, footer, sizeof(footer),
+                    adjacent ? adjacent : offset + PS_RUN_IDENTITY_BYTES, 1,
+                    error);
       if (rc == LC_OK && out) {
         out->crc = crc;
         out->reconstructed = prefix && prefix->reconstructed;
@@ -11318,19 +11343,26 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
     }
     return rc;
   }
-  if (rc == LC_OK) {
-    if (captured)
-      memcpy(footer, captured->bytes, sizeof(footer));
-    else
-      rc = transfer(s, footer, sizeof(footer), offset + PS_RUN_IDENTITY_BYTES,
-                    0, error);
+  if (rc == LC_OK && captured &&
+      piece_footer_matches(captured->bytes, bytes, run->entry->token)) {
+    memcpy(footer, captured->bytes, sizeof(footer));
+    found = 1;
   }
-  if (rc == LC_OK && (memcmp(footer, "LCPSPIEC", 8) ||
-                      (ps_wire_get64(footer + 8) & ~reconstructed) != bytes ||
-                      ps_wire_get64(footer + 20) != run->entry->token ||
-                      ps_wire_get32(footer + 28) != checksum(footer, 28)))
+  if (rc == LC_OK && !found && adjacent) {
+    rc = transfer(s, footer, sizeof(footer), adjacent, 0, error);
+    found =
+        rc == LC_OK && piece_footer_matches(footer, bytes, run->entry->token);
+  }
+  if (rc == LC_OK && !found && !captured) {
+    rc = transfer(s, footer, sizeof(footer), offset + PS_RUN_IDENTITY_BYTES, 0,
+                  error);
+    found =
+        rc == LC_OK && piece_footer_matches(footer, bytes, run->entry->token);
+  }
+  if (rc == LC_OK && !found)
     rc = err(error, LC_ERR_PROTOCOL, "invalid finalized piece checksum footer");
-  if (rc == LC_OK && operation && (ps_wire_get64(footer + 8) & reconstructed))
+  if (rc == LC_OK && operation &&
+      (ps_wire_get64(footer + 8) & PS_PIECE_RECONSTRUCTED))
     rc = lc_error_set(error, LC_ERR_INVALID, 0,
                       "reconstructed piece needs canonical body validation",
                       NULL, "pouch_piece_needs_validation", "pouch-space");
@@ -11343,7 +11375,8 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
   }
   if (rc == LC_OK && out) {
     out->crc = ps_wire_get32(footer + 16);
-    out->reconstructed = (ps_wire_get64(footer + 8) & reconstructed) != 0;
+    out->reconstructed =
+        (ps_wire_get64(footer + 8) & PS_PIECE_RECONSTRUCTED) != 0;
   }
   return rc;
 }
@@ -11377,6 +11410,32 @@ int ps_owned_piece_inspect_initial(ps_owned_run *run, uint64_t bytes,
 int ps_owned_piece_verify(ps_owned_run *run, uint64_t bytes, void *scratch,
                           lc_error *error) {
   return owned_piece(run, bytes, scratch, 1, 0, NULL, NULL, NULL, NULL, error);
+}
+int ps_owned_piece_anchor_footer(ps_owned_run *run, uint64_t bytes,
+                                 const ps_piece_checksum *proof, int *pre_sync,
+                                 lc_error *error) {
+  unsigned char footer[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES],
+      adjacent_footer[sizeof(footer)];
+  uint64_t offset, adjacent;
+  int rc;
+  if (ps_owned_run_mapped(run))
+    return LC_OK;
+  offset = run->entry->extents[0].offset;
+  adjacent = piece_tail_footer(offset, ps_owned_run_capacity(run), bytes);
+  if (!adjacent)
+    return LC_OK;
+  piece_footer_encode(footer, bytes, run->entry->token, proof->crc,
+                      proof->reconstructed);
+  rc = transfer(run->space, adjacent_footer, sizeof(adjacent_footer), adjacent,
+                0, error);
+  if (rc == LC_OK)
+    rc = transfer(run->space, footer, sizeof(footer),
+                  offset + PS_RUN_IDENTITY_BYTES, 1, error);
+  /* If the append proof was cleared, the fixed copy must be durable before
+   * the seal can select it. Otherwise either location can survive the seal. */
+  if (rc == LC_OK)
+    *pre_sync = memcmp(footer, adjacent_footer, sizeof(footer)) != 0;
+  return rc;
 }
 typedef struct piece_selection {
   ps_owned_head *head;
@@ -11850,7 +11909,7 @@ int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
   }
   return rc;
 }
-int ps_owned_seal(ps_owned_head *head, lc_error *error) {
+int ps_owned_seal_prepared(ps_owned_head *head, int pre_sync, lc_error *error) {
   ps_space *s;
   ps_entry snapshot;
   ps_stream_state stream_snapshot;
@@ -11875,7 +11934,7 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
     return rc;
   /* Any valid seal event may recover before its acknowledgement. Its final
    * canonical tail must already be durable, even if journal bytes reorder. */
-  if (needs_sync)
+  if (needs_sync || pre_sync)
     rc = sync_file(s, error);
   if (rc != LC_OK)
     return rc;
@@ -11902,6 +11961,9 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc == LC_OK && sequence ? wait_durable(s, sequence, error) : rc;
+}
+int ps_owned_seal(ps_owned_head *head, lc_error *error) {
+  return ps_owned_seal_prepared(head, 0, error);
 }
 int ps_owned_claim_orphan(ps_owned_head *head, lc_error *error) {
   ps_space *s;

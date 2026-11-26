@@ -61,6 +61,13 @@ coverage before exposing them. Shared reopen can reuse a durable namespace
 checkpoint for a recovered tail within its coverage when the piece footers
 are intact. Reconstructed footers keep the recovery sync requirement, including
 on retry after an interrupted repair.
+When a partial piece's footer fits after the completed bytes on the last
+written page, the append can avoid rewriting the piece's first page. A later
+append can replace that footer. Recovery accepts the last complete canonical
+tail and rebuilds its footer if interrupted. Full pieces retain fixed footers.
+Sealing stores the final footer in its fixed position so a sealed stream
+normally reads only the piece headers. An interrupted seal can use the
+tail-adjacent footer if the fixed copy was lost.
 Owners that reopen using a proof acquire an incarnation range on first use.
 On an exclusive root, the first namespace creation can share a barrier with
 its new incarnation range. Recovery admits the catalog entry only when the
