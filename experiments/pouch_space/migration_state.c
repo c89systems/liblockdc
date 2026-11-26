@@ -1,3 +1,4 @@
+#include "collections.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_outbox_store.h"
@@ -74,6 +75,9 @@ static int import_namespace(void *context, const char *ns, lc_error *e) {
   lc_pouch_retention_work_cleanup(work->source, &retention);
   if (rc == LC_OK)
     rc = lc_pouch_outbox_markers_import(work->source, work->target, ns, e);
+  if (rc == LC_OK)
+    rc = ps_pouch_import_legacy_collections(work->source, work->target,
+                                            work->destination, ns, e);
   if (work->destination) {
     ps_namespace_release(work->destination);
     work->destination = NULL;
@@ -81,13 +85,12 @@ static int import_namespace(void *context, const char *ns, lc_error *e) {
   return rc;
 }
 
-int ps_pouch_import_legacy_state(lc_pouch *source, lc_pouch *target,
-                                 lc_error *e) {
+int ps_pouch_import_legacy(lc_pouch *source, lc_pouch *target, lc_error *e) {
   state_import work;
   if (!source || source->storage.ops || !source->single_writer ||
       !ps_pouch_state_root(target) || !target->single_writer)
     return lc_error_set(e, LC_ERR_INVALID, 0,
-                        "state import requires exclusively owned legacy and "
+                        "import requires exclusively owned legacy and "
                         "container roots",
                         NULL, NULL, "pouch");
   work.source = source;

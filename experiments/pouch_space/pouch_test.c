@@ -7,6 +7,7 @@
 #include "fixture_barriers.h"
 #include "frame.h"
 #include "lc_api_internal.h"
+#include "lc_collection_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
 #include "namespace.h"
@@ -7797,7 +7798,7 @@ static void legacy_state_import(const char *path, const char *directory) {
        &e);
 
     ok(ps_pouch_state_open(path, 1, &allocator, &o, &target, &e), &e);
-    ok(ps_pouch_import_legacy_state(source_pouch, target, &e), &e);
+    ok(ps_pouch_import_legacy(source_pouch, target, &e), &e);
     ok(target->storage.ops->flush(target->storage.context, &e), &e);
     lc_pouch_close(target);
     lc_pouch_close(source_pouch);
@@ -7844,6 +7845,98 @@ static void legacy_state_import(const char *path, const char *directory) {
   lc_error_cleanup(&e);
 }
 
+static void legacy_collection_import(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int codec = 0; codec < 4; ++codec) {
+    ps_pouch_state_options o = options(codec, 0);
+    char legacy[1400], *endpoint = NULL;
+    const char *endpoints[1];
+    lc_client_config config;
+    lc_collection_config collection_config;
+    lc_collection_head_res before, after;
+    lc_collection_append_req append = {0};
+    lc_collection_append_res result;
+    lc_collection_read_res rows;
+    lc_pouch_maintenance_result maintenance = {0};
+    lc_client *client = NULL;
+    lc_collection *collection = NULL;
+    lc_pouch *source_pouch = NULL, *target = NULL;
+    lc_source *body = NULL;
+    lc_sink *sink = NULL;
+    const void *bytes;
+    size_t length;
+
+    REQUIRE(snprintf(legacy, sizeof(legacy), "%s/legacy-%d", directory, codec) <
+            (int)sizeof(legacy));
+    ok(lc_pouch_endpoint_build(legacy, NULL, 0, &endpoint, &e), &e);
+    endpoints[0] = endpoint;
+    lc_client_config_init(&config);
+    config.allocator = allocator;
+    config.endpoints = endpoints;
+    config.endpoint_count = 1;
+    config.pouch_compression = o.logical.compression;
+    config.pouch_crypto_key = o.logical.crypto_key;
+    ok(lc_client_open(&config, &client, &e), &e);
+    lc_collection_config_init(&collection_config);
+    collection_config.ns = "tenant/log";
+    collection_config.name = "Journal";
+    ok(lc_client_create_collection(client, &collection_config, &collection, &e),
+       &e);
+    append.append_id = "snapshot-entry";
+    ok(lc_source_from_memory("{\"a\":1}", 7, &body, &e), &e);
+    ok(lc_collection_append_staged(collection, &append, body, &result, &e), &e);
+    lc_source_close(body);
+    REQUIRE(result.position == 1);
+    ok(lc_collection_compact(collection, 1, 0, &maintenance, &e), &e);
+    REQUIRE(maintenance.compacted);
+    lc_pouch_maintenance_result_cleanup(&allocator, &maintenance);
+    append.append_id = "tail-entry";
+    ok(lc_source_from_memory("{\"a\":2}", 7, &body, &e), &e);
+    ok(lc_collection_append(collection, &append, body, &result, &e), &e);
+    lc_source_close(body);
+    REQUIRE(result.position == 2);
+    ok(lc_collection_head(collection, &before, &e), &e);
+    lc_collection_close(collection);
+    lc_client_close(client);
+    lc_pouch_endpoint_free(endpoint);
+
+    ok(lc_pouch_open(legacy, &allocator, &o.logical, &source_pouch, &e), &e);
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &target, &e), &e);
+    ok(ps_pouch_import_legacy(source_pouch, target, &e), &e);
+    ok(target->storage.ops->flush(target->storage.context, &e), &e);
+    lc_pouch_close(target);
+    lc_pouch_close(source_pouch);
+    REQUIRE(!live);
+
+    ok(lc_pouch_endpoint_build(path, NULL, 0, &endpoint, &e), &e);
+    endpoints[0] = endpoint;
+    ok(ps_pouch_client_open(&config, 0, NULL, &client, &e), &e);
+    ok(lc_client_open_collection(client, &collection_config, &collection, &e),
+       &e);
+    ok(lc_collection_head(collection, &after, &e), &e);
+    REQUIRE(!strcmp(after.collection_id, before.collection_id) &&
+            after.upper_position == 2 && after.live_count == 2);
+    ok(lc_sink_to_memory(&sink, &e), &e);
+    lc_collection_read_res_init(&rows);
+    ok(lc_collection_read(collection, NULL, sink, &rows, &e), &e);
+    ok(lc_sink_memory_bytes(sink, &bytes, &length, &e), &e);
+    REQUIRE(length == 16 && !memcmp(bytes, "{\"a\":1}\n{\"a\":2}\n", length));
+    lc_collection_read_res_cleanup(&rows);
+    lc_sink_close(sink);
+    append.append_id = "snapshot-entry";
+    ok(lc_source_from_memory("{\"a\":1}", 7, &body, &e), &e);
+    ok(lc_collection_append_staged(collection, &append, body, &result, &e), &e);
+    lc_source_close(body);
+    REQUIRE(result.duplicate && result.position == 1);
+    lc_collection_close(collection);
+    lc_client_close(client);
+    lc_pouch_endpoint_free(endpoint);
+    REQUIRE(!live && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+
 typedef struct run {
   const char *path, *directory, *mode;
   int codec, profile, durable;
@@ -7854,6 +7947,8 @@ static void *worker(void *context) {
     lifecycle(r->path, r->directory);
   else if (!strcmp(r->mode, "legacy-state-import"))
     legacy_state_import(r->path, r->directory);
+  else if (!strcmp(r->mode, "legacy-collection-import"))
+    legacy_collection_import(r->path, r->directory);
   else if (!strcmp(r->mode, "shared-admission"))
     shared_admission(r->path);
   else if (!strcmp(r->mode, "shared-state"))

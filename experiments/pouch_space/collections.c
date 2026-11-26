@@ -1423,23 +1423,18 @@ static int load_owner(ps_namespace *ns, const char *name,
     owner_free(owner, 0);
   return rc;
 }
-static int create_owner(ps_namespace *ns, const lc_collection_config *config,
-                        const lc_allocator *allocator,
-                        ps_collection_owner **out, lc_error *e) {
-  ps_collection_owner *owner;
-  ps_collection_segment *segment = NULL;
-  lc_collection_disk_head head;
-  lc_pouch_unix_seconds now;
+static int create_identity(ps_collection_owner *owner, const char *id,
+                           lc_error *e) {
   unsigned char bytes[LC_COLLECTION_CATALOG_BYTES];
   lc_pouch_record_io output;
   struct iovec part;
-  int rc;
-  *out = NULL;
-  owner = allocate_owner(ns, config->name, allocator, e);
-  if (!owner)
-    return e->code;
-  rc = ps_catalog_allocate_id(space(owner), &owner->numeric, e);
-  if (rc == LC_OK)
+  int rc = ps_catalog_allocate_id(space(owner), &owner->numeric, e);
+  if (rc == LC_OK && id) {
+    if (!lc_xid_is_valid(id))
+      return failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
+                     "legacy collection identity is invalid");
+    memcpy(owner->id, id, sizeof(owner->id));
+  } else if (rc == LC_OK)
     rc = lc_xid_new(owner->id, e);
   if (rc == LC_OK)
     rc = lc_collection_catalog_encode(owner->id, owner->name, bytes, e);
@@ -1454,6 +1449,21 @@ static int create_owner(ps_namespace *ns, const lc_collection_config *config,
   }
   if (rc == LC_OK)
     rc = ps_collection_segment_seal(owner->identity, e);
+  return rc;
+}
+static int create_owner(ps_namespace *ns, const lc_collection_config *config,
+                        const lc_allocator *allocator,
+                        ps_collection_owner **out, lc_error *e) {
+  ps_collection_owner *owner;
+  ps_collection_segment *segment = NULL;
+  lc_collection_disk_head head;
+  lc_pouch_unix_seconds now;
+  int rc;
+  *out = NULL;
+  owner = allocate_owner(ns, config->name, allocator, e);
+  if (!owner)
+    return e->code;
+  rc = create_identity(owner, NULL, e);
   if (rc == LC_OK)
     rc = get_segment(owner, 1U, 1, &segment, e);
   memset(&head, 0, sizeof(head));
@@ -1477,6 +1487,86 @@ static int create_owner(ps_namespace *ns, const lc_collection_config *config,
     owner_free(owner, 1);
   return rc;
 }
+
+typedef struct collection_import {
+  ps_collection_owner *owner;
+  const lc_collection_disk_head *head;
+  unsigned char *buffer;
+} collection_import;
+
+static int import_part(void *context, lc_u64 id, lc_pouch_record_io input,
+                       uint64_t end, lc_error *e) {
+  collection_import *work = context;
+  collection_segment part = {0};
+  lc_pouch_record_io output;
+  struct iovec bytes;
+  uint64_t offset = 0;
+  int rc = open_segment(work->owner, id, 1, 0, &part, e);
+
+  if (rc == LC_OK)
+    output = ps_collection_segment_io(part.segment);
+  bytes.iov_base = work->buffer;
+  while (rc == LC_OK && offset < end) {
+    bytes.iov_len = end - offset > PS_CHUNK ? PS_CHUNK : (size_t)(end - offset);
+    rc = lc_pouch_record_io_read(input, offset, &bytes, 1, e);
+    if (rc == LC_OK)
+      rc = lc_pouch_record_io_append(output, &bytes, 1, e);
+    offset += bytes.iov_len;
+  }
+  if (rc == LC_OK && id != work->head->active)
+    rc = ps_collection_segment_seal(part.segment, e);
+  else if (rc == LC_OK)
+    rc = ps_collection_segment_publish(part.segment, PS_COMMIT_DEFAULT, e);
+  ps_collection_segment_close(part.segment);
+  return rc;
+}
+
+int ps_collection_import(lc_pouch *target, ps_namespace *ns, const char *name,
+                         const char *id, const lc_collection_disk_head *head,
+                         ps_collection_import_parts_fn parts, void *context,
+                         lc_error *e) {
+  ps_collection_owner *owner;
+  collection_import work;
+  ps_owned_status status;
+  lc_collection *check = NULL;
+  int rc;
+
+  owner = allocate_owner(ns, name, &target->allocator, e);
+  if (!owner)
+    return e->code;
+  work.owner = owner;
+  work.head = head;
+  work.buffer = lc_alloc_with_allocator(&target->allocator, PS_CHUNK);
+  rc = work.buffer ? LC_OK
+                   : failure(e, LC_ERR_NOMEM, NULL,
+                             "cannot allocate collection import buffer");
+  if (rc == LC_OK)
+    rc = create_identity(owner, id, e);
+  if (rc == LC_OK)
+    rc = parts(context, import_part, &work, e);
+  lc_free_with_allocator(&target->allocator, work.buffer);
+  if (rc == LC_OK)
+    rc = control_store(owner, head, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_COLLECTION, 0, e);
+  if (rc == LC_OK)
+    rc = ps_collection_segment_status(owner->identity, &status, NULL, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_put(space(owner), NULL, ns->identity.owner,
+                        PS_CATALOG_COLLECTION, name, strlen(name), NULL,
+                        key_for(owner, 0U), &status.ref, &owner->binding, e);
+  if (rc != LC_OK) {
+    owner_free(owner, 1);
+    return rc;
+  }
+  owner->published = 1;
+  cache_owner(owner);
+  rc = receiver_open(owner, target, NULL, 1, &check, e);
+  if (check)
+    check->close(check);
+  return rc;
+}
+
 static int stale(int rc, const lc_error *e) {
   return rc == LC_ERR_INVALID && e->server_code &&
          !strcmp(e->server_code, "collection_stale");
