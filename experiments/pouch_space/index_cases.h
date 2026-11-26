@@ -3,6 +3,7 @@
 #include "lc_pouch_index_store.h"
 #include "lc_pouch_query_index.h"
 #include "query_index.h"
+#include "wire.h"
 #include <zlib.h>
 #ifdef __SANITIZE_ADDRESS__
 extern int __lsan_do_recoverable_leak_check(void);
@@ -742,7 +743,86 @@ static void index_corrupt_generation(const char *directory) {
   }
   lc_error_cleanup(&e);
 }
+static unsigned char *index_generation_count(char *bytes, size_t length,
+                                             size_t which) {
+  unsigned char *packed = (unsigned char *)bytes;
+  REQUIRE(length >= 88 && memcmp(packed, "LPQISEG1", 8) == 0);
+  /* The exact-term generation follows the document table. */
+  size_t doc_bytes = (size_t)index_fixture_u64(packed + 24);
+  size_t term_bytes = (size_t)index_fixture_u64(packed + 32);
+  REQUIRE(doc_bytes <= length - 88 && term_bytes <= length - 88 - doc_bytes &&
+          term_bytes >= 65);
+  unsigned char *term = packed + 88 + doc_bytes;
+  REQUIRE(memcmp(term, "LPITGEN1", 8) == 0 && index_fixture_u64(term + 8) == 2);
+  size_t ns_bytes = (size_t)index_fixture_u64(term + 40);
+  REQUIRE(ns_bytes <= term_bytes - 57);
+  size_t offset = 49 + ns_bytes;
+  if (which == 0)
+    return term + offset;
+  uint64_t fields = index_fixture_u64(term + offset);
+  offset += 8;
+  for (uint64_t i = 0; i < fields; ++i) {
+    REQUIRE(term_bytes - offset >= 9);
+    size_t field_bytes = (size_t)index_fixture_u64(term + offset);
+    REQUIRE(field_bytes <= term_bytes - offset - 9);
+    offset += 9 + field_bytes;
+  }
+  REQUIRE(term_bytes - offset >= 16);
+  return term + offset + (which - 1) * 8;
+}
+static void index_malformed_generation_counts(const char *directory) {
+  char path[1400];
+  lc_error e = {0};
+  REQUIRE(snprintf(path, sizeof(path), "%s/index-generation-counts",
+                   directory) < (int)sizeof(path));
+  for (size_t which = 0; which < 3; ++which) {
+    lc_client *client = index_client(path, 0, 1, 1, NULL, &e);
+    index_seed(client, 0, &e);
+    ok(index_flush(client, &e), &e);
+    lc_pouch_generation sequence = 0;
+    ok(lc_pouch_state_query_index_seq(index_pouch(client), index_namespace,
+                                      &sequence, &e),
+       &e);
+    lc_pouch_index_artifact *packed = index_artifact(
+        client, index_namespace, LC_POUCH_INDEX_PACKED, sequence, &e);
+    char *bytes = NULL;
+    size_t length = 0;
+    int present = 0, valid = 0;
+    ok(lc_pouch_index_artifact_load(packed, 1, &bytes, &length, &present,
+                                    &valid, &e),
+       &e);
+    REQUIRE(present && valid && length < PS_MIB);
+    ps_wire_put64(index_generation_count(bytes, length, which), PS_MIB / 4);
+    /* Preserve the artifact envelope and checksum so the decoder reaches
+     * the malformed count. Limit allocator requests during the cold query. */
+    ok(lc_pouch_index_artifact_write(packed, bytes, length, 0, 1, &e), &e);
+    lc_pouch_index_signature malformed = {0};
+    ok(lc_pouch_index_artifact_signature(packed, &malformed, &e), &e);
+    REQUIRE(malformed.present);
+    lc_free_with_allocator(&allocator, bytes);
+    lc_free_with_allocator(&allocator, packed);
+    lc_client_close(client);
+    REQUIRE(!live);
+    client = index_client(path, 0, 0, 1, NULL, &e);
+    __atomic_store_n(&oversized_allocations, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&allocation_ceiling, PS_MIB, __ATOMIC_RELAXED);
+    REQUIRE(index_query(client, "index", index_selectors[0], &e) == 1U);
+    __atomic_store_n(&allocation_ceiling, 0, __ATOMIC_RELAXED);
+    REQUIRE(!__atomic_load_n(&oversized_allocations, __ATOMIC_RELAXED));
+    index_verify(client, 0, 1, &e);
+    packed = index_artifact(client, index_namespace, LC_POUCH_INDEX_PACKED,
+                            sequence, &e);
+    lc_pouch_index_signature rebuilt = {0};
+    ok(lc_pouch_index_artifact_signature(packed, &rebuilt, &e), &e);
+    REQUIRE(rebuilt.present && rebuilt.mtime != malformed.mtime);
+    lc_free_with_allocator(&allocator, packed);
+    lc_client_close(client);
+    REQUIRE(!live && !unlink(path));
+  }
+  lc_error_cleanup(&e);
+}
 static void index_lost_revision(const char *directory) {
+  index_malformed_generation_counts(directory);
   /* Persist complete descriptor writes even when their acknowledgement is
    * lost, while earlier query payload writes may disappear. Canonical state
    * remains authoritative and the first validating flush must rebuild. */

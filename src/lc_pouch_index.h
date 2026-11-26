@@ -408,6 +408,15 @@ typedef struct lc_pouch_index_term_limits {
   size_t max_terms;
   size_t max_term_bytes;
 } lc_pouch_index_term_limits;
+/* A V2 dictionary entry needs a length, a nonempty token and its NUL.
+ * The two generation counts follow the dictionary. */
+enum {
+  LC_POUCH_INDEX_TERM_FIELD_MIN_BYTES = 10U,
+  LC_POUCH_INDEX_TERM_COUNTS_BYTES = 16U
+};
+int lc_pouch_index_term_generation_counts_fit(uint64_t version, size_t bytes,
+                                              unsigned long terms,
+                                              unsigned long postings);
 /* Optional limits bound decoded dictionary/posting cardinality and expanded
  * field/value bytes before allocation, including dictionary expansion. Bounded
  * pages also require posting slots within expected_row_count. NULL retains

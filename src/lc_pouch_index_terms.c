@@ -1936,6 +1936,20 @@ static int lc_pouch_index_term_generation_decode_posting_bytes(
   return rc;
 }
 
+int lc_pouch_index_term_generation_counts_fit(uint64_t version, size_t bytes,
+                                              unsigned long terms,
+                                              unsigned long postings) {
+  /* Each term has an eight-byte ID and a one-byte type. V1 adds two
+   * length-prefixed strings with terminators. V2 adds a field ID and an
+   * encoding tag, with the three-byte trigram as its shortest value. */
+  size_t term_min =
+      version == LC_POUCH_INDEX_TERM_GENERATION_VERSION_V1 ? 27U : 21U;
+  /* A posting has four eight-byte fields and a one-byte kind. */
+  size_t posting_min = 33U;
+  return terms <= bytes / term_min && postings <= terms &&
+         postings <= (bytes - (size_t)terms * term_min) / posting_min;
+}
+
 int lc_pouch_index_term_generation_decode(
     const lc_allocator *allocator, const char *bytes, size_t length,
     uint64_t expected_index_seq, unsigned long expected_row_count,
@@ -2038,7 +2052,10 @@ int lc_pouch_index_term_generation_decode(
   if (rc == LC_OK && version == LC_POUCH_INDEX_TERM_GENERATION_VERSION_V2 &&
       field_count > 0UL) {
     if ((limits != NULL && field_count > limits->max_terms) ||
-        field_count > cursor.length - cursor.offset ||
+        cursor.length - cursor.offset < LC_POUCH_INDEX_TERM_COUNTS_BYTES ||
+        field_count >
+            (cursor.length - cursor.offset - LC_POUCH_INDEX_TERM_COUNTS_BYTES) /
+                LC_POUCH_INDEX_TERM_FIELD_MIN_BYTES ||
         field_count >
             (unsigned long)((size_t)-1 / sizeof(field_dictionary[0]))) {
       rc = lc_error_set(error, LC_ERR_INVALID, 0L,
@@ -2101,6 +2118,12 @@ int lc_pouch_index_term_generation_decode(
       (term_count > limits->max_terms || posting_count > limits->max_terms))
     rc = lc_error_set(error, LC_ERR_INVALID, 0L,
                       "pouch index term generation exceeds bounded term count",
+                      NULL, NULL, "pouch");
+  if (rc == LC_OK &&
+      !lc_pouch_index_term_generation_counts_fit(
+          version, cursor.length - cursor.offset, term_count, posting_count))
+    rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                      "pouch index term generation counts exceed its bytes",
                       NULL, NULL, "pouch");
   for (index = 0UL; rc == LC_OK && index < term_count; ++index) {
     const char *field_hex;

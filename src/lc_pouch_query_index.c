@@ -13151,6 +13151,10 @@ static int lc_pouch_query_index_generation_cache_parse(
   }
   if (version == LC_POUCH_INDEX_TERM_GENERATION_VERSION_V2) {
     if (!lc_pouch_query_index_binary_ulong(&cursor, &field_count) ||
+        cursor.length - cursor.offset < LC_POUCH_INDEX_TERM_COUNTS_BYTES ||
+        field_count >
+            (cursor.length - cursor.offset - LC_POUCH_INDEX_TERM_COUNTS_BYTES) /
+                LC_POUCH_INDEX_TERM_FIELD_MIN_BYTES ||
         field_count >
             (unsigned long)((size_t)-1 / sizeof(field_dictionary[0]))) {
       return LC_ERR_INVALID;
@@ -13184,8 +13188,9 @@ static int lc_pouch_query_index_generation_cache_parse(
     rc = LC_ERR_INVALID;
     goto cleanup;
   }
-  if (version == LC_POUCH_INDEX_TERM_GENERATION_VERSION_V2 &&
-      ((term_count == 0UL && field_count != 0UL) || field_count > term_count)) {
+  if (field_count > term_count ||
+      !lc_pouch_index_term_generation_counts_fit(
+          version, cursor.length - cursor.offset, term_count, posting_count)) {
     rc = LC_ERR_INVALID;
     goto cleanup;
   }

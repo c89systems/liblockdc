@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 static size_t checks, allocation, live;
+static size_t allocation_ceiling, oversized_allocations;
 static size_t fail_at __attribute__((unused));
 static int armed;
 #define REQUIRE(x)                                                             \
@@ -78,6 +79,11 @@ typedef union header {
   } value;
 } header;
 static void *allocate(void *context, size_t n) {
+  size_t ceiling = __atomic_load_n(&allocation_ceiling, __ATOMIC_RELAXED);
+  if (ceiling && n >= ceiling) {
+    __atomic_add_fetch(&oversized_allocations, 1, __ATOMIC_RELAXED);
+    return NULL;
+  }
   header *h = malloc(sizeof(*h) + n);
   (void)context;
   if (!h)
