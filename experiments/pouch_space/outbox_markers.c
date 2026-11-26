@@ -13,6 +13,7 @@ typedef struct marker_store {
   char **names;
   size_t count, capacity, cursor;
 } marker_store;
+enum { HISTORY_MARKER = LC_POUCH_RETENTION_KIND_COUNT };
 static int failure(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0L, message, NULL, NULL, "pouch");
 }
@@ -28,7 +29,7 @@ int ps_outbox_marker_enter(ps_namespace *ns, int kind, const char *name,
   int rc = LC_OK;
   if (out)
     *out = NULL;
-  if (!ns || !name || !name[0] || !out || kind < -1 || kind > 3)
+  if (!ns || !name || !name[0] || !out || kind < -1 || kind > HISTORY_MARKER)
     return failure(e, LC_ERR_INVALID, "invalid outbox marker authority");
   pthread_mutex_lock(&ns->outbox);
   for (gate = ns->outbox_writers; gate; gate = gate->next)
@@ -267,14 +268,15 @@ static int close_store(void *context, lc_error *e) {
   lc_free_with_allocator(&a, store);
   return LC_OK;
 }
-int ps_outbox_markers_open(ps_root *root, const char *ns, int kind, int create,
-                           lc_pouch_outbox_store *out, lc_error *e) {
+static int marker_store_open(ps_root *root, const char *ns, int kind,
+                             int create, lc_pouch_outbox_store *out,
+                             lc_error *e) {
   static const lc_pouch_outbox_store_ops operations = {
       next, read_marker, write_marker, remove_marker, close_store};
   marker_store *store;
   int rc;
   memset(out, 0, sizeof(*out));
-  if (!root || !ns || !ns[0] || kind < -1 || kind > 3)
+  if (!root || !ns || !ns[0])
     return failure(e, LC_ERR_INVALID, "invalid container outbox marker store");
   store = lc_calloc_with_allocator(&root->crypto_allocator, 1U, sizeof(*store));
   if (!store)
@@ -295,4 +297,34 @@ int ps_outbox_markers_open(ps_root *root, const char *ns, int kind, int create,
   } else
     (void)close_store(store, NULL);
   return rc;
+}
+
+int ps_outbox_markers_open(ps_root *root, const char *ns, int kind, int create,
+                           lc_pouch_outbox_store *out, lc_error *e) {
+  if (kind < -1 || kind >= LC_POUCH_RETENTION_KIND_COUNT)
+    return failure(e, LC_ERR_INVALID, "invalid container outbox marker kind");
+  return marker_store_open(root, ns, kind, create, out, e);
+}
+
+int ps_history_markers_open(ps_root *root, const char *ns, int create,
+                            lc_pouch_outbox_store *out, lc_error *e) {
+  return marker_store_open(root, ns, HISTORY_MARKER, create, out, e);
+}
+
+static int history_marker_present(void *context, const void *name,
+                                  size_t length, const ps_catalog_info *info,
+                                  lc_error *e) {
+  const unsigned char *bytes = name;
+  (void)info;
+  (void)e;
+  if (length && bytes[0] == HISTORY_MARKER + 1)
+    *(int *)context = 1;
+  return LC_OK;
+}
+
+int ps_history_markers_present(ps_namespace *ns, int *present, lc_error *e) {
+  *present = 0;
+  return ps_catalog_visit(ns->root->space, ns->identity.owner,
+                          PS_CATALOG_MARKER, history_marker_present, present,
+                          e);
 }

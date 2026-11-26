@@ -1,6 +1,7 @@
 #include "lc_api_internal.h"
 #include "lc_intcompat.h"
 #include "namespace_internal.h"
+#include "outbox_markers.h"
 #include "space_internal.h"
 #include <string.h>
 static int failure(lc_error *, const char *);
@@ -303,9 +304,14 @@ int ps_ns_reclaim_before_append(struct ps_namespace_data *d, lc_error *e) {
   lc_error local = {0};
   unsigned int retired;
   size_t i, count = 0;
-  int rc = LC_OK, done;
+  int rc, done, history;
   if (!e)
     e = &local;
+  rc = ps_history_markers_present(d->ns, &history, e);
+  if (rc != LC_OK || history) {
+    lc_error_cleanup(&local);
+    return rc;
+  }
   pthread_mutex_lock(&d->mutex);
   for (i = 0; i < d->count; ++i) {
     ps_ns_resource *source = d->items[i];

@@ -7943,6 +7943,159 @@ static void legacy_collection_import(const char *path, const char *directory) {
   lc_error_cleanup(&e);
 }
 
+typedef struct history_observation {
+  ps_namespace *ns;
+  unsigned int generations;
+  int metadata;
+} history_observation;
+
+static int check_history_source(void *context,
+                                const ps_namespace_source *source,
+                                lc_error *e) {
+  history_observation *history = context;
+  ps_namespace_window *window = NULL;
+  lc_pouch_state_entry record = {0};
+  unsigned char *scratch = NULL;
+  ps_frame frame;
+  uint64_t next;
+  int found, truncated;
+  if (source->kind != PS_CATALOG_SEGMENT || !source->tail)
+    return LC_OK;
+  ok(ps_namespace_read_open(history->ns, source->kind, source->id, 0,
+                            source->tail, &window, e),
+     e);
+  lc_pouch_record_io io = ps_namespace_read_input(window);
+  ok(ps_frame_read(io, 0, source->tail, &scratch, &frame, e), e);
+  REQUIRE(frame.framed);
+  ok(lc_pouch_state_record_read(io, &allocator, source->leaf, frame.start,
+                                frame.end, 0, 0, NULL, &record, &next, &found,
+                                &truncated, e),
+     e);
+  REQUIRE(found && !truncated);
+  if (!record.control && !strcmp(record.key, "versioned")) {
+    REQUIRE(record.payload_span.present);
+    if (record.record_type == LC_POUCH_STATE_RECORD_STATE_META)
+      history->metadata = 1;
+    else if (record.version == 1 || record.version == 2)
+      history->generations |= 1U << record.version;
+  }
+  lc_pouch_state_entry_cleanup(&allocator, &record);
+  lc_free_with_allocator(NULL, scratch);
+  ps_namespace_read_close(window);
+  return LC_OK;
+}
+
+static void legacy_history_import(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int codec = 0; codec <= 3; codec += 3) {
+    char legacy[1400], *endpoint = NULL;
+    const char *endpoints[1];
+    lc_pouch_settings settings;
+    lc_client_config config;
+    ps_pouch_state_options o = options(codec, 0);
+    lc_client *client = NULL;
+    lc_pouch *source_pouch, *target = NULL;
+    lc_history_consumer *consumer = NULL;
+    lc_history_consumer_config history_config;
+    lc_history_consumer_position position;
+    lc_pouch_state_write_result w = {0};
+    lc_pouch_state_write_options meta = {0};
+    lc_pouch_maintenance_options maintenance = {0};
+    lc_pouch_maintenance_result pass = {0};
+    history_observation history = {0};
+    input in = source(65569, 1);
+    lc_pouch_generation original;
+    const char *ns = "history/ns";
+
+    REQUIRE(snprintf(legacy, sizeof(legacy), "%s/legacy-%d", directory, codec) <
+            (int)sizeof(legacy));
+    ok(lc_pouch_endpoint_build(legacy, NULL, 0, &endpoint, &e), &e);
+    endpoints[0] = endpoint;
+    lc_client_config_init(&config);
+    lc_pouch_settings_init(&settings);
+    settings.set_mask = LC_POUCH_SETTING_SEGMENT_TARGET_BYTES |
+                        LC_POUCH_SETTING_BACKGROUND_COMPACTION |
+                        LC_POUCH_SETTING_QUERY_INDEXING;
+    o.logical.segment_target_bytes = settings.segment_target_bytes = 1;
+    config.pouch_settings = &settings;
+    config.allocator = allocator;
+    config.endpoints = endpoints;
+    config.endpoint_count = 1;
+    config.pouch_compression = o.logical.compression;
+    config.pouch_crypto_key = o.logical.crypto_key;
+    ok(lc_client_open(&config, &client, &e), &e);
+    source_pouch = ((lc_client_handle *)client)->pouch;
+    ok(put(source_pouch, ns, "versioned", &in, NULL, &w, &e), &e);
+    original = w.index_seq;
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+
+    lc_history_consumer_config_init(&history_config);
+    history_config.ns = ns;
+    history_config.consumer_id = "replica/a";
+    history_config.initial_acknowledged_index_seq = original;
+    ok(lc_client_new_history_consumer(client, &history_config, &consumer, &e),
+       &e);
+    lc_history_consumer_close(consumer);
+    in = source(31, 2);
+    ok(put(source_pouch, ns, "versioned", &in, NULL, &w, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    meta.has_metadata = 1;
+    meta.metadata = (const unsigned char *)"tag";
+    meta.metadata_length = 3;
+    ok(lc_pouch_state_update_metadata(source_pouch, ns, "versioned", &meta, &w,
+                                      &e),
+       &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &target, &e), &e);
+    ok(ps_pouch_import_legacy(source_pouch, target, &e), &e);
+    ok(target->storage.ops->flush(target->storage.context, &e), &e);
+    lc_pouch_close(target);
+    lc_client_close(client);
+    lc_pouch_endpoint_free(endpoint);
+    REQUIRE(!live);
+
+    ok(lc_pouch_endpoint_build(path, NULL, 0, &endpoint, &e), &e);
+    endpoints[0] = endpoint;
+    ok(ps_pouch_client_open(&config, 0, NULL, &client, &e), &e);
+    target = ((lc_client_handle *)client)->pouch;
+    history_config.initial_acknowledged_index_seq = 0;
+    ok(lc_client_new_history_consumer(client, &history_config, &consumer, &e),
+       &e);
+    ok(lc_history_consumer_get_position(consumer, &position, &e), &e);
+    REQUIRE(position.acknowledged_index_seq == original &&
+            position.current_index_seq > original);
+    maintenance.ns = ns;
+    maintenance.force = 1;
+    ok(lc_pouch_maintenance_run(target, &maintenance, &pass, &e), &e);
+    REQUIRE(pass.skipped &&
+            !strcmp(pass.diagnostic, "history-consumer-behind"));
+    lc_pouch_maintenance_result_cleanup(&allocator, &pass);
+    ok(ps_root_namespace_acquire(ps_pouch_state_root(target), ns, 0,
+                                 &history.ns, &e),
+       &e);
+    ok(ps_namespace_sources_visit(history.ns, check_history_source, &history,
+                                  &e),
+       &e);
+    REQUIRE(history.generations == 6 && history.metadata);
+    ps_namespace_release(history.ns);
+    read_value(target, ns, "versioned", 31, 2, 2, &e);
+    ok(lc_history_consumer_advance(consumer, position.current_index_seq,
+                                   &position, &e),
+       &e);
+    ok(lc_pouch_maintenance_run(target, &maintenance, &pass, &e), &e);
+    REQUIRE(pass.compacted && !pass.skipped);
+    lc_pouch_maintenance_result_cleanup(&allocator, &pass);
+    ok(lc_history_consumer_unregister(consumer, &e), &e);
+    lc_history_consumer_close(consumer);
+    lc_client_close(client);
+    lc_pouch_endpoint_free(endpoint);
+    REQUIRE(!live && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+
 typedef struct run {
   const char *path, *directory, *mode;
   int codec, profile, durable;
@@ -7955,6 +8108,8 @@ static void *worker(void *context) {
     legacy_state_import(r->path, r->directory);
   else if (!strcmp(r->mode, "legacy-collection-import"))
     legacy_collection_import(r->path, r->directory);
+  else if (!strcmp(r->mode, "legacy-history-import"))
+    legacy_history_import(r->path, r->directory);
   else if (!strcmp(r->mode, "shared-admission"))
     shared_admission(r->path);
   else if (!strcmp(r->mode, "shared-state"))

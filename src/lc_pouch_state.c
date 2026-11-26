@@ -8766,7 +8766,9 @@ static int lc_pouch_state_record_append_inner(
       (request->record_type != LC_POUCH_STATE_RECORD_STATE_PUT &&
        request->record_type != LC_POUCH_STATE_RECORD_OBJECT_PUT &&
        !(expected && request->record_type == expected->record_type &&
-         (request->record_type == LC_POUCH_COLLECTION_EDIT_BODY ||
+         (request->record_type == LC_POUCH_STATE_RECORD_STATE_LINK ||
+          request->record_type == LC_POUCH_STATE_RECORD_STATE_META ||
+          request->record_type == LC_POUCH_COLLECTION_EDIT_BODY ||
           request->record_type == LC_POUCH_COLLECTION_EDIT))))
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch state append requires PUT inputs and authority",
@@ -8873,6 +8875,10 @@ static int lc_pouch_state_record_append_inner(
   if (rc == LC_OK)
     rc = lc_pouch_state_meta_set_lifetime(meta, meta_length, request->lifetime,
                                           error);
+  if (rc == LC_OK && request->object_link &&
+      (request->record_type == LC_POUCH_STATE_RECORD_STATE_LINK ||
+       request->record_type == LC_POUCH_STATE_RECORD_STATE_META))
+    meta[60] |= LC_POUCH_STATE_PAYLOAD_FLAG_OBJECT_LINK;
   if (rc == LC_OK && meta_length != reserved_metadata)
     rc = lc_error_set(error, LC_ERR_PROTOCOL, 0,
                       "converted metadata changed reservation size", NULL, NULL,
@@ -9048,10 +9054,10 @@ int lc_pouch_state_record_recode_bound(const lc_allocator *allocator,
   lc_free_with_allocator(allocator, metadata);
   return rc;
 }
-int lc_pouch_state_record_recode(
+static int lc_pouch_state_record_recode_impl(
     const lc_allocator *allocator, lc_pouch_crypto *crypto,
     lc_pouch_record_io input_io, lc_pouch_record_io output, const char *leaf,
-    const lc_pouch_state_entry *entry, const char *binding,
+    const lc_pouch_state_entry *entry, const char *binding, int preserve_type,
     lc_pouch_state_entry *result, lc_error *error) {
   lc_pouch_state_recode_input input;
   lc_pouch_crypto_reader *reader = NULL;
@@ -9095,7 +9101,7 @@ int lc_pouch_state_record_recode(
   input.decoded = decoded;
   request = *entry;
   request.record_type =
-      entry->record_type == LC_POUCH_COLLECTION_EDIT_BODY ||
+      preserve_type || entry->record_type == LC_POUCH_COLLECTION_EDIT_BODY ||
               entry->record_type == LC_POUCH_COLLECTION_EDIT
           ? entry->record_type
       : lc_pouch_state_record_type_is_object(entry->record_type) ||
@@ -9110,6 +9116,24 @@ done:
   lc_pouch_crypto_reader_close(reader);
   lc_error_cleanup(&local);
   return rc;
+}
+
+int lc_pouch_state_record_recode(
+    const lc_allocator *allocator, lc_pouch_crypto *crypto,
+    lc_pouch_record_io input, lc_pouch_record_io output, const char *leaf,
+    const lc_pouch_state_entry *entry, const char *binding,
+    lc_pouch_state_entry *result, lc_error *error) {
+  return lc_pouch_state_record_recode_impl(
+      allocator, crypto, input, output, leaf, entry, binding, 0, result, error);
+}
+
+int lc_pouch_state_record_import_history(
+    const lc_allocator *allocator, lc_pouch_crypto *crypto,
+    lc_pouch_record_io input, lc_pouch_record_io output, const char *leaf,
+    const lc_pouch_state_entry *entry, const char *binding,
+    lc_pouch_state_entry *result, lc_error *error) {
+  return lc_pouch_state_record_recode_impl(
+      allocator, crypto, input, output, leaf, entry, binding, 1, result, error);
 }
 
 static int lc_pouch_state_read_next_record(
@@ -10409,7 +10433,88 @@ static int lc_pouch_legacy_visit_entry(lc_pouch *pouch, const char *ns,
   return rc;
 }
 
+typedef struct lc_pouch_legacy_history {
+  lc_pouch *pouch;
+  const char *ns;
+  const char *namespace_path;
+  lc_pouch_namespace_logstore *cache;
+  lc_pouch_legacy_state_visit_fn visit;
+  void *context;
+} lc_pouch_legacy_history;
+
+static int lc_pouch_legacy_history_file(lc_pouch_legacy_history *history,
+                                        const char *directory, const char *leaf,
+                                        int active, lc_error *error) {
+  lc_pouch *pouch = history->pouch;
+  lc_pouch_state_entry entry = {0};
+  char *path;
+  FILE *file = NULL;
+  struct stat info;
+  int rc = LC_OK;
+
+  path = lc_pouch_state_child_path(&pouch->allocator, history->namespace_path,
+                                   directory, leaf);
+  if (!path)
+    return lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "cannot allocate legacy history path", NULL, NULL,
+                        "pouch");
+  file = fopen(path, "rb");
+  if (!file || fstat(fileno(file), &info) != 0 || !S_ISREG(info.st_mode) ||
+      info.st_size < 0)
+    rc =
+        lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                     "cannot open legacy history segment", path, NULL, "pouch");
+  while (rc == LC_OK) {
+    lc_pouch_state_cache_record *selected;
+    int found, truncated;
+    rc = lc_pouch_state_read_next_record(file, &pouch->allocator, leaf, active,
+                                         0, NULL, (uint64_t)info.st_size,
+                                         &entry, &found, &truncated, error);
+    if (rc != LC_OK || !found)
+      break;
+    rc = lc_pouch_state_cache_apply_entry(pouch, history->cache, &entry, 0,
+                                          error);
+    if (rc != LC_OK)
+      break;
+    if (!entry.control && !entry.has_query_index_seq) {
+      selected = lc_pouch_state_cache_record_find(history->cache, entry.key);
+      entry.has_query_index_seq = 1;
+      entry.query_index_seq = selected ? selected->query_index_seq : 0;
+    }
+    rc = lc_pouch_legacy_visit_entry(pouch, history->ns,
+                                     history->namespace_path, &entry,
+                                     history->visit, history->context, error);
+  }
+  lc_pouch_state_entry_cleanup(&pouch->allocator, &entry);
+  if (file)
+    fclose(file);
+  lc_free_with_allocator(&pouch->allocator, path);
+  return rc;
+}
+
+static int lc_pouch_legacy_history_visit(lc_pouch_legacy_history *history,
+                                         lc_pouch_namespace_manifest *manifest,
+                                         lc_error *error) {
+  unsigned long i;
+  int rc = LC_OK;
+  if (manifest->latest_snapshot)
+    rc = lc_pouch_legacy_history_file(history, "snapshots",
+                                      manifest->latest_snapshot, 0, error);
+  for (i = 0; rc == LC_OK && i < manifest->segment_count; ++i) {
+    const char *leaf = manifest->segment_leaves[i];
+    if (lc_pouch_state_manifest_segment_visible(manifest, leaf))
+      rc = lc_pouch_legacy_history_file(
+          history, "segments", leaf,
+          lc_pouch_state_manifest_segment_allows_tail_repair(manifest, leaf),
+          error);
+  }
+  if (manifest->state_max_version > history->cache->max_version)
+    history->cache->max_version = manifest->state_max_version;
+  return rc;
+}
+
 int lc_pouch_legacy_state_visit(lc_pouch *pouch, const char *ns,
+                                int preserve_history,
                                 lc_pouch_legacy_state_visit_fn visit,
                                 void *context, lc_error *error) {
   lc_pouch_namespace_manifest manifest = {0};
@@ -10441,11 +10546,21 @@ int lc_pouch_legacy_state_visit(lc_pouch *pouch, const char *ns,
                         NULL, "pouch");
     lc_free_with_allocator(&pouch->allocator, path);
   }
-  if (rc == LC_OK)
+  if (rc == LC_OK && preserve_history) {
+    lc_pouch_legacy_history history;
+    history.pouch = pouch;
+    history.ns = ns;
+    history.namespace_path = manifest.namespace_path;
+    history.cache = &cache;
+    history.visit = visit;
+    history.context = context;
+    rc = lc_pouch_legacy_history_visit(&history, &manifest, error);
+  } else if (rc == LC_OK) {
     rc = lc_pouch_state_cache_refresh(pouch, &cache, &manifest, 1, error);
-  if (rc == LC_OK)
-    rc = lc_pouch_state_collect_decisions(pouch, &manifest, &cache, &decisions,
-                                          error);
+    if (rc == LC_OK)
+      rc = lc_pouch_state_collect_decisions(pouch, &manifest, &cache,
+                                            &decisions, error);
+  }
   if (rc == LC_OK) {
     entry.key = LC_POUCH_STATE_HIGH_WATER_KEY;
     entry.record_type = LC_POUCH_STATE_RECORD_HIGH_WATER;
@@ -10454,7 +10569,8 @@ int lc_pouch_legacy_state_visit(lc_pouch *pouch, const char *ns,
     entry.query_index_seq = cache.max_query_index_seq;
     rc = visit(context, &entry, no_body, NULL, error);
   }
-  for (record = lc_pouch_state_order_bound(&cache, NULL, 0);
+  for (record = preserve_history ? NULL
+                                 : lc_pouch_state_order_bound(&cache, NULL, 0);
        rc == LC_OK && record; record = lc_pouch_state_order_next(record)) {
     lc_pouch_state_entry_borrow_cache_record(record, &entry);
     rc = lc_pouch_legacy_visit_entry(pouch, ns, manifest.namespace_path, &entry,

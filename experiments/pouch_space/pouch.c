@@ -878,6 +878,11 @@ static const lc_pouch_index_store_ops *query_indexes(void *context,
   *out = owner->root;
   return &ps_query_index_store_ops;
 }
+static int history_markers_open(void *context, const char *ns, int create,
+                                lc_pouch_outbox_store *out, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return ps_history_markers_open(owner->root, ns, create, out, e);
+}
 static const lc_pouch_storage_ops storage_ops = {check,
                                                  flush,
                                                  namespace_open,
@@ -912,7 +917,8 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  &metadata_ops,
                                                  namespace_state_lock,
                                                  namespace_state_unlock,
-                                                 namespace_query_sequence};
+                                                 namespace_query_sequence,
+                                                 history_markers_open};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;

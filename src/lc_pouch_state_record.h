@@ -175,6 +175,13 @@ int lc_pouch_state_record_recode(const lc_allocator *, lc_pouch_crypto *,
                                  const lc_pouch_state_entry *,
                                  const char *binding_context,
                                  lc_pouch_state_entry *result, lc_error *);
+/* The same verified streaming copy with the original replay operation
+ * preserved. META and LINK carry their relocated payload inline. */
+int lc_pouch_state_record_import_history(
+    const lc_allocator *, lc_pouch_crypto *, lc_pouch_record_io input,
+    lc_pouch_record_io output, const char *output_leaf,
+    const lc_pouch_state_entry *, const char *binding_context,
+    lc_pouch_state_entry *result, lc_error *);
 
 /* Canonical checkpoint bytes, including HIGH_WATER and retained decisions.
  * Control records require NULL encoded input. Preserve resolved versions,
@@ -217,7 +224,7 @@ typedef int (*lc_pouch_legacy_state_visit_fn)(void *,
                                               const lc_pouch_state_entry *,
                                               lc_pouch_record_io, const char *,
                                               lc_error *);
-int lc_pouch_legacy_state_visit(lc_pouch *, const char *,
+int lc_pouch_legacy_state_visit(lc_pouch *, const char *, int preserve_history,
                                 lc_pouch_legacy_state_visit_fn, void *,
                                 lc_error *);
 

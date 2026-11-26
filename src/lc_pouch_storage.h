@@ -325,6 +325,9 @@ typedef struct lc_pouch_storage_ops {
    * Return nonzero only when the sequence is known, under the caller's
    * namespace projection authority. */
   int (*namespace_query_sequence)(void *, lc_pouch_generation *);
+  /* Durable acknowledgement records, serialized by namespace authority. */
+  int (*history_markers_open)(void *, const char *, int,
+                              struct lc_pouch_outbox_store *, lc_error *);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
   const lc_pouch_storage_ops *ops;

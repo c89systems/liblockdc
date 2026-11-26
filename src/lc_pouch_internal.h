@@ -565,6 +565,8 @@ int lc_pouch_history_oldest_acknowledged(lc_pouch *pouch, const char *ns,
                                          int *has_consumers,
                                          lc_pouch_generation *out,
                                          lc_error *error);
+int lc_pouch_history_import(lc_pouch *source, lc_pouch *target, const char *ns,
+                            lc_error *);
 /** Schedules derived index publication after a mutation. The queue and bounded
  * normalized projection never retain a document body, and a failed derived
  * publication cannot revoke an already durable mutation. */

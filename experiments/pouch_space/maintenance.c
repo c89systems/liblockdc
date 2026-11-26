@@ -3,6 +3,7 @@
 #include "lc_pouch_internal.h"
 #include "namespace.h"
 #include "namespace_work.h"
+#include "outbox_markers.h"
 #include "pouch_internal.h"
 #include <string.h>
 
@@ -85,9 +86,50 @@ static int candidate(void *context, const ps_namespace_source *source,
   w->bytes += bytes;
   return LC_OK;
 }
+static int history_pinned(compact *w, int *pinned, lc_error *e) {
+  lc_pouch_generation ack, current;
+  int found, rc = ps_history_markers_present(w->ns, &found, e);
+
+  *pinned = 0;
+  if (rc == LC_OK && found)
+    rc = lc_pouch_history_oldest_acknowledged(w->pouch, w->name, &found, &ack,
+                                              e);
+  if (rc == LC_OK && found) {
+    rc = lc_pouch_state_index_seq(w->pouch, w->name, &current, e);
+    if (rc == LC_OK)
+      *pinned = ack < current;
+  }
+  return rc;
+}
+
+static int require_history_releasable(compact *w, lc_error *e) {
+  int pinned, rc = history_pinned(w, &pinned, e);
+  if (rc == LC_OK && pinned)
+    rc = fail(e, LC_ERR_PENDING, "namespace history is pinned");
+  return rc;
+}
+
+typedef struct compact_piece {
+  compact *work;
+  ps_piece_publish_fn publish;
+  void *context;
+} compact_piece;
+
+static int select_piece(void *context, lc_error *e) {
+  compact_piece *piece = context;
+  int rc = require_history_releasable(piece->work, e);
+  if (rc == LC_OK)
+    rc = piece->publish(piece->context, e);
+  return rc;
+}
+
 static int select_logical(void *context, ps_piece_publish_fn publish,
                           void *publication, lc_error *e) {
-  return compact_namespace(context, publish, publication, e);
+  compact_piece piece;
+  piece.work = context;
+  piece.publish = publish;
+  piece.context = publication;
+  return compact_namespace(context, select_piece, &piece, e);
 }
 typedef struct retire_task {
   compact *work;
@@ -99,7 +141,9 @@ typedef struct retire_task {
 static int retire_locked(void *context, lc_error *e) {
   retire_task *task = context;
   compact *w = task->work;
-  int rc;
+  int rc = require_history_releasable(w, e);
+  if (rc != LC_OK)
+    return rc;
   if (task->active)
     return ps_namespace_unlink_active(w->ns, task->id, &task->retirement, e);
   if (ps_namespace_source_refs(w->ns, task->kind, task->id)) {
@@ -177,7 +221,7 @@ static int compact_locked(void *context, lc_error *e) {
   compact *w = context;
   uint64_t closed, pending, minimum_bytes;
   unsigned long minimum_segments;
-  int present, rc;
+  int present, rc, pinned;
   if (background_stopping(w))
     return stop_pending(e);
   rc = w->pouch->storage.ops->namespace_open(w->pouch->storage.context, w->name,
@@ -190,6 +234,13 @@ static int compact_locked(void *context, lc_error *e) {
                                e);
   if (rc == LC_OK)
     rc = ps_namespace_status_get(w->ns, &w->before, e);
+  if (rc == LC_OK)
+    rc = history_pinned(w, &pinned, e);
+  if (rc == LC_OK && pinned) {
+    w->result.skipped = 1;
+    w->reason = "history-consumer-behind";
+    return LC_OK;
+  }
   if (rc == LC_OK)
     rc = ps_namespace_reap(w->ns, &closed, &pending, e);
   if (rc != LC_OK)

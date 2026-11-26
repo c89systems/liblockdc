@@ -1,6 +1,7 @@
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
+#include "lc_pouch_outbox_store.h"
 #include "lc_pouch_path.h"
 
 #include <dirent.h>
@@ -11,6 +12,8 @@
 #include <unistd.h>
 
 #define LC_POUCH_HISTORY_MAGIC "LCH1"
+#define LC_POUCH_HISTORY_BYTES 64U
+#define LC_POUCH_HISTORY_CONSUMER_PREFIX "consumer:"
 
 struct lc_history_consumer_handle {
   lc_history_consumer pub;
@@ -119,7 +122,8 @@ static int lc_pouch_history_file_path(lc_pouch *pouch, const char *ns,
   if (rc != LC_OK) {
     return rc;
   }
-  consumer_name_size = strlen("consumer:") + strlen(consumer_id) + 1U;
+  consumer_name_size =
+      sizeof(LC_POUCH_HISTORY_CONSUMER_PREFIX) + strlen(consumer_id);
   consumer_name =
       (char *)lc_alloc_with_allocator(&pouch->allocator, consumer_name_size);
   if (consumer_name == NULL) {
@@ -129,7 +133,8 @@ static int lc_pouch_history_file_path(lc_pouch *pouch, const char *ns,
                         "failed to allocate pouch history consumer record",
                         NULL, NULL, "pouch");
   }
-  snprintf(consumer_name, consumer_name_size, "consumer:%s", consumer_id);
+  snprintf(consumer_name, consumer_name_size,
+           LC_POUCH_HISTORY_CONSUMER_PREFIX "%s", consumer_id);
   consumer_leaf = lc_pouch_path_escape_name(&pouch->allocator, consumer_name);
   lc_free_with_allocator(&pouch->allocator, consumer_name);
   *path_out =
@@ -364,30 +369,37 @@ static int lc_pouch_history_read(const char *path, int *found,
   return rc;
 }
 
+static int lc_pouch_history_encode(lc_index_seq seq,
+                                   char text[LC_POUCH_HISTORY_BYTES],
+                                   lc_error *error) {
+  char acknowledged[32];
+  int length;
+
+  if (lc_u64_format_base10((lc_u64)seq, acknowledged, sizeof(acknowledged)) < 0)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "failed to format pouch history consumer record", NULL,
+                        NULL, "pouch");
+  length = snprintf(text, LC_POUCH_HISTORY_BYTES,
+                    LC_POUCH_HISTORY_MAGIC "\nack=%s\n", acknowledged);
+  if (length < 0 || (size_t)length >= LC_POUCH_HISTORY_BYTES)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch history consumer record exceeds limit", NULL,
+                        NULL, "pouch");
+  return LC_OK;
+}
+
 static int lc_pouch_history_write(lc_pouch *pouch, const char *directory,
                                   const char *path,
                                   lc_index_seq acknowledged_index_seq,
                                   lc_error *error) {
-  char acknowledged[32];
-  char text[64];
+  char text[LC_POUCH_HISTORY_BYTES];
   char *staging_directory;
   char *staging_path;
   const char *leaf;
-  int rc;
+  int rc = lc_pouch_history_encode(acknowledged_index_seq, text, error);
 
-  if (lc_u64_format_base10((lc_u64)acknowledged_index_seq, acknowledged,
-                           sizeof(acknowledged)) < 0 ||
-      snprintf(text, sizeof(text), LC_POUCH_HISTORY_MAGIC "\nack=%s\n",
-               acknowledged) < 0) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "failed to format pouch history consumer record", NULL,
-                        NULL, "pouch");
-  }
-  if (strlen(text) >= sizeof(text)) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch history consumer record exceeds limit", NULL,
-                        NULL, "pouch");
-  }
+  if (rc != LC_OK)
+    return rc;
   leaf = strrchr(path, '/');
   leaf = leaf != NULL ? leaf + 1 : path;
   staging_directory = NULL;
@@ -439,24 +451,67 @@ static int lc_pouch_history_current_locked(lc_pouch *pouch, const char *ns,
   return rc;
 }
 
-int lc_pouch_history_oldest_acknowledged(lc_pouch *pouch, const char *ns,
-                                         int *has_consumers,
-                                         lc_pouch_generation *out,
-                                         lc_error *error) {
+typedef int (*lc_pouch_history_visit_fn)(void *, const char *, lc_index_seq,
+                                         lc_error *);
+
+static int history_store_open(lc_pouch *pouch, const char *ns, int create,
+                              lc_pouch_outbox_store *store, lc_error *error) {
+  if (!pouch->storage.ops->history_markers_open)
+    return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
+                        "pouch storage owner has no history consumer store",
+                        NULL, NULL, "pouch");
+  return pouch->storage.ops->history_markers_open(pouch->storage.context, ns,
+                                                  create, store, error);
+}
+
+static int history_store_read(lc_pouch *pouch, lc_pouch_outbox_store *store,
+                              const char *id, int *found, lc_index_seq *seq,
+                              lc_error *error) {
+  static const char magic[] = LC_POUCH_HISTORY_MAGIC "\n";
+  unsigned char *bytes = NULL;
+  char line[LC_POUCH_HISTORY_BYTES];
+  size_t length = 0, prefix = sizeof(magic) - 1U;
+  int rc;
+
+  *found = 0;
+  *seq = 0;
+  rc = store->ops->read(store->context, id, &pouch->allocator, prefix + 6U,
+                        sizeof(line) - 1U, &bytes, &length, error);
+  if (rc == LC_POUCH_OUTBOX_MARKER_MISSING)
+    return LC_OK;
+  if (rc == LC_OK && (memcmp(bytes, magic, prefix) || memchr(bytes, 0, length)))
+    rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                      "pouch history consumer record is malformed", NULL, id,
+                      "pouch");
+  if (rc == LC_OK) {
+    memcpy(line, bytes + prefix, length - prefix);
+    line[length - prefix] = '\0';
+    rc = lc_pouch_history_parse_ack(line, seq, error);
+  }
+  lc_free_with_allocator(&pouch->allocator, bytes);
+  if (rc == LC_OK)
+    *found = 1;
+  return rc;
+}
+
+static int history_store_write(lc_pouch_outbox_store *store, const char *id,
+                               lc_index_seq seq, lc_error *error) {
+  char text[LC_POUCH_HISTORY_BYTES];
+  int rc = lc_pouch_history_encode(seq, text, error);
+  if (rc == LC_OK)
+    rc = store->ops->write(store->context, id, (const unsigned char *)text,
+                           strlen(text), error);
+  return rc;
+}
+
+static int history_visit_legacy(lc_pouch *pouch, const char *ns,
+                                lc_pouch_history_visit_fn visit, void *context,
+                                lc_error *error) {
   char *directory;
   DIR *dir;
   struct dirent *entry;
   int rc;
 
-  if (pouch == NULL || ns == NULL || ns[0] == '\0' || has_consumers == NULL ||
-      out == NULL) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch history acknowledgement requires namespace and "
-                        "outputs",
-                        NULL, NULL, "pouch");
-  }
-  *has_consumers = 0;
-  *out = 0U;
   directory = NULL;
   rc = lc_pouch_history_directory(pouch, ns, 0, &directory, error);
   if (rc != LC_OK) {
@@ -506,12 +561,8 @@ int lc_pouch_history_oldest_acknowledged(lc_pouch *pouch, const char *ns,
     found = 0;
     acknowledged_index_seq = 0U;
     rc = lc_pouch_history_read(path, &found, &acknowledged_index_seq, error);
-    if (rc == LC_OK && found) {
-      if (!*has_consumers || acknowledged_index_seq < (lc_index_seq)*out) {
-        *out = (lc_pouch_generation)acknowledged_index_seq;
-      }
-      *has_consumers = 1;
-    }
+    if (rc == LC_OK && found)
+      rc = visit(context, decoded, acknowledged_index_seq, error);
     lc_free_with_allocator(&pouch->allocator, decoded);
     lc_free_with_allocator(&pouch->allocator, path);
   }
@@ -524,9 +575,104 @@ int lc_pouch_history_oldest_acknowledged(lc_pouch *pouch, const char *ns,
   return rc;
 }
 
+static int history_visit_store(lc_pouch *pouch, const char *ns,
+                               lc_pouch_history_visit_fn visit, void *context,
+                               lc_error *error) {
+  lc_pouch_outbox_store store = {0};
+  const char *name = NULL;
+  int rc = history_store_open(pouch, ns, 0, &store, error);
+  while (rc == LC_OK &&
+         (rc = store.ops->next(store.context, &name, error)) == LC_OK && name) {
+    lc_index_seq seq;
+    int found;
+    rc = history_store_read(pouch, &store, name, &found, &seq, error);
+    if (rc == LC_OK && found)
+      rc = visit(context, name, seq, error);
+  }
+  return lc_pouch_outbox_store_close(&store, rc, error);
+}
+
+typedef struct history_oldest {
+  lc_index_seq seq;
+  int found;
+} history_oldest;
+
+static int history_minimum(void *context, const char *id, lc_index_seq seq,
+                           lc_error *error) {
+  history_oldest *oldest = context;
+  (void)id;
+  (void)error;
+  if (!oldest->found || seq < oldest->seq)
+    oldest->seq = seq;
+  oldest->found = 1;
+  return LC_OK;
+}
+
+int lc_pouch_history_oldest_acknowledged(lc_pouch *pouch, const char *ns,
+                                         int *has_consumers,
+                                         lc_pouch_generation *out,
+                                         lc_error *error) {
+  history_oldest oldest = {0};
+  int rc;
+  if (!pouch || !ns || !*ns || !has_consumers || !out)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch history acknowledgement requires namespace and "
+                        "outputs",
+                        NULL, NULL, "pouch");
+  rc = pouch->storage.ops
+           ? history_visit_store(pouch, ns, history_minimum, &oldest, error)
+           : history_visit_legacy(pouch, ns, history_minimum, &oldest, error);
+  *has_consumers = rc == LC_OK && oldest.found;
+  *out = rc == LC_OK ? oldest.seq : 0;
+  return rc;
+}
+
+static int history_import_one(void *context, const char *id, lc_index_seq seq,
+                              lc_error *error) {
+  size_t prefix = sizeof(LC_POUCH_HISTORY_CONSUMER_PREFIX) - 1U;
+  if (strncmp(id, LC_POUCH_HISTORY_CONSUMER_PREFIX, prefix) || !id[prefix])
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "legacy history consumer name is invalid", NULL, id,
+                        "pouch");
+  return history_store_write(context, id + prefix, seq, error);
+}
+
+int lc_pouch_history_import(lc_pouch *source, lc_pouch *target, const char *ns,
+                            lc_error *error) {
+  lc_pouch_outbox_store store = {0};
+  int rc = history_store_open(target, ns, 0, &store, error);
+  if (rc == LC_OK)
+    rc = history_visit_legacy(source, ns, history_import_one, &store, error);
+  return lc_pouch_outbox_store_close(&store, rc, error);
+}
+
+static int history_position_write(lc_pouch *pouch, const char *directory,
+                                  const char *path,
+                                  lc_pouch_outbox_store *store, const char *id,
+                                  lc_index_seq seq, lc_error *error) {
+  return store->ops
+             ? history_store_write(store, id, seq, error)
+             : lc_pouch_history_write(pouch, directory, path, seq, error);
+}
+
+static int history_position_remove(const char *directory, const char *path,
+                                   lc_pouch_outbox_store *store, const char *id,
+                                   lc_error *error) {
+  if (store->ops)
+    return store->ops->remove(store->context, id, error);
+  if (unlink(path) != 0 && errno != ENOENT)
+    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                        "failed to remove pouch history consumer record",
+                        strerror(errno), path, "pouch");
+  return lc_pouch_path_fsync_directory(
+      directory, "failed to sync pouch history consumer directory", error);
+}
+
 static int lc_pouch_history_operation_locked(void *opaque, lc_error *error) {
   lc_pouch_history_operation_context *context;
   lc_history_consumer_handle *consumer;
+  lc_pouch *pouch;
+  lc_pouch_outbox_store store = {0};
   char *directory;
   char *path;
   lc_index_seq current_index_seq;
@@ -543,25 +689,30 @@ static int lc_pouch_history_operation_locked(void *opaque, lc_error *error) {
                         "pouch");
   }
   consumer = context->consumer;
+  pouch = consumer->client->pouch;
   directory = NULL;
   path = NULL;
   current_index_seq = 0U;
   acknowledged_index_seq = 0U;
   found = 0;
-  rc = lc_pouch_history_current_locked(consumer->client->pouch, consumer->ns,
-                                       &current_index_seq, error);
-  if (rc == LC_OK) {
-    rc = lc_pouch_history_file_path(
-        consumer->client->pouch, consumer->ns, consumer->consumer_id,
-        context->operation == LC_POUCH_HISTORY_REGISTER, &directory, &path,
-        error);
-  }
-  if (rc == LC_OK) {
-    rc = lc_pouch_history_staging_cleanup(consumer->client->pouch, directory,
-                                          error);
-  }
-  if (rc == LC_OK) {
-    rc = lc_pouch_history_read(path, &found, &acknowledged_index_seq, error);
+  rc = lc_pouch_history_current_locked(pouch, consumer->ns, &current_index_seq,
+                                       error);
+  if (rc == LC_OK && pouch->storage.ops) {
+    rc = history_store_open(pouch, consumer->ns,
+                            context->operation == LC_POUCH_HISTORY_REGISTER,
+                            &store, error);
+    if (rc == LC_OK)
+      rc = history_store_read(pouch, &store, consumer->consumer_id, &found,
+                              &acknowledged_index_seq, error);
+  } else if (rc == LC_OK) {
+    rc = lc_pouch_history_file_path(pouch, consumer->ns, consumer->consumer_id,
+                                    context->operation ==
+                                        LC_POUCH_HISTORY_REGISTER,
+                                    &directory, &path, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_history_staging_cleanup(pouch, directory, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_history_read(path, &found, &acknowledged_index_seq, error);
   }
   if (rc == LC_OK && context->operation == LC_POUCH_HISTORY_REGISTER &&
       !found) {
@@ -575,8 +726,9 @@ static int lc_pouch_history_operation_locked(void *opaque, lc_error *error) {
                         "namespace sequence",
                         NULL, NULL, "pouch");
     } else {
-      rc = lc_pouch_history_write(consumer->client->pouch, directory, path,
-                                  acknowledged_index_seq, error);
+      rc = history_position_write(pouch, directory, path, &store,
+                                  consumer->consumer_id, acknowledged_index_seq,
+                                  error);
       if (rc == LC_OK) {
         found = 1;
       }
@@ -603,7 +755,8 @@ static int lc_pouch_history_operation_locked(void *opaque, lc_error *error) {
                                                      consumer->ns, error);
       if (rc == LC_OK) {
         acknowledged_index_seq = context->requested_acknowledged_index_seq;
-        rc = lc_pouch_history_write(consumer->client->pouch, directory, path,
+        rc = history_position_write(pouch, directory, path, &store,
+                                    consumer->consumer_id,
                                     acknowledged_index_seq, error);
       }
     }
@@ -618,16 +771,9 @@ static int lc_pouch_history_operation_locked(void *opaque, lc_error *error) {
     if (found) {
       rc = lc_pouch_compaction_note_history_advanced(consumer->client->pouch,
                                                      consumer->ns, error);
-      if (rc == LC_OK && unlink(path) != 0 && errno != ENOENT) {
-        rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                          "failed to remove pouch history consumer record",
-                          strerror(errno), path, "pouch");
-      }
-      if (rc == LC_OK) {
-        rc = lc_pouch_path_fsync_directory(
-            directory, "failed to sync pouch history consumer directory",
-            error);
-      }
+      if (rc == LC_OK)
+        rc = history_position_remove(directory, path, &store,
+                                     consumer->consumer_id, error);
     }
     if (rc == LC_OK) {
       consumer->registered = 0;
@@ -640,7 +786,7 @@ static int lc_pouch_history_operation_locked(void *opaque, lc_error *error) {
   }
   lc_free_with_allocator(&consumer->client->allocator, directory);
   lc_free_with_allocator(&consumer->client->allocator, path);
-  return rc;
+  return lc_pouch_outbox_store_close(&store, rc, error);
 }
 
 static int lc_history_consumer_run(lc_history_consumer_handle *consumer,
