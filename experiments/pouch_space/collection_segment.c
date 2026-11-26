@@ -111,6 +111,30 @@ static int cs_transfer(ps_collection_segment *s, uint64_t at, void *bytes,
   return LC_OK;
 }
 
+static int cs_write_parts(ps_collection_segment *s, uint64_t at,
+                          const struct iovec *parts, int count, uint64_t bytes,
+                          enum cs_access access, lc_error *e) {
+  unsigned char prefix[1024];
+  int i, rc = LC_OK;
+  /* Keep one small prefix together. The caller still writes a finalized
+   * header separately, and large vectors keep their bounded direct writes. */
+  if (count > 1 && bytes <= sizeof(prefix)) {
+    size_t used = 0;
+    for (i = 0; i < count; ++i) {
+      if (!parts[i].iov_len)
+        continue;
+      memcpy(prefix + used, parts[i].iov_base, parts[i].iov_len);
+      used += parts[i].iov_len;
+    }
+    return cs_transfer(s, at, prefix, used, access, e);
+  }
+  for (i = 0; i < count && rc == LC_OK; ++i) {
+    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, access, e);
+    at += parts[i].iov_len;
+  }
+  return rc;
+}
+
 /* Called with allocation/append authority; private payload writes do not
  * hold this mutex while performing physical I/O. */
 static int cs_grant(ps_collection_segment *s, uint64_t end, lc_error *e) {
@@ -193,19 +217,18 @@ static int cs_read(void *context, uint64_t at, const struct iovec *parts,
 static int cs_patch_at(ps_collection_segment *s, uint64_t at,
                        const struct iovec *parts, int count,
                        enum cs_access access, lc_error *e) {
-  uint64_t limit;
-  int i, rc = LC_OK;
+  uint64_t limit, end = at;
+  int i;
   pthread_mutex_lock(&s->mutex);
   limit = s->tail;
   pthread_mutex_unlock(&s->mutex);
-  for (i = 0; i < count && rc == LC_OK; ++i) {
-    if (at > limit || (uint64_t)parts[i].iov_len > limit - at)
+  for (i = 0; i < count; ++i) {
+    if (end > limit || (uint64_t)parts[i].iov_len > limit - end)
       return cs_error(e, LC_ERR_INVALID,
                       "collection patch exceeds its private canonical range");
-    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, access, e);
-    at += parts[i].iov_len;
+    end += parts[i].iov_len;
   }
-  return rc;
+  return cs_write_parts(s, at, parts, count, end - at, access, e);
 }
 
 static int cs_patch(void *context, uint64_t at, const struct iovec *parts,
@@ -259,11 +282,8 @@ static int cs_append_at_tail(ps_collection_segment *s,
   pthread_mutex_unlock(&s->mutex);
   /* Logical append authority excludes other appenders. Mapping capture and
    * private range writes remain independent of this bounded metadata append. */
-  for (i = 0; i < count && rc == LC_OK; ++i) {
-    rc = cs_transfer(s, at, parts[i].iov_base, parts[i].iov_len, access, e);
-    at += parts[i].iov_len;
-  }
-  return rc;
+  return rc == LC_OK ? cs_write_parts(s, at, parts, count, end - at, access, e)
+                     : rc;
 }
 
 static int cs_append(void *context, const struct iovec *parts, int count,

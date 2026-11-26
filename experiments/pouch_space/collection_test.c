@@ -40,6 +40,43 @@ static void clear(lc_error *e) {
   lc_error_cleanup(e);
   lc_error_init(e);
 }
+static void vector_writes(const char *directory) {
+  char path[1024], actual[8];
+  const size_t start = PS_PAGE - PS_RUN_HEADER - 4U;
+  unsigned char *fill = calloc(1, start);
+  ps_collection_segment *segment = NULL;
+  ps_space *space = NULL;
+  ps_options options = {0};
+  ps_key key = {71, 1, PS_STREAM};
+  struct iovec pad = {fill, start}, read_part = {actual, sizeof(actual)};
+  struct iovec parts[] = {{"abc", 3}, {NULL, 0}, {"defgh", 5}};
+  lc_error e = {0};
+  ps_owned_status status;
+  REQUIRE(fill);
+  REQUIRE(snprintf(path, sizeof(path), "%s/vector-writes", directory) <
+          (int)sizeof(path));
+  ok(ps_open(path, 1, &options, &space, &e), &e);
+  ok(ps_collection_segment_open(space, key, 1, NULL, NULL, NULL, &segment, &e),
+     &e);
+  lc_pouch_record_io io = ps_collection_segment_io(segment);
+  ok(lc_pouch_record_io_append(io, &pad, 1, &e), &e);
+  ok(lc_pouch_record_io_append(io, parts, 3, &e), &e);
+  ok(ps_collection_segment_status(segment, &status, NULL, &e), &e);
+  REQUIRE(status.runs == 2);
+  ok(lc_pouch_record_io_read(io, start, &read_part, 1, &e), &e);
+  REQUIRE(!memcmp(actual, "abcdefgh", sizeof(actual)));
+  parts[0].iov_base = "ABC";
+  parts[2].iov_base = "DEFGH";
+  ok(lc_pouch_record_io_patch(io, start, parts, 3, &e), &e);
+  ok(lc_pouch_record_io_read(io, start, &read_part, 1, &e), &e);
+  REQUIRE(!memcmp(actual, "ABCDEFGH", sizeof(actual)));
+  ok(ps_collection_segment_publish(segment, PS_COMMIT_DEFAULT, &e), &e);
+  ps_collection_segment_close(segment);
+  ok(ps_close(space, &e), &e);
+  REQUIRE(!unlink(path));
+  lc_error_cleanup(&e);
+  free(fill);
+}
 static unsigned char content_at(uint64_t at, uint64_t size) {
   static const char begin[] = "{\"blob\":\"";
   static const char alphabet[] =
@@ -722,6 +759,7 @@ int main(int argc, char **argv) {
     REQUIRE(!pthread_join(worker, NULL));
   } else {
     projections();
+    vector_writes(directory);
     for (int durable = 0; durable < 2; ++durable)
       indexed(directory, durable);
     for (int codec = 0; codec < 4; ++codec)
