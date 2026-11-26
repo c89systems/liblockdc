@@ -147,7 +147,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         pouch_space_coordination_test 120 ${mode})
     endforeach()
     foreach(mode
-        commit crash-boundaries reopen reopen-ordering reopen-sanitize reopen-portable
+        commit crash-boundaries reopen reopen-ordering reopen-close-proof
+        reopen-layout-rejection reopen-portable
         checkpoint-idempotence checkpoint-initialization checkpoint-covered-reopen
         root-covered-admission root-obligations
         standing-capacity standing-deletion native-metadata-shared-reserve
@@ -156,6 +157,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         namespace-repack namespace-repack-concurrency namespace-repack-shared-refresh
         namespace-repack-churn)
       pouch_space_darwin_case(pouch_space_${mode} pouch_space_test 240 ${mode})
+    endforeach()
+    foreach(sync RANGE 0 1)
+      foreach(group RANGE 0 1)
+        pouch_space_darwin_case(pouch_space_reopen-sanitize_${sync}_${group}
+          pouch_space_test 120 reopen-sanitize ${sync} ${group})
+      endforeach()
     endforeach()
     foreach(mode checkpoint-retire-select checkpoint-retire-shared checkpoint-retire-live checkpoint-inline-cleanup)
       foreach(sync RANGE 0 1)
@@ -1225,12 +1232,20 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_reopen-portable COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-portable)
   set_tests_properties(pouch_space_reopen-portable PROPERTIES TIMEOUT 30
     LABELS "unit;local;pouch-space")
-  add_test(NAME pouch_space_reopen-sanitize COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-sanitize)
-  set_tests_properties(pouch_space_reopen-sanitize PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space")
-  add_test(NAME pouch_space_reopen-ordering COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-ordering)
-  set_tests_properties(pouch_space_reopen-ordering PROPERTIES TIMEOUT 120
-    LABELS "unit;local;pouch-space")
+  foreach(mode reopen-ordering reopen-close-proof reopen-layout-rejection)
+    add_test(NAME pouch_space_${mode}
+      COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 120
+      LABELS "unit;local;pouch-space")
+  endforeach()
+  foreach(sync RANGE 0 1)
+    foreach(group RANGE 0 1)
+      add_test(NAME pouch_space_reopen-sanitize_${sync}_${group}
+        COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-sanitize ${sync} ${group})
+      set_tests_properties(pouch_space_reopen-sanitize_${sync}_${group} PROPERTIES TIMEOUT 120
+        LABELS "unit;local;pouch-space")
+    endforeach()
+  endforeach()
   add_test(NAME pouch_space_metadata COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata)
   add_test(NAME pouch_space_metadata-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity)
   add_test(NAME pouch_space_metadata-capacity-faults COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity-faults)

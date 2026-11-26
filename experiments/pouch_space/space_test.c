@@ -317,6 +317,7 @@ typedef struct model {
   uint64_t read_bytes;
   int tear, persist_torn, interrupt_read, interrupt_write;
   int persist_grants, fail_grant_sync;
+  int snapshot_only;
 } model;
 static int fail(model *m) { return ++m->operations == m->fail_at; }
 static ssize_t model_read(void *v, int fd, void *p, size_t n, off_t offset) {
@@ -379,7 +380,8 @@ static int model_sync(void *v, int fd) {
     errno = EIO;
     return -1;
   }
-  CHECK(ps_native_io.sync(NULL, fd) == 0);
+  if (!m->snapshot_only)
+    CHECK(ps_native_io.sync(NULL, fd) == 0);
   CHECK(fstat(fd, &st) == 0 && st.st_size <= (off_t)m->stable_capacity);
   m->stable_bytes = (size_t)st.st_size;
   CHECK(pread(fd, m->stable, m->stable_bytes, 0) == (ssize_t)m->stable_bytes);
@@ -440,7 +442,8 @@ static void crash(model *m) {
   CHECK(fd >= 0);
   CHECK(pwrite(fd, m->stable, m->stable_bytes, 0) == (ssize_t)m->stable_bytes);
   CHECK(ps_native_io.reserve(NULL, fd, 0, (off_t)m->stable_bytes) == 0);
-  CHECK(ps_native_io.sync(NULL, fd) == 0);
+  if (!m->snapshot_only)
+    CHECK(ps_native_io.sync(NULL, fd) == 0);
   CHECK(close(fd) == 0);
   m->fail_at = m->operations = 0;
 }
@@ -1169,7 +1172,6 @@ static ps_ref reopen_sanitize_fixture(model *m, const ps_io *io, int durable,
     CHECK(pwrite(fd, old_root, sizeof(old_root), (off_t)sibling) ==
           (ssize_t)sizeof(old_root));
   }
-  CHECK(ps_native_io.sync(NULL, fd) == 0);
   CHECK(pread(fd, m->stable, m->stable_bytes, 0) == (ssize_t)m->stable_bytes);
   CHECK(close(fd) == 0);
   free(journal);
@@ -1182,6 +1184,8 @@ static size_t reopen_sanitize_case(int durable, int layout, size_t fail_at,
   ps_options options = {0};
   ps_space *s = NULL;
   ps_stats status;
+  /* Each simulated crash restores the exact bytes in the durable snapshot. */
+  m.snapshot_only = 1;
   ps_ref keep = reopen_sanitize_fixture(&m, &io, durable, layout);
   ps_ref issued, next;
   unsigned char *journal = malloc(PS_JOURNAL);
@@ -1255,17 +1259,22 @@ static size_t reopen_sanitize_case(int durable, int layout, size_t fail_at,
   clean();
   return operations;
 }
-static void reopen_sanitization(void) {
+static void reopen_sanitization(int durable, int group) {
+  const int first_layout = group * 3;
   size_t sites = 0;
-  for (int durable = 0; durable < 2; ++durable)
-    for (int layout = 0; layout < 6; ++layout) {
-      size_t n = reopen_sanitize_case(durable, layout, 0, 0);
-      CHECK(n >= (layout == 0 ? 1U : 2U));
-      sites += n;
-      for (size_t nth = 1; nth <= n; ++nth)
-        for (int torn = 0; torn < 2; ++torn)
-          reopen_sanitize_case(durable, layout, nth, torn);
-    }
+  for (int layout = first_layout; layout < first_layout + 3; ++layout) {
+    size_t n = reopen_sanitize_case(durable, layout, 0, 0);
+    CHECK(n >= (layout == 0 ? 1U : 2U));
+    sites += n;
+    for (size_t nth = 1; nth <= n; ++nth)
+      for (int torn = 0; torn < 2; ++torn)
+        reopen_sanitize_case(durable, layout, nth, torn);
+  }
+  printf("reopen: %zu cleanup failure sites with lost/torn persistence\n",
+         sites);
+}
+
+static void reopen_layout_rejection(void) {
   /* An otherwise checked root with the former layout must fail before an
    * opener can clear its journal. The former reader rejects the new bit. */
   model m;
@@ -1303,9 +1312,6 @@ static void reopen_sanitization(void) {
   CHECK(!memcmp(readiness, preserved, sizeof(readiness)) && close(fd) == 0);
   free(m.stable);
   clean();
-  printf("reopen: bounded clean writes, sparse/stale tails, both sibling-root "
-         "states and %zu I/O failure sites with lost/torn persistence\n",
-         sites);
 }
 
 static void reopen_cleanup_ordering(void) {
@@ -3052,21 +3058,23 @@ enum close_proof_case {
   CLOSE_PROOF_ADVANCED,
   CLOSE_PROOF_SHARED_SWITCH
 };
-static void exclusive_close_recovery(enum close_proof_case mode) {
+static void exclusive_close_recovery(enum close_proof_case mode, int durable) {
   const char body[] = "covered";
   model m;
   ps_io io = model_init_capacity(&m, PS_DEFAULT_CAPACITY);
   ps_options options = {0};
-  ps_space *space = create(PS_DEFAULT_CAPACITY, 1, &io);
+  ps_space *space = create(PS_DEFAULT_CAPACITY, durable, &io);
   ps_stream *stream = stream_open(space, 1, 1, NULL, NULL);
   ps_stream_info info;
   uint64_t start, id = 0, next;
   size_t syncs;
   options.io = &io;
-  options.durable_sync = 1;
+  options.durable_sync = durable;
   OK(canonical_append(stream, body, sizeof(body), 3, 1, &start, &error));
   OK(ps_stream_status(stream, &info, &error));
   OK(ps_stream_close(stream, &error));
+  if (!durable)
+    OK(ps_flush(space, &error));
   ps_key grant = {info.ref.incarnation, 0, PS_OWNED_RUN};
   ps_entry *run = ps_internal_lookup(space, grant);
   CHECK(run && run->count == 1 && run->extents[0].bytes >= 2 * info.tail);
@@ -3118,6 +3126,8 @@ static void exclusive_close_recovery(enum close_proof_case mode) {
     if (mode == CLOSE_PROOF_COVERED) {
       CHECK(m.syncs == syncs);
       m.fail_sync_at = m.syncs + 1;
+      OK(ps_flush(space, &error));
+      CHECK(m.syncs == syncs);
       CHECK(ps_catalog_allocate_id(space, &id, &error) == LC_ERR_TRANSPORT &&
             !id && m.syncs == syncs + 1);
       lc_error_cleanup(&error);
@@ -8220,10 +8230,6 @@ static int run_portable_case(const char *mode) {
   if (!strcmp(mode, "reopen-ordering")) {
     reopen_cleanup_ordering();
     shared_pool_power_loss();
-    exclusive_close_recovery(CLOSE_PROOF_COVERED);
-    exclusive_close_recovery(CLOSE_PROOF_TORN);
-    exclusive_close_recovery(CLOSE_PROOF_ADVANCED);
-    exclusive_close_recovery(CLOSE_PROOF_SHARED_SWITCH);
     nosync_close_recovery(NOSYNC_RECOVERY_FLUSH);
     nosync_close_recovery(NOSYNC_RECOVERY_MUTATE);
     nosync_close_recovery(NOSYNC_RECOVERY_WRITE_FAILURE);
@@ -8232,8 +8238,16 @@ static int run_portable_case(const char *mode) {
     shared_creation_zero_proof();
     return 1;
   }
-  if (!strcmp(mode, "reopen-sanitize")) {
-    reopen_sanitization();
+  if (!strcmp(mode, "reopen-close-proof")) {
+    exclusive_close_recovery(CLOSE_PROOF_COVERED, 0);
+    exclusive_close_recovery(CLOSE_PROOF_COVERED, 1);
+    exclusive_close_recovery(CLOSE_PROOF_TORN, 1);
+    exclusive_close_recovery(CLOSE_PROOF_ADVANCED, 1);
+    exclusive_close_recovery(CLOSE_PROOF_SHARED_SWITCH, 1);
+    return 1;
+  }
+  if (!strcmp(mode, "reopen-layout-rejection")) {
+    reopen_layout_rejection();
     return 1;
   }
   if (!strcmp(mode, "reopen-portable")) {
@@ -8285,6 +8299,8 @@ int main(int argc, char **argv) {
       checkpoint_retire_live(durable, profile);
     else if (!strcmp(argv[2], "checkpoint-inline-cleanup"))
       checkpoint_inline_cleanup(durable, profile);
+    else if (!strcmp(argv[2], "reopen-sanitize"))
+      reopen_sanitization(durable, profile);
 #ifdef __linux__
     else if (!strcmp(argv[2], "checkpoint-faults"))
       checkpoint_faults(durable, profile);

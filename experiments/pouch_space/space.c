@@ -11716,6 +11716,16 @@ static int owned_ready_sequence(ps_space *s, uint64_t *sequence,
   *sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
   return LC_OK;
 }
+static void owned_select_tail(ps_space *s, ps_entry *head, uint64_t tail,
+                              int complete, uint64_t sequence) {
+  head->bytes = tail;
+  head->stream.head->complete_generation =
+      complete && s->readiness ? s->generation : 0;
+  stream_admitted(s, head, complete && s->readiness);
+  if (!head->dirty_link)
+    dirty_entry(s, head, NULL);
+  head->stream.head->ready = sequence;
+}
 /* Payload writes and any logical selection have already finished. Only the
  * ready boundary joins the shared journal, under allocation authority. */
 static int owned_publish_tail(ps_space *s, ps_entry *head, uint64_t tail,
@@ -11736,15 +11746,8 @@ static int owned_publish_tail(ps_space *s, ps_entry *head, uint64_t tail,
     }
   } else if (!*sequence)
     rc = owned_ready_sequence(s, sequence, error);
-  if (rc == LC_OK) {
-    head->bytes = tail;
-    head->stream.head->complete_generation =
-        complete && s->readiness ? s->generation : 0;
-    stream_admitted(s, head, complete && s->readiness);
-    if (!head->dirty_link)
-      dirty_entry(s, head, NULL);
-    head->stream.head->ready = *sequence;
-  }
+  if (rc == LC_OK)
+    owned_select_tail(s, head, tail, complete, *sequence);
   return rc;
 }
 static int owned_commit(ps_owned_head *head, uint64_t tail, int complete,
@@ -11851,6 +11854,24 @@ static int restore_covered_tail(ps_owned_head *head, uint64_t tail,
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
+static int restore_exclusive_tail(ps_owned_head *head, uint64_t tail,
+                                  lc_error *error) {
+  ps_space *s = head->space;
+  ps_coordination_guard *guard;
+  int rc;
+  pthread_mutex_lock(&s->mutex);
+  rc = owned_capture_begin(head, &guard, error);
+  if (rc == LC_OK && !owned_tail_allowed(head->entry, tail))
+    rc = err(error, LC_ERR_PROTOCOL, "recovered tail outside owned range");
+  /* The validated close receipt already covers these bytes. Restoring the
+   * in-memory selection can use the current durable sequence. */
+  if (rc == LC_OK)
+    owned_select_tail(s, head->entry, tail, 0,
+                      __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
+  rc = allocation_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 int ps_owned_restore_tail(ps_owned_head *head, uint64_t tail, int advanced,
                           uint64_t checkpoint, lc_error *error) {
   const unsigned char *proof = head->space->close_proof;
@@ -11870,8 +11891,9 @@ int ps_owned_restore_tail(ps_owned_head *head, uint64_t tail, int advanced,
       if (ps_wire_get64(proof) == head->entry->token &&
           ps_wire_get64(proof + 8) >= tail)
         break;
-    if (i == count)
-      return ps_owned_recovered(head, tail, error);
+    if (i < count)
+      return restore_exclusive_tail(head, tail, error);
+    return ps_owned_recovered(head, tail, error);
   }
   if (advanced && ps_readiness_reused_open_barrier(head->space))
     return ps_owned_recovered(head, tail, error);

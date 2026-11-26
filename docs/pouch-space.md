@@ -55,12 +55,12 @@ admitting a cold namespace for writes, recovery checks for complete records past
 the selected stream tail and restores their outstanding capacity obligations.
 After validating the recovered prefix, the first owner can reuse proof from
 a previous durability barrier. A clean exclusive close can record that
-proof for the exact journal and a bounded set of stream tails. When reusing
-that durability proof, recovery syncs newly discovered records outside its
-coverage before exposing them. Shared reopen can reuse a durable namespace
-checkpoint for a recovered tail within its coverage when the piece footers
-are intact. Reconstructed footers keep the recovery sync requirement, including
-on retry after an interrupted repair.
+proof for the exact journal and a bounded set of stream tails. Restoring a
+covered tail reuses its durable sequence. Recovery syncs newly discovered
+records outside the proof before exposing them. Shared reopen can reuse a
+durable namespace checkpoint for a recovered tail within its coverage when
+the piece footers are intact. Reconstructed footers keep the recovery sync
+requirement, including on retry after an interrupted repair.
 When a partial piece's footer fits after the completed bytes on the last
 written page, the append can avoid rewriting the piece's first page. A later
 append can replace that footer. Recovery accepts the last complete canonical
