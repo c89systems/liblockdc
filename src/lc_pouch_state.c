@@ -8610,11 +8610,12 @@ int lc_pouch_state_record_terminal_span(const unsigned char *span, size_t bytes,
   return rc;
 }
 
-int lc_pouch_state_record_read(
+int lc_pouch_state_record_read_with_crc(
     lc_pouch_record_io io, const lc_allocator *allocator, const char *leaf,
     uint64_t start, uint64_t end, int allow_truncated_tail, int verify_payload,
-    unsigned char **scratch, lc_pouch_state_entry *entry, uint64_t *next,
-    int *found, int *truncated_tail, lc_error *error) {
+    unsigned char **scratch, lc_pouch_state_record_crc_fn checksum,
+    lc_pouch_state_entry *entry, uint64_t *next, int *found,
+    int *truncated_tail, lc_error *error) {
   lc_pouch_record_header header;
   unsigned char encoded[LC_POUCH_RECORD_HEADER_BYTES];
   unsigned char *key = NULL, *meta = NULL;
@@ -8624,7 +8625,7 @@ int lc_pouch_state_record_read(
   int rc;
   if (!io.ops || !io.ops->read || !allocator || !leaf || !entry || !next ||
       !found || !truncated_tail || start > end || end > (uint64_t)LC_I64_MAX ||
-      (verify_payload && !scratch))
+      (verify_payload && !checksum && !scratch))
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch state record read requires bounded inputs", NULL,
                         NULL, "pouch");
@@ -8667,7 +8668,9 @@ int lc_pouch_state_record_read(
   parts[1].iov_base = meta;
   parts[1].iov_len = header.meta_len;
   rc = lc_pouch_record_io_read(io, start + sizeof(encoded), parts, 2, error);
-  if (rc == LC_OK && verify_payload) {
+  if (rc == LC_OK && verify_payload && checksum)
+    rc = checksum(io.context, payload, header.payload_len, &crc, error);
+  if (rc == LC_OK && verify_payload && !checksum) {
     if (!*scratch)
       *scratch = lc_alloc_with_allocator(allocator, 16384U);
     if (!*scratch)
@@ -8687,11 +8690,11 @@ int lc_pouch_state_record_read(
     }
     if (*scratch)
       OPENSSL_cleanse(*scratch, 16384U);
-    if (rc == LC_OK && crc != header.payload_crc)
-      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "pouch state segment payload CRC mismatch", NULL, NULL,
-                        "pouch");
   }
+  if (rc == LC_OK && verify_payload && crc != header.payload_crc)
+    rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                      "pouch state segment payload CRC mismatch", NULL, NULL,
+                      "pouch");
   if (rc == LC_OK)
     rc = lc_pouch_state_record_select(allocator, &header, key, meta, leaf,
                                       start, payload, entry, error);
@@ -8710,6 +8713,16 @@ truncated:
   return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                       "pouch state segment record is incomplete", NULL, NULL,
                       "pouch");
+}
+
+int lc_pouch_state_record_read(
+    lc_pouch_record_io io, const lc_allocator *allocator, const char *leaf,
+    uint64_t start, uint64_t end, int allow_truncated_tail, int verify_payload,
+    unsigned char **scratch, lc_pouch_state_entry *entry, uint64_t *next,
+    int *found, int *truncated_tail, lc_error *error) {
+  return lc_pouch_state_record_read_with_crc(
+      io, allocator, leaf, start, end, allow_truncated_tail, verify_payload,
+      scratch, NULL, entry, next, found, truncated_tail, error);
 }
 
 static int lc_pouch_state_record_sink_write(lc_sink *sink, const void *bytes,

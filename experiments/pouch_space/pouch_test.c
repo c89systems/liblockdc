@@ -1224,6 +1224,8 @@ static void cold_append_crash(const char *path) {
           (int)sizeof(image_path));
   for (int codec = 0; codec <= 3; codec += 3)
     for (int phase = 0; phase < 3; ++phase) {
+      /* The plaintext record spans multiple recovery read-ahead chunks. */
+      size_t bytes = codec ? 17 : 2 * PS_CHUNK + 17;
       scope_image image = {0};
       ps_io io = {&image,           io_read,    io_write,
                   scope_image_sync, io_reserve, NULL};
@@ -1240,6 +1242,8 @@ static void cold_append_crash(const char *path) {
       REQUIRE(child >= 0);
       if (!child) {
         ps_namespace *ns = NULL;
+        lc_pouch_state_write_result w = {0};
+        input in = source(bytes, 7);
         ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
         ok(ps_root_namespace_acquire(ps_pouch_state_root(p), "metadata", 1, &ns,
                                      &e),
@@ -1247,8 +1251,9 @@ static void cold_append_crash(const char *path) {
         ps_namespace_release(ns);
         metadata_hint_expect(p, 0, &e);
         uint64_t syncs = scope_syncs(p, &e);
-        scope_put(p, "metadata", 7, &e);
-        read_value(p, "metadata", "key", 17, 7, 1, &e);
+        ok(put(p, "metadata", "key", &in, NULL, &w, &e), &e);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        read_value(p, "metadata", "key", bytes, 7, 1, &e);
         metadata_hint_expect(p, 1, &e);
         REQUIRE(scope_syncs(p, &e) == syncs);
         if (phase) {
@@ -1269,7 +1274,7 @@ static void cold_append_crash(const char *path) {
       ok(ps_pouch_state_open(image_path, 0, &allocator, &o, &p, &e), &e);
       metadata_hint_expect(p, phase == 1, &e);
       if (phase == 1)
-        read_value(p, "metadata", "key", 17, 7, 1, &e);
+        read_value(p, "metadata", "key", bytes, 7, 1, &e);
       else {
         ok(lc_pouch_state_read_metadata(p, "metadata", "key", &r, &e), &e);
         REQUIRE(!r.found);

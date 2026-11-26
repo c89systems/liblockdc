@@ -81,6 +81,10 @@ int ps_stream_retire_batch(ps_stream *const *, size_t count, size_t *completed,
                            lc_error *);
 int ps_stream_recovery_read(ps_stream *, uint64_t offset, void *, size_t,
                             lc_error *);
+/* Compute the CRC from the same bounded read-ahead used by recovery reads.
+ * The borrowed context is the recovering ps_stream. */
+int ps_stream_recovery_crc(void *, uint64_t offset, uint64_t length,
+                           unsigned long *, lc_error *);
 /* During canonical recovery only: require intact completion footers for every
  * full piece protected by the canonical checkpoint. Inspects only metadata,
  * without reading bodies. Uncovered accepted pieces are finalized separately.

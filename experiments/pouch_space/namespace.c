@@ -257,10 +257,10 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
       rc = failure(e, LC_ERR_PROTOCOL,
                    "namespace checkpoint splits a batch frame");
     while (rc == LC_OK) {
-      rc = lc_pouch_state_record_read(
+      rc = lc_pouch_state_record_read_with_crc(
           ps_record_recovery_input(stream), &allocator, s->leaf, inner,
-          frame.end, !frame.framed, cursor >= checkpoint, &scratch, &record,
-          &next, &found, &truncated, e);
+          frame.end, !frame.framed, cursor >= checkpoint, NULL,
+          ps_stream_recovery_crc, &record, &next, &found, &truncated, e);
       if (rc != LC_OK || !found)
         break;
       inner = next;

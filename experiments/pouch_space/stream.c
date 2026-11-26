@@ -4,6 +4,7 @@
 #include "lc_intcompat.h"
 #include "owned.h"
 
+#include <openssl/crypto.h>
 #include <pthread.h>
 #include <string.h>
 #include <zlib.h>
@@ -346,6 +347,7 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
     s->tail = accepted;
     s->repair_pending = 1;
   }
+  OPENSSL_cleanse(s->recovery_buffer, PS_CHUNK);
   lc_free_with_allocator(NULL, s->recovery_buffer);
   s->recovery_buffer = NULL;
   return rc;
@@ -804,40 +806,72 @@ int ps_stream_retire_batch(ps_stream *const *streams, size_t count,
   lc_error_cleanup(&interrupted);
   return rc;
 }
+static int recovery_chunk(ps_stream *s, uint64_t offset, uint64_t length,
+                          const unsigned char **bytes, size_t *size,
+                          lc_error *error) {
+  size_t at, take;
+  int rc;
+  if (offset < s->recovery_offset ||
+      offset - s->recovery_offset >= s->recovery_bytes) {
+    uint64_t remaining = s->capacity - offset;
+    take = remaining < PS_CHUNK ? (size_t)remaining : PS_CHUNK;
+    /* A clean open usually examines only the next header at the known
+     * tail. If it identifies a record, the next miss uses read-ahead. */
+    if (!s->recovery_bytes && offset >= s->tail && length <= 64U)
+      take = (size_t)length;
+    rc = stream_io(s, offset, s->recovery_buffer, take, 0, error);
+    if (rc != LC_OK)
+      return rc;
+    s->recovery_offset = offset;
+    s->recovery_bytes = take;
+  }
+  at = (size_t)(offset - s->recovery_offset);
+  take = s->recovery_bytes - at;
+  *size = take < length ? take : (size_t)length;
+  *bytes = s->recovery_buffer + at;
+  return LC_OK;
+}
 int ps_stream_recovery_read(ps_stream *s, uint64_t offset, void *bytes,
                             size_t n, lc_error *error) {
   unsigned char *p = bytes;
-  size_t at, take;
+  const unsigned char *chunk;
+  size_t take;
   int rc;
   if (!s || !s->recovering || (!bytes && n) || offset > s->capacity ||
       n > s->capacity - offset)
     return stream_error(error, LC_ERR_INVALID,
                         "candidate read outside canonical recovery");
   while (n) {
-    if (offset < s->recovery_offset ||
-        offset - s->recovery_offset >= s->recovery_bytes) {
-      take = (size_t)(s->capacity - offset);
-      /* A clean open usually examines only the next header at the known
-       * tail. If it identifies a record, the next miss uses read-ahead. */
-      if (!s->recovery_bytes && offset >= s->tail && n <= 64U)
-        take = n;
-      else if (take > PS_CHUNK)
-        take = PS_CHUNK;
-      rc = stream_io(s, offset, s->recovery_buffer, take, 0, error);
-      if (rc != LC_OK)
-        return rc;
-      s->recovery_offset = offset;
-      s->recovery_bytes = take;
-    }
-    at = (size_t)(offset - s->recovery_offset);
-    take = s->recovery_bytes - at;
-    if (take > n)
-      take = n;
-    memcpy(p, s->recovery_buffer + at, take);
+    rc = recovery_chunk(s, offset, n, &chunk, &take, error);
+    if (rc != LC_OK)
+      return rc;
+    memcpy(p, chunk, take);
     n -= take;
     p += take;
     offset += take;
   }
+  return LC_OK;
+}
+int ps_stream_recovery_crc(void *context, uint64_t offset, uint64_t length,
+                           unsigned long *out, lc_error *error) {
+  ps_stream *s = context;
+  const unsigned char *chunk;
+  size_t take;
+  uint32_t crc = 0;
+  int rc;
+  if (!s || !s->recovering || !out || offset > s->capacity ||
+      length > s->capacity - offset)
+    return stream_error(error, LC_ERR_INVALID,
+                        "candidate checksum outside canonical recovery");
+  while (length) {
+    rc = recovery_chunk(s, offset, length, &chunk, &take, error);
+    if (rc != LC_OK)
+      return rc;
+    crc = ps_crc32(crc, chunk, take);
+    offset += take;
+    length -= take;
+  }
+  *out = crc;
   return LC_OK;
 }
 int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {

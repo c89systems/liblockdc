@@ -98,6 +98,17 @@ int lc_pouch_state_record_read(lc_pouch_record_io, const lc_allocator *,
                                unsigned char **scratch, lc_pouch_state_entry *,
                                uint64_t *next, int *found, int *truncated_tail,
                                lc_error *);
+/* As above, with an optional checksum of the exact payload range using the
+ * same captured input. The callback borrows io.context. The record reader
+ * still checks the returned CRC against the canonical header. */
+typedef int (*lc_pouch_state_record_crc_fn)(void *, uint64_t, uint64_t,
+                                            unsigned long *, lc_error *);
+int lc_pouch_state_record_read_with_crc(
+    lc_pouch_record_io, const lc_allocator *, const char *leaf, uint64_t start,
+    uint64_t end, int allow_truncated_tail, int verify_payload,
+    unsigned char **scratch, lc_pouch_state_record_crc_fn,
+    lc_pouch_state_entry *, uint64_t *next, int *found, int *truncated_tail,
+    lc_error *);
 /* Decode exactly one record from a caller-verified contiguous capture.
  * Fields in the result are owned. The input is borrowed for the call. */
 int lc_pouch_state_record_decode_span(const unsigned char *, size_t,
