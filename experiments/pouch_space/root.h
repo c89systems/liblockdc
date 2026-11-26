@@ -55,13 +55,18 @@ int ps_root_crypto_matches(ps_root *, lc_pouch_crypto *, lc_error *);
  * registry mutex spans storage I/O or application callbacks. */
 int ps_root_namespace_acquire(ps_root *, const char *, int create,
                               ps_namespace **, lc_error *);
+/* Lazy admission for the Pouch runtime. An exclusive NoSync owner can
+ * attach its first canonical records before a standalone catalog sync. */
+int ps_root_namespace_stage(ps_root *, const char *, ps_namespace **,
+                            lc_error *);
 int ps_namespace_identity(const ps_namespace *, ps_namespace_info *,
                           lc_error *);
 void ps_namespace_release(ps_namespace *);
 typedef int (*ps_namespace_visit_fn)(const char *, const ps_namespace_info *,
                                      void *, lc_error *);
-/* Captures one durable catalog prefix; callbacks may acquire/create other
- * namespaces. A callback's namespace pin remains live until it returns. */
+/* Captures one catalog prefix, including staged names on exclusive NoSync
+ * roots. Callbacks may acquire/create namespaces and retain a namespace pin
+ * until they return. */
 int ps_root_namespace_visit(ps_root *, ps_namespace_visit_fn, void *,
                             lc_error *);
 /* Explicit maintenance only: retire closed streams with no catalog reference

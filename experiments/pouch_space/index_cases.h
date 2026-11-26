@@ -555,9 +555,69 @@ static size_t index_trial(const char *directory, int action, int sync, int kind,
   lc_error_cleanup(&e);
   return sites;
 }
+static void index_namespace_admission(const char *directory) {
+  char path[1400];
+  lc_error e = {0};
+  const char *name = visit_names[0];
+  REQUIRE(snprintf(path, sizeof(path), "%s/index-namespace-admission",
+                   directory) < (int)sizeof(path));
+  for (int flush = 0; flush <= 1; ++flush) {
+    retention_disk disk = {0};
+    disk.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
+    disk.dirty = calloc((size_t)(PS_DEFAULT_CAPACITY / PS_PAGE), 1);
+    disk.scratch = malloc(PS_PAGE);
+    REQUIRE(disk.stable && disk.dirty && disk.scratch);
+    ps_io io = {&disk,
+                retention_disk_read,
+                retention_disk_write,
+                retention_disk_sync,
+                retention_disk_reserve,
+                NULL};
+    lc_client *client = index_client(path, 0, 1, 1, &io, &e);
+    lc_pouch *pouch = index_pouch(client);
+    ps_space *space = ps_root_space(ps_pouch_state_root(pouch));
+    ps_stats before, after;
+    lc_pouch_generation sequence = 99;
+    namespace_expect(pouch, 0, &e);
+    ok(ps_status(space, &before, &e), &e);
+    ok(lc_pouch_state_index_seq(pouch, name, &sequence, &e), &e);
+    REQUIRE(sequence == 0);
+    namespace_expect(pouch, 1, &e);
+    ok(ps_status(space, &after, &e), &e);
+    REQUIRE(after.syncs == before.syncs);
+    if (flush) {
+      lc_index_flush_req request;
+      lc_index_flush_res result = {0};
+      index_put_in(client, name, "one", "{\"kind\":\"active\"}", &e);
+      lc_index_flush_req_init(&request);
+      request.ns = name;
+      request.mode = "wait";
+      ok(lc_flush_index(client, &request, &result, &e), &e);
+      REQUIRE(result.flushed && !result.pending);
+      lc_index_flush_res_cleanup(&result);
+    }
+    disk.frozen = 1;
+    lc_client_close(client);
+    REQUIRE(!live);
+    retention_disk_restore(&disk, path);
+    client = index_client(path, 0, 0, 1, &io, &e);
+    namespace_expect(index_pouch(client), (unsigned int)flush, &e);
+    if (flush)
+      REQUIRE(index_query_in(client, name, "index", index_selectors[0], &e) ==
+              1U);
+    lc_client_close(client);
+    REQUIRE(!live && !unlink(path));
+    free(disk.stable);
+    free(disk.dirty);
+    free(disk.scratch);
+  }
+  lc_error_cleanup(&e);
+}
 static void index_faults(const char *directory, int kind) {
   size_t cuts = 0U;
   fixture_directory_sync_model(kind != 0);
+  if (!kind)
+    index_namespace_admission(directory);
   for (int sync = 0; sync < 2; ++sync)
     for (int persist = 0; persist < (kind == 1 ? 3 : 1); ++persist)
       for (int action = 0; action < 4; ++action) {

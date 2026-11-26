@@ -347,7 +347,12 @@ int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
-enum catalog_publication { CATALOG_BOUND, CATALOG_IDENTITY, CATALOG_STAGED };
+enum catalog_publication {
+  CATALOG_BOUND,
+  CATALOG_IDENTITY,
+  CATALOG_STAGED_SEGMENT,
+  CATALOG_STAGED_IDENTITY
+};
 static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
                        unsigned int kind, const void *name, size_t length,
                        const ps_ref *expected, ps_key stream,
@@ -359,7 +364,10 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
   ps_catalog_info info;
   uint64_t sequence = 0, growth = 0, added = 0, prior, next;
   int marker = kind == PS_CATALOG_MARKER;
-  int identity = publication == CATALOG_IDENTITY;
+  int identity =
+      publication == CATALOG_IDENTITY || publication == CATALOG_STAGED_IDENTITY;
+  int defer = publication == CATALOG_STAGED_SEGMENT ||
+              publication == CATALOG_STAGED_IDENTITY;
   int rc, installed = 0, staged = 0;
   if (out)
     memset(out, 0, sizeof(*out));
@@ -378,6 +386,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
   p->key.owner = owner;
   rc = attach_record(p, kind, name, length, value, value_length, e);
   if (rc == LC_OK) {
+    p->catalog->deferred_identity = publication == CATALOG_STAGED_IDENTITY;
     p->catalog->stream = stream;
     p->catalog->token = target ? target->incarnation : 0;
     pthread_mutex_lock(&s->mutex);
@@ -444,7 +453,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
   }
   if (!installed)
     ps_internal_entry_free(p);
-  if (rc == LC_OK && !staged && publication != CATALOG_STAGED)
+  if (rc == LC_OK && !staged && !defer)
     rc = ps_internal_durable(s, sequence, e);
   if (preparation || claim) {
     ps_coordination_unlock(preparation);
@@ -467,10 +476,11 @@ int ps_catalog_stage_segment(ps_space *s, ps_budget *budget, uint64_t owner,
                              const void *name, size_t length, ps_key stream,
                              const ps_ref *target, ps_catalog_info *out,
                              lc_error *e) {
-  return catalog_put(
-      s, budget, owner, PS_CATALOG_SEGMENT, name, length, NULL, stream, target,
-      NULL, 0, out,
-      ps_internal_exclusive_nosync(s) ? CATALOG_STAGED : CATALOG_BOUND, e);
+  return catalog_put(s, budget, owner, PS_CATALOG_SEGMENT, name, length, NULL,
+                     stream, target, NULL, 0, out,
+                     ps_internal_exclusive_nosync(s) ? CATALOG_STAGED_SEGMENT
+                                                     : CATALOG_BOUND,
+                     e);
 }
 int ps_catalog_put_marker(ps_space *s, ps_budget *budget, uint64_t owner,
                           const void *name, size_t length,
@@ -487,6 +497,15 @@ int ps_catalog_create_namespace(ps_space *s, const void *name, size_t length,
   ps_key stream = {0};
   return catalog_put(s, NULL, 0, PS_CATALOG_NAMESPACE, name, length, NULL,
                      stream, NULL, NULL, 0, out, CATALOG_IDENTITY, e);
+}
+int ps_catalog_stage_namespace(ps_space *s, const void *name, size_t length,
+                               ps_catalog_info *out, lc_error *e) {
+  ps_key stream = {0};
+  return catalog_put(s, NULL, 0, PS_CATALOG_NAMESPACE, name, length, NULL,
+                     stream, NULL, NULL, 0, out,
+                     ps_internal_exclusive_nosync(s) ? CATALOG_STAGED_IDENTITY
+                                                     : CATALOG_IDENTITY,
+                     e);
 }
 int ps_catalog_remove_many(ps_space *s, uint64_t owner,
                            const ps_catalog_removal *items, size_t count,
@@ -650,8 +669,15 @@ void ps_catalog_view_close(ps_catalog_view *view) {
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, view);
 }
-int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
-                     ps_catalog_visit_fn callback, void *context, lc_error *e) {
+static ps_entry *visit_visible(ps_entry *p, uint64_t prefix, uint64_t peer,
+                               int local_namespaces) {
+  if (local_namespaces && p->catalog->deferred_identity && !p->deleted)
+    return p;
+  return visible(p, prefix, peer);
+}
+static int catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
+                         int local, ps_catalog_visit_fn callback, void *context,
+                         lc_error *e) {
   ps_entry **entries = NULL, *p, *v;
   ps_coordination_guard *guard;
   ps_catalog_info info;
@@ -668,7 +694,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   for (i = 0; rc == LC_OK && i < s->catalogs.capacity; ++i)
     for (p = s->catalogs.buckets[i]; p; p = p->catalog->next)
       if (p->key.owner == owner && p->catalog->kind == kind &&
-          visible(p, prefix, s->peer_durable))
+          visit_visible(p, prefix, s->peer_durable, local))
         ++count;
   if (rc == LC_OK && count) {
     if (count > (size_t)-1 / sizeof(*entries))
@@ -682,7 +708,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   for (i = 0; rc == LC_OK && i < s->catalogs.capacity; ++i)
     for (p = s->catalogs.buckets[i]; p; p = p->catalog->next)
       if (p->key.owner == owner && p->catalog->kind == kind &&
-          (v = visible(p, prefix, s->peer_durable)) != NULL) {
+          (v = visit_visible(p, prefix, s->peer_durable, local)) != NULL) {
         entries[at++] = v;
         ++v->pins;
         if (v->catalog->target) {
@@ -717,6 +743,15 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   }
   lc_free_with_allocator(NULL, entries);
   return rc;
+}
+int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
+                     ps_catalog_visit_fn callback, void *context, lc_error *e) {
+  return catalog_visit(s, owner, kind, 0, callback, context, e);
+}
+int ps_catalog_visit_live_namespaces(ps_space *s, ps_catalog_visit_fn callback,
+                                     void *context, lc_error *e) {
+  return catalog_visit(s, 0, PS_CATALOG_NAMESPACE,
+                       ps_internal_exclusive_nosync(s), callback, context, e);
 }
 static int orphan(const ps_entry *p, uint64_t prefix, uint64_t peer) {
   return !p->stream.head->handles && !target_retained(p, prefix, peer);

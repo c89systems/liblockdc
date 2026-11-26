@@ -677,7 +677,10 @@ static lc_pouch *visit_open(const char *path, int native, int sync, int create,
      e);
   return pouch;
 }
-static void namespace_artifacts(const char *directory, const char *prefix) {
+static int fixture_selected(const char *name, int value, int maximum);
+static void namespace_artifacts_checked(const char *directory,
+                                        const char *prefix,
+                                        unsigned int profiles) {
   DIR *dir = opendir(directory);
   struct dirent *entry;
   unsigned int mask = 0;
@@ -698,7 +701,10 @@ static void namespace_artifacts(const char *directory, const char *prefix) {
     REQUIRE(bit && !(mask & bit));
     mask |= bit;
   }
-  REQUIRE(closedir(dir) == 0 && mask == 15);
+  REQUIRE(closedir(dir) == 0 && mask == profiles);
+}
+static void namespace_artifacts(const char *directory, const char *prefix) {
+  namespace_artifacts_checked(directory, prefix, 15);
 }
 static const char *visit_names[] = {
     "team/alpha", "%2f", ".", "space name", ".txns", "created/during/visit"};
@@ -776,12 +782,20 @@ static size_t namespace_cold_failures(const char *path, int native, int sync,
 static void namespace_visits(const char *directory) {
   lc_error e;
   size_t sites = 0, cold_sites = 0;
+  unsigned int profiles = 0;
   lc_error_init(&e);
   REQUIRE(lc_pouch_storage_namespaces_visit(NULL, namespace_name, NULL, &e) ==
           LC_ERR_INVALID);
   clear(&e);
+  /* This sweep models API allocation and read failures. Keep the physical
+   * barriers in the durability, crash, and comparison fixtures. */
+  fixture_barriers_model(1);
   for (int native = 0; native < 2; ++native)
     for (int sync = 0; sync < 2; ++sync) {
+      int profile = native * 2 + sync;
+      if (!fixture_selected("POUCH_NAMESPACE_TEST_PROFILE", profile, 3))
+        continue;
+      profiles |= 1U << profile;
       char path[1400], invalid[1500], saved[1500];
       io_fault f = {0};
       ps_io io = {&f, disk_read, disk_write, disk_sync, disk_reserve, NULL};
@@ -892,7 +906,8 @@ static void namespace_visits(const char *directory) {
          "both owners/policies, "
          "cold/warm, callback retry, nested mutation and poisoned admission\n",
          sites, cold_sites);
-  namespace_artifacts(directory, "visit-");
+  namespace_artifacts_checked(directory, "visit-", profiles);
+  fixture_barriers_model(0);
   lc_error_cleanup(&e);
 }
 static double namespace_clock(clockid_t clock) {
@@ -947,9 +962,15 @@ static void *create_and_visit(void *context) {
 }
 static void namespace_concurrency(const char *directory) {
   lc_error e;
+  unsigned int profiles = 0;
   lc_error_init(&e);
+  fixture_barriers_model(1);
   for (int native = 0; native < 2; ++native)
     for (int sync = 0; sync < 2; ++sync) {
+      int profile = native * 2 + sync;
+      if (!fixture_selected("POUCH_NAMESPACE_TEST_PROFILE", profile, 3))
+        continue;
+      profiles |= 1U << profile;
       pthread_t threads[4];
       concurrent_visit workers[4];
       char path[1400];
@@ -974,7 +995,8 @@ static void namespace_concurrency(const char *directory) {
       if (!native)
         one_file(path);
     }
-  namespace_artifacts(directory, "concurrent-");
+  namespace_artifacts_checked(directory, "concurrent-", profiles);
+  fixture_barriers_model(0);
   lc_error_cleanup(&e);
 }
 static void namespace_compare(const char *directory, int reverse) {

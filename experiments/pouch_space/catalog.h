@@ -31,6 +31,10 @@ int ps_catalog_allocate_id(ps_space *, uint64_t *, lc_error *);
  * belongs to the root owner. Removal/recreation allocates a fresh identity. */
 int ps_catalog_create_namespace(ps_space *, const void *, size_t,
                                 ps_catalog_info *, lc_error *);
+/* A lazy exclusive NoSync owner can use its journaled namespace identity
+ * before it is durable. Its incarnation reservation still precedes use. */
+int ps_catalog_stage_namespace(ps_space *, const void *, size_t,
+                               ps_catalog_info *, lc_error *);
 /* Names are exact byte strings, including empty names, not filesystem paths.
  * NULL expected means create-only; otherwise replace exactly that revision.
  * Structural publication always waits for durability, even in NoSync stores.
@@ -90,6 +94,10 @@ typedef int (*ps_catalog_visit_fn)(void *, const void *, size_t,
  * follows captured metadata, never reserved capacity or document bodies. */
 int ps_catalog_visit(ps_space *, uint64_t owner, unsigned int kind,
                      ps_catalog_visit_fn, void *, lc_error *);
+/* Live namespace discovery for the exclusive owner includes its staged
+ * names. Shared readers still select one durable catalog prefix. */
+int ps_catalog_visit_live_namespaces(ps_space *, ps_catalog_visit_fn, void *,
+                                     lc_error *);
 typedef int (*ps_catalog_orphan_fn)(void *, ps_key, const ps_ref *, lc_error *);
 /* Candidates have no live catalog references, no catalog views, no open owner
  * and no pending catalog release. Callbacks revalidate before retirement:

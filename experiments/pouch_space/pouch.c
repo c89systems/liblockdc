@@ -113,7 +113,8 @@ static int namespace_open(void *context, const char *name, int create,
   ps_namespace *ns = NULL;
   ps_checkpoint_observer observer = {checkpoint_prepare, checkpoint_finish,
                                      NULL};
-  int rc = ps_root_namespace_acquire(owner->root, name, create, &ns, e);
+  int rc = create ? ps_root_namespace_stage(owner->root, name, &ns, e)
+                  : ps_root_namespace_acquire(owner->root, name, 0, &ns, e);
   observer.context = context;
   if (rc == LC_OK)
     rc = ps_namespace_checkpoint_observe(ns, &observer, e);

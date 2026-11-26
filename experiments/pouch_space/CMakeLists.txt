@@ -898,13 +898,21 @@ if(LOCKDC_BUILD_TESTS)
       endforeach()
     endforeach()
   endforeach()
-  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-io-faults retention-capacity retention-capacity-faults retention-progress retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare outbox-markers outbox-notifications outbox-marker-io-faults outbox-marker-allocation-faults outbox-marker-crash outbox-marker-concurrency)
+  foreach(mode lifecycle validation faults io-faults namespace-compare retention-codec retention retention-io-faults retention-capacity retention-capacity-faults retention-progress retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare outbox-markers outbox-notifications outbox-marker-io-faults outbox-marker-allocation-faults outbox-marker-crash outbox-marker-concurrency)
     add_test(NAME pouch_space_client_${mode} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space")
     if(mode MATCHES "compare$")
       set_tests_properties(pouch_space_client_${mode} PROPERTIES
         RESOURCE_LOCK pouch_space_comparison COST 12)
     endif()
+  endforeach()
+  foreach(mode namespaces namespace-concurrency)
+    foreach(profile RANGE 0 3)
+      set(name pouch_space_client_${mode}_${profile})
+      add_test(NAME ${name} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+      set_tests_properties(${name} PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space"
+        ENVIRONMENT "POUCH_NAMESPACE_TEST_PROFILE=${profile}")
+    endforeach()
   endforeach()
   set_tests_properties(pouch_space_client_outbox-marker-crash PROPERTIES TIMEOUT 300)
   foreach(profile RANGE 0 3)
@@ -1100,16 +1108,24 @@ if(LOCKDC_BUILD_TESTS)
   target_include_directories(pouch_space_root_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_root_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_root_test PRIVATE
+    "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync"
     "LINKER:--wrap=lc_alloc_with_allocator"
     "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator"
     "LINKER:--wrap=lc_strdup_with_allocator"
     "LINKER:--wrap=ps_internal_entry_new")
   lc_configure_c_test_target(pouch_space_root_test)
-  foreach(mode lifecycle faults concurrency)
+  foreach(mode catalog faults concurrency)
     add_test(NAME pouch_space_root_${mode}
       COMMAND pouch_space_root_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_root_${mode} PROPERTIES TIMEOUT 120
+      LABELS "unit;local;pouch-space")
+  endforeach()
+  foreach(codec RANGE 0 3)
+    set(name pouch_space_root_lifecycle_${codec})
+    add_test(NAME ${name}
+      COMMAND pouch_space_root_test ${CMAKE_CURRENT_BINARY_DIR} lifecycle ${codec})
+    set_tests_properties(${name} PROPERTIES TIMEOUT 180
       LABELS "unit;local;pouch-space")
   endforeach()
   add_executable(pouch_space_control_test control_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)

@@ -387,7 +387,13 @@ int ps_namespace_unguard(ps_namespace *ns, ps_coordination_guard *guard, int rc,
   }
   return rc;
 }
-static int namespace_load(ps_namespace *ns, int create, lc_error *error) {
+enum namespace_admission_mode {
+  NAMESPACE_LOOKUP,
+  NAMESPACE_CREATE,
+  NAMESPACE_STAGE
+};
+static int namespace_load(ps_namespace *ns, enum namespace_admission_mode mode,
+                          lc_error *error) {
   ps_catalog_view *view = NULL;
   ps_catalog_info binding;
   ps_coordination_guard *guard;
@@ -397,9 +403,12 @@ static int namespace_load(ps_namespace *ns, int create, lc_error *error) {
                         strlen(ns->name), &view, error);
   if (rc == LC_OK && view)
     rc = ps_catalog_view_info(view, &binding, error);
-  else if (rc == LC_OK && !create)
+  else if (rc == LC_OK && mode == NAMESPACE_LOOKUP)
     rc = failure(error, LC_ERR_INVALID, "pouch_namespace_not_found",
                  "pouch namespace does not exist");
+  else if (rc == LC_OK && mode == NAMESPACE_STAGE)
+    rc = ps_catalog_stage_namespace(ns->root->space, ns->name, strlen(ns->name),
+                                    &binding, error);
   else if (rc == LC_OK)
     rc = ps_catalog_create_namespace(ns->root->space, ns->name,
                                      strlen(ns->name), &binding, error);
@@ -446,8 +455,9 @@ static int namespace_locks_init(ps_namespace *ns, lc_error *error) {
   }
   return LC_OK;
 }
-int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
-                              ps_namespace **out, lc_error *error) {
+static int namespace_acquire(ps_root *root, const char *name,
+                             enum namespace_admission_mode mode,
+                             ps_namespace **out, lc_error *error) {
   ps_namespace *ns, *fresh = NULL, *dead = NULL;
   uint64_t hash;
   int rc = LC_OK;
@@ -501,7 +511,7 @@ int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
     if (!ns->ready) {
       ns->loading = 1;
       pthread_mutex_unlock(&root->mutex);
-      rc = namespace_load(ns, create, error);
+      rc = namespace_load(ns, mode, error);
       pthread_mutex_lock(&root->mutex);
       ns->loading = 0;
       ns->ready = rc == LC_OK;
@@ -541,6 +551,15 @@ int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
     lc_free_with_allocator(NULL, dead);
   }
   return rc;
+}
+int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
+                              ps_namespace **out, lc_error *error) {
+  return namespace_acquire(
+      root, name, create ? NAMESPACE_CREATE : NAMESPACE_LOOKUP, out, error);
+}
+int ps_root_namespace_stage(ps_root *root, const char *name, ps_namespace **out,
+                            lc_error *error) {
+  return namespace_acquire(root, name, NAMESPACE_STAGE, out, error);
 }
 int ps_namespace_identity(const ps_namespace *ns, ps_namespace_info *out,
                           lc_error *error) {
@@ -612,8 +631,8 @@ int ps_root_namespace_visit(ps_root *root, ps_namespace_visit_fn visit,
   pthread_mutex_lock(&root->mutex);
   ++root->calls;
   pthread_mutex_unlock(&root->mutex);
-  rc = ps_catalog_visit(root->space, 0, PS_CATALOG_NAMESPACE, visit_namespace,
-                        &ctx, error);
+  rc = ps_catalog_visit_live_namespaces(root->space, visit_namespace, &ctx,
+                                        error);
   pthread_mutex_lock(&root->mutex);
   --root->calls;
   pthread_mutex_unlock(&root->mutex);

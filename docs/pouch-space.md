@@ -118,6 +118,10 @@ completed canonical prefix.
 An exclusive namespace can answer an index freshness check from the
 watermark recovered at open while its logical epoch and tail match. Queries
 that need canonical keys still populate the state projection.
+An exclusive NoSync owner can discover a new namespace as soon as its name
+is journaled. The next canonical durability barrier covers the name and its
+completed records. A newly reserved incarnation range becomes durable before
+dependent records use it.
 Exclusive NoSync foreground appends frame a successor binding and maintenance
 hint before the route can select that segment. The route makes the hint
 discoverable to live maintenance. The next canonical durability barrier

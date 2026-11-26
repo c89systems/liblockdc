@@ -284,6 +284,7 @@ struct ps_reserve {
 
 typedef struct ps_catalog_record {
   unsigned int kind;
+  int deferred_identity;
   ps_writer_stamp writer;
   size_t length, value_length;
   unsigned char *name;

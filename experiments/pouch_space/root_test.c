@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
+#include "fixture_barriers.h"
 #include "lc_api_internal.h"
 #include "root.h"
 #include "space_internal.h"
@@ -170,7 +171,7 @@ static void read_body(ps_root *root, ps_stream *stream, const char *descriptor,
   ps_stream_reader_close(source.reader);
 }
 static void lifecycle(const char *path, const char *key_string,
-                      const char *wrong_key) {
+                      const char *wrong_key, int selected_codec) {
   ps_root *r = NULL, *other = NULL;
   ps_root_options options = {0}, mismatch;
   ps_namespace *a, *b, *again;
@@ -201,7 +202,9 @@ static void lifecycle(const char *path, const char *key_string,
   clear(&e);
   ok(ps_root_close(NULL, &e), &e);
   ps_namespace_release(NULL);
-  for (int transform = 0; transform < 4; ++transform) {
+  int first_codec = selected_codec < 0 ? 0 : selected_codec;
+  int last_codec = selected_codec < 0 ? 3 : selected_codec;
+  for (int transform = first_codec; transform <= last_codec; ++transform) {
     char *descriptor = NULL;
     uint64_t plain, stored;
     unsigned long crc;
@@ -424,6 +427,9 @@ static void malformed(const char *path) {
   REQUIRE(got == sizeof(original));
   ps_reader_close(reader);
   ok(ps_root_close(root, &e), &e);
+  /* The malformed records test decoder admission across reopen. Each
+   * revision needs visible bytes, with physical barriers tested separately. */
+  fixture_barriers_model(1);
   for (size_t mutation = 0; mutation < 142; ++mutation) {
     memcpy(bad, original, sizeof(original));
     bad[128] = 0;
@@ -453,6 +459,7 @@ static void malformed(const char *path) {
             root == NULL);
     clear(&e);
   }
+  fixture_barriers_model(0);
   REQUIRE(unlink(path) == 0);
   for (int variant = 0; variant < 6; ++variant) {
     ok(ps_root_open(path, 1, NULL, &root, &e), &e);
@@ -535,6 +542,7 @@ static void conversion_intent(const char *path) {
   ok(ps_root_open(path, 1, NULL, &root, &e), &e);
   ok(ps_root_close(root, &e), &e);
   const unsigned offsets[] = {8, 16, 24, 32, 40, 48, 56, 64, 80, 88, 96, 176};
+  fixture_barriers_model(1);
   for (size_t mutation = 0; mutation < 194 + sizeof(offsets) / sizeof(*offsets);
        ++mutation) {
     memcpy(bad, valid, sizeof(valid));
@@ -561,6 +569,7 @@ static void conversion_intent(const char *path) {
     REQUIRE(ps_root_open(path, 0, NULL, &root, &e) == LC_ERR_PROTOCOL && !root);
     clear(&e);
   }
+  fixture_barriers_model(0);
   ps_writer *writer = NULL;
   ok(ps_open(path, 0, NULL, &space, &e), &e);
   ok(ps_begin(space, NULL, key, &writer, &e), &e);
@@ -583,7 +592,7 @@ static void catalog(const char *path) {
   ok(ps_root_open(path, 1, NULL, &root, &e), &e);
   for (unsigned i = 0; i < 500; ++i) {
     snprintf(name, sizeof(name), "ns-%u", i);
-    ns = acquire(root, name, 1, &e);
+    ok(ps_root_namespace_stage(root, name, &ns, &e), &e);
     ps_namespace_release(ns);
   }
   count(root, 500, &e);
@@ -1104,11 +1113,17 @@ static void death(const char *path) {
 }
 typedef struct run {
   const char *path, *mode, *key, *wrong_key;
+  int codec;
 } run;
 static void *run_tests(void *v) {
   run *r = v;
-  if (!strcmp(r->mode, "lifecycle")) {
-    lifecycle(r->path, r->key, r->wrong_key);
+  int lifecycle_mode = !strcmp(r->mode, "lifecycle");
+  if (lifecycle_mode) {
+    lifecycle(r->path, r->key, r->wrong_key, r->codec);
+    if (r->codec >= 0)
+      return NULL;
+  }
+  if (lifecycle_mode || !strcmp(r->mode, "catalog")) {
     namespace_records(r->path);
     malformed(r->path);
     conversion_intent(r->path);
@@ -1132,11 +1147,17 @@ int main(int argc, char **argv) {
   lc_error e;
   char *key = NULL, *wrong = NULL;
   pthread_t thread;
-  REQUIRE(argc == 3);
+  int codec = -1;
+  REQUIRE(argc == 3 || argc == 4);
+  if (argc == 4) {
+    REQUIRE(!strcmp(argv[2], "lifecycle") && argv[3][0] >= '0' &&
+            argv[3][0] <= '3' && !argv[3][1]);
+    codec = argv[3][0] - '0';
+  }
   REQUIRE(pthread_key_create(&thread_gate, NULL) == 0);
   thread_gate_ready = 1;
   REQUIRE(!strcmp(argv[2], "lifecycle") || !strcmp(argv[2], "faults") ||
-          !strcmp(argv[2], "concurrency"));
+          !strcmp(argv[2], "concurrency") || !strcmp(argv[2], "catalog"));
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/pouch-root-", argv[1]) > 0);
   REQUIRE(snprintf(temporary, sizeof(temporary), "%sXXXXXX", prefix) > 0);
   REQUIRE(lc_test_tmp_mkdtemp(temporary, root, sizeof(root), prefix));
@@ -1144,7 +1165,7 @@ int main(int argc, char **argv) {
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&key, &e), &e);
   ok(lc_pouch_crypto_generate_key_string(&wrong, &e), &e);
-  run r = {path, argv[2], key, wrong};
+  run r = {path, argv[2], key, wrong, codec};
   REQUIRE(pthread_create(&thread, NULL, run_tests, &r) == 0);
   REQUIRE(pthread_join(thread, NULL) == 0);
   thread_gate_ready = 0;

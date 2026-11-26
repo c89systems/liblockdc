@@ -19657,6 +19657,30 @@ int lc_pouch_client_recover_transactions(lc_client *self, lc_error *error) {
                         "pouch transaction recovery requires self", NULL, NULL,
                         NULL);
   client = (lc_client_handle *)self;
+  if (client->pouch->storage.ops &&
+      !client->pouch->storage.coordinated_namespaces &&
+      !client->pouch->durable_sync) {
+    lc_pouch_storage *storage = &client->pouch->storage;
+    void *namespace_handle = NULL;
+    lc_error lookup;
+    lc_error_init(&lookup);
+    /* Startup only inspects transaction history. Creating an empty name
+     * here leaves journal work on an otherwise quiescent NoSync root. */
+    rc = storage->ops->namespace_open(storage->context, LC_POUCH_TXN_NAMESPACE,
+                                      0, &namespace_handle, &lookup);
+    if (rc == LC_ERR_INVALID && lookup.server_code &&
+        !strcmp(lookup.server_code, "pouch_namespace_not_found")) {
+      lc_error_cleanup(&lookup);
+      return LC_OK;
+    }
+    if (rc != LC_OK)
+      lc_error_set(error, lookup.code, lookup.http_status, lookup.message,
+                   lookup.detail, lookup.server_code, lookup.correlation_id);
+    lc_error_cleanup(&lookup);
+    if (rc != LC_OK)
+      return rc;
+    storage->ops->namespace_close(storage->context, namespace_handle);
+  }
   group_retirements = client->pouch->storage.ops && client->pouch->durable_sync;
   rc = lc_pouch_state_visit(client->pouch, LC_POUCH_TXN_NAMESPACE,
                             lc_pouch_txn_collect_key, &keys, error);
