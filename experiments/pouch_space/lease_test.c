@@ -6,6 +6,7 @@
 #include "lc_pouch_format.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_retention.h"
+#include "lc_pouch_storage.h"
 #include "lc_pouch_txn_guard.h"
 #include "pouch.h"
 #include "pouch_internal.h"
@@ -297,7 +298,7 @@ static void open_store(fixture *f, int create, lc_error *e) {
   if (shared_lease_fixture)
     physical.maximum_capacity = PS_DEFAULT_CAPACITY;
   ok(f->native
-         ? lc_client_open(&f->config, &f->client, e)
+         ? lc_pouch_legacy_client_open(&f->config, &f->client, e)
          : ps_pouch_client_open(&f->config, create, &physical, &f->client, e),
      e);
   REQUIRE((store(f)->storage.ops == NULL) == f->native);

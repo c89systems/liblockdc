@@ -25,6 +25,7 @@
 #include "lc_pouch_path.h"
 #include "lc_pouch_recode.h"
 #include "lc_pouch_record.h"
+#include "lc_pouch_storage.h"
 
 #define PREFIX LC_COLLECTION_TMP_PARENT "/liblockdc-compression-"
 typedef struct unit_sync_probe {
@@ -103,7 +104,7 @@ static int open_client(fixture *f, const char *mode, lc_client **out) {
     config.allocator.free_fn = fixture_free;
     config.allocator.context = f;
   }
-  return lc_client_open(&config, out, &f->error);
+  return lc_pouch_legacy_client_open(&config, out, &f->error);
 }
 static void expect_mode(fixture *f, lc_client *client, const char *mode) {
   lc_pouch_status status = {0};

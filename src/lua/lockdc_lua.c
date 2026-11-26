@@ -2171,7 +2171,8 @@ static int lcdc_pouch_settings_check_keys(lua_State *L, int index,
         strcmp(name, "crypto_key") != 0 &&
         strcmp(name, "crypto_key_file") != 0 &&
         strcmp(name, "crypto_generate_key_file") != 0 &&
-        strcmp(name, "compression") != 0) {
+        strcmp(name, "compression") != 0 &&
+        strcmp(name, "disable_migration") != 0) {
       lua_pop(L, 2);
       return lc_error_set(error, LC_ERR_INVALID, 0L, "unknown pouch setting",
                           name, NULL, "pouch");
@@ -2395,6 +2396,13 @@ static int lcdc_parse_pouch_settings(lua_State *L, int index,
     settings->compression = value;
     settings->set_mask |= LC_POUCH_SETTING_COMPRESSION;
   }
+  rc =
+      lcdc_pouch_setting_boolean(L, index, "disable_migration",
+                                 &settings->disable_migration, &present, error);
+  if (rc != LC_OK)
+    return rc;
+  if (present)
+    settings->set_mask |= LC_POUCH_SETTING_DISABLE_MIGRATION;
   return LC_OK;
 }
 

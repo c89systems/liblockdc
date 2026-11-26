@@ -18,6 +18,7 @@
 #include "lc_collection_internal.h"
 #include "lc_collection_query.h"
 #include "lc_pouch_namespace.h"
+#include "lc_pouch_storage.h"
 
 #define PREFIX LC_COLLECTION_TMP_PARENT "/mixed-storage-"
 #define WRITERS 3
@@ -77,7 +78,7 @@ static void open_client(fixture *f, int create, int durable, uint64_t segment,
   config.endpoint_count = 1;
   config.default_namespace = "mixed";
   config.pouch_settings = &settings;
-  check(f, lc_client_open(&config, &f->client, &f->error));
+  check(f, lc_pouch_legacy_client_open(&config, &f->client, &f->error));
   collection.name = "events";
   check(f, create ? lc_client_create_collection(f->client, &collection,
                                                 &f->collection, &f->error)

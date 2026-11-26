@@ -17,6 +17,7 @@
 
 #include "../support/lc_test_tmp.h"
 #include "lc_collection_internal.h"
+#include "lc_pouch_storage.h"
 
 #define PREFIX LC_COLLECTION_TMP_PARENT "/collection-sync-"
 #define WRITERS 4
@@ -94,7 +95,7 @@ static void open_client(fixture *f, size_t index, int exclusive, long segment) {
   config.endpoint_count = 1U;
   config.default_namespace = "sync";
   config.pouch_settings = &settings;
-  check(f, lc_client_open(&config, &f->clients[index], &f->error));
+  check(f, lc_pouch_legacy_client_open(&config, &f->clients[index], &f->error));
 }
 
 static void open_handles(fixture *f, int exclusive, long segment) {

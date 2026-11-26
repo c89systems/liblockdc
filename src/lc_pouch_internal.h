@@ -478,6 +478,8 @@ int lc_pouch_compaction_capacity_turn(lc_pouch *,
  */
 int lc_pouch_compaction_note_history_advanced(lc_pouch *pouch, const char *ns,
                                               lc_error *error);
+int lc_pouch_import_terminal_reclaim(lc_pouch *source, lc_pouch *target,
+                                     const char *ns, lc_error *error);
 /* Consumes completed terminal-reclaim work while the caller holds the same
  * namespace mutation authority used to make the reclamation decision. */
 int lc_pouch_terminal_reclaim_marker_remove(lc_pouch *pouch, const char *ns,

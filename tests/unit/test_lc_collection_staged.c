@@ -21,6 +21,7 @@
 #include "lc_collection_chunks.h"
 #include "lc_collection_internal.h"
 #include "lc_pouch_recode.h"
+#include "lc_pouch_storage.h"
 
 #define PREFIX LC_COLLECTION_TMP_PARENT "/collection-staged-"
 #define BODY_BYTES (256U * 1024U)
@@ -105,7 +106,7 @@ static void open_owners(fixture *f, int mode, int create) {
   config.default_namespace = "journal";
   config.allocator = f->allocator;
   config.pouch_settings = &settings;
-  check(f, lc_client_open(&config, &f->client, &f->error));
+  check(f, lc_pouch_legacy_client_open(&config, &f->client, &f->error));
   collection.name = "events";
   check(f, create ? lc_client_create_collection(f->client, &collection,
                                                 &f->collection, &f->error)
@@ -984,9 +985,8 @@ static uint64_t stream_materialized_bytes(int fd, off_t size) {
   unsigned char page[sizeof(zero)];
   uint64_t bytes = 0;
   for (off_t at = 0; at < size;) {
-    size_t count = (size - at < (off_t)sizeof(page))
-                       ? (size_t)(size - at)
-                       : sizeof(page);
+    size_t count =
+        (size - at < (off_t)sizeof(page)) ? (size_t)(size - at) : sizeof(page);
     ssize_t got;
     do {
       got = pread(fd, page, count, at);

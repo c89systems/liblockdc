@@ -55,6 +55,7 @@ int main(int argc, char **argv) {
   const char *endpoints[1];
   unsigned int round;
   unsigned int required_keys;
+  int retained_failed_lease = 0;
   int rc = LC_OK;
   int failed = 1;
 
@@ -68,11 +69,15 @@ int main(int argc, char **argv) {
       RAND_bytes(bytes, sizeof(bytes)) != 1 ||
       !lc_test_tmp_mkdtemp(template_path, root, sizeof(root), TMP_PREFIX))
     goto done;
-  if (snprintf(endpoint, sizeof(endpoint), "pouch://%s?single_writer=%s", root,
-               strcmp(argv[2], "single") == 0 ? "true" : "false") < 0)
+  if (snprintf(endpoint, sizeof(endpoint), "pouch://%s/store?single_writer=%s",
+               root, strcmp(argv[2], "single") == 0 ? "true" : "false") < 0)
     goto done;
   endpoints[0] = endpoint;
   required_keys = strcmp(argv[2], "single") == 0 ? 3U : 4U;
+#ifdef LOCKDC_POUCH_CONTAINER
+  /* Shared container owners use their own physical mutation authority. */
+  required_keys = 3U;
+#endif
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
@@ -87,22 +92,32 @@ int main(int argc, char **argv) {
     if (rc == LC_OK) {
       lc_acquire_req_init(&acquire);
       acquire.ns = "default";
-      acquire.key = "key-failure";
+      acquire.key =
+          retained_failed_lease ? "key-failure-reopen" : "key-failure";
       acquire.owner = "key-failure-test";
       acquire.ttl_seconds = 30L;
       rc = lc_acquire(client, &acquire, &lease, &error);
     }
-    if (injected && fail_at <= required_keys) {
-      if (rc != LC_ERR_TRANSPORT || error.code != rc || lease != NULL)
+    if (rc == LC_OK) {
+      if (lease == NULL)
         goto done;
-    } else {
-      if (rc != LC_OK || lease == NULL ||
-          lc_source_from_memory("{\"value\":1}", 11U, &source, &error) !=
-              LC_OK ||
-          lc_lease_update(lease, source, NULL, &error) != LC_OK)
-        goto done;
+      rc = lc_source_from_memory("{\"value\":1}", 11U, &source, &error);
+      if (rc == LC_OK)
+        rc = lc_lease_update(lease, source, NULL, &error);
       lc_source_close(source);
       source = NULL;
+    }
+    if (injected && fail_at <= required_keys) {
+      if (rc != LC_ERR_TRANSPORT || error.code != rc)
+        goto done;
+      /* An exclusive container can acquire before the update first needs a
+       * namespace guard. Leave that acquired lease untouched on reopen. */
+      retained_failed_lease = lease != NULL;
+      lc_lease_close(lease);
+      lease = NULL;
+    } else {
+      if (rc != LC_OK)
+        goto done;
       if (lc_lease_release(lease, NULL, &error) != LC_OK)
         goto done;
       lease = NULL;

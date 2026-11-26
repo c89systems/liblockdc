@@ -13,6 +13,9 @@
 #include "lc_pouch_query_index.h"
 #include "lc_pouch_recode.h"
 #include "lc_pouch_retention.h"
+#ifdef LOCKDC_POUCH_CONTAINER
+#include "migration.h"
+#endif
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -1345,9 +1348,8 @@ static void *lc_pouch_compaction_worker(void *arg) {
           lc_pouch_compaction_capacity_turn(pouch, &capacity, &pressure_delay);
     /* Keep sampling headroom during the advisory window so an urgent
      * observation can bypass it. Every pass services the same work sources. */
-    if ((regular_due ||
-         (capacity_due &&
-          (!capacity.advisory || compaction_due(&now, &advisory)))) &&
+    if ((regular_due || (capacity_due && (!capacity.advisory ||
+                                          compaction_due(&now, &advisory)))) &&
         !lc_pouch_compaction_stopping(pouch)) {
       lc_pouch_compaction_run_pass(pouch);
       if (armed)
@@ -1609,6 +1611,23 @@ int lc_pouch_compaction_note_history_advanced(lc_pouch *pouch, const char *ns,
   if (rc == LC_OK) {
     lc_pouch_compaction_note_mutation(pouch, ns, 1);
   }
+  return rc;
+}
+
+int lc_pouch_import_terminal_reclaim(lc_pouch *source, lc_pouch *target,
+                                     const char *ns, lc_error *error) {
+  char *directory = NULL, *path = NULL;
+  struct stat info;
+  int rc = lc_pouch_terminal_reclaim_marker_path(source, ns, 0, &directory,
+                                                 &path, error);
+  if (rc == LC_OK && lstat(path, &info) == 0)
+    rc = lc_pouch_terminal_reclaim_marker_write(target, ns, error);
+  else if (rc == LC_OK && errno != ENOENT)
+    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                      "failed to inspect legacy terminal reclaim marker",
+                      strerror(errno), path, "pouch");
+  lc_free_with_allocator(&source->allocator, path);
+  lc_free_with_allocator(&source->allocator, directory);
   return rc;
 }
 
@@ -4030,6 +4049,26 @@ int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
   return LC_OK;
 }
 
+int lc_pouch_legacy_runtime_factory(void *context, const char *path,
+                                    const lc_allocator *allocator,
+                                    const lc_pouch_open_options *options,
+                                    lc_pouch **out, lc_error *error) {
+  (void)context;
+  return lc_pouch_open(path, allocator, options, out, error);
+}
+
+int lc_pouch_open_managed(const char *path, const lc_allocator *allocator,
+                          const lc_pouch_open_options *options, lc_pouch **out,
+                          lc_error *error) {
+#ifdef LOCKDC_POUCH_CONTAINER
+  return ps_pouch_open_managed(path, allocator, options,
+                               options && options->disable_migration, out,
+                               error);
+#else
+  return lc_pouch_open(path, allocator, options, out, error);
+#endif
+}
+
 void lc_pouch_close(lc_pouch *pouch) {
   lc_allocator allocator;
 
@@ -4735,8 +4774,9 @@ int lc_pouch_status_read(lc_pouch *pouch, lc_pouch_status *out,
   memset(out, 0, sizeof(*out));
   out->root_path =
       lc_strdup_with_allocator(&pouch->allocator, pouch->root_path);
-  out->layout_name =
-      lc_strdup_with_allocator(&pouch->allocator, LC_POUCH_LAYOUT_NAME);
+  out->layout_name = lc_strdup_with_allocator(
+      &pouch->allocator,
+      pouch->storage.ops ? "pouch-container" : LC_POUCH_LAYOUT_NAME);
   if (out->root_path == NULL || out->layout_name == NULL) {
     lc_pouch_status_cleanup(&pouch->allocator, out);
     return lc_error_set(error, LC_ERR_NOMEM, 0L, "failed to copy pouch status",

@@ -26,6 +26,7 @@
 #include "lc_pouch_path.h"
 #include "lc_pouch_recode.h"
 #include "lc_pouch_record.h"
+#include "lc_pouch_storage.h"
 
 #define PREFIX LC_COLLECTION_TMP_PARENT "/collections-api-"
 
@@ -80,7 +81,7 @@ static void open_client(fixture *f, const char *key, int compressed,
   config.endpoint_count = 1U;
   config.default_namespace = "journal";
   config.pouch_settings = &settings;
-  check(f, lc_client_open(&config, &f->client, &f->error));
+  check(f, lc_pouch_legacy_client_open(&config, &f->client, &f->error));
 }
 
 static void close_handles(fixture *f) {
@@ -233,11 +234,11 @@ static int load_query(fixture *f, const char *query_id, int *found) {
   check(f, lc_collection_order_rows(&handle->order, 0, rows,
                                     LC_COLLECTION_ORDER_PAGE_ROWS, &count,
                                     proof, &f->error));
-  return lc_collection_query_load(handle,
-                                  query_id ? query_id :
-                                  lc_collection_query_epoch(handle, &handle->order),
-                                  0, lc_collection_query_row_hash(rows, count),
-                                  proof, &f->query_index, found, &f->error);
+  return lc_collection_query_load(
+      handle,
+      query_id ? query_id : lc_collection_query_epoch(handle, &handle->order),
+      0, lc_collection_query_row_hash(rows, count), proof, &f->query_index,
+      found, &f->error);
 }
 
 static void
@@ -1503,7 +1504,7 @@ static void test_remote_unsupported_without_network_requests(void **state) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.disable_mtls = 1;
-  check(f, lc_client_open(&config, &f->client, &f->error));
+  check(f, lc_pouch_legacy_client_open(&config, &f->client, &f->error));
   check(f,
         lc_client_collection_capabilities(f->client, &capabilities, &f->error));
   assert_true(!capabilities.collections && !capabilities.lql_filter &&
@@ -5156,7 +5157,7 @@ static void test_push_allocation_failure_and_bounded_heap(void **state) {
   config.allocator.realloc_fn = lease_reallocate;
   config.allocator.free_fn = lease_free;
   config.allocator.context = &stats;
-  check(f, lc_client_open(&config, &f->client, &f->error));
+  check(f, lc_pouch_legacy_client_open(&config, &f->client, &f->error));
   bind_collection(f, "events", 1, &f->a);
   check(f, lc_collection_append_begin(f->a, &req, &writer, &f->error));
   stats.largest = 0;
@@ -5218,7 +5219,7 @@ test_collection_lease_allocation_failure_keeps_ownership_free(void **state) {
   config.allocator.realloc_fn = lease_reallocate;
   config.allocator.free_fn = lease_free;
   config.allocator.context = &stats;
-  check(f, lc_client_open(&config, &f->client, &f->error));
+  check(f, lc_pouch_legacy_client_open(&config, &f->client, &f->error));
   bind_collection(f, "events", 1, &f->a);
   stats.fail = 1;
   assert_int_equal(lc_collection_acquire(f->a, &req, &f->b, &f->error),
@@ -5373,7 +5374,7 @@ static int migration_open(fixture *f) {
   config.endpoint_count = 1;
   config.default_namespace = "journal";
   config.pouch_settings = &settings;
-  return lc_client_open(&config, &f->client, &f->error);
+  return lc_pouch_legacy_client_open(&config, &f->client, &f->error);
 }
 
 static int migration_count(void *context, const char *path, int published,

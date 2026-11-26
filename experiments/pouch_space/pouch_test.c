@@ -10,6 +10,7 @@
 #include "lc_collection_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
+#include "migration.h"
 #include "namespace.h"
 #include "namespace_work.h"
 #include "pouch.h"
@@ -7851,7 +7852,7 @@ static void legacy_state_import(const char *path, const char *directory) {
   lc_error_cleanup(&e);
 }
 
-static void legacy_collection_import(const char *path, const char *directory) {
+static void legacy_collection_import(const char *directory) {
   lc_error e;
   lc_error_init(&e);
   for (int codec = 0; codec < 4; ++codec) {
@@ -7867,7 +7868,6 @@ static void legacy_collection_import(const char *path, const char *directory) {
     lc_pouch_maintenance_result maintenance = {0};
     lc_client *client = NULL;
     lc_collection *collection = NULL;
-    lc_pouch *source_pouch = NULL, *target = NULL;
     lc_source *body = NULL;
     lc_sink *sink = NULL;
     const void *bytes;
@@ -7883,7 +7883,7 @@ static void legacy_collection_import(const char *path, const char *directory) {
     config.endpoint_count = 1;
     config.pouch_compression = o.logical.compression;
     config.pouch_crypto_key = o.logical.crypto_key;
-    ok(lc_client_open(&config, &client, &e), &e);
+    ok(lc_pouch_legacy_client_open(&config, &client, &e), &e);
     lc_collection_config_init(&collection_config);
     collection_config.ns = "tenant/log";
     collection_config.name = "Journal";
@@ -7905,19 +7905,12 @@ static void legacy_collection_import(const char *path, const char *directory) {
     ok(lc_collection_head(collection, &before, &e), &e);
     lc_collection_close(collection);
     lc_client_close(client);
-    lc_pouch_endpoint_free(endpoint);
-
-    ok(lc_pouch_open(legacy, &allocator, &o.logical, &source_pouch, &e), &e);
-    ok(ps_pouch_state_open(path, 1, &allocator, &o, &target, &e), &e);
-    ok(ps_pouch_import_legacy(source_pouch, target, &e), &e);
-    ok(target->storage.ops->flush(target->storage.context, &e), &e);
-    lc_pouch_close(target);
-    lc_pouch_close(source_pouch);
     REQUIRE(!live);
 
-    ok(lc_pouch_endpoint_build(path, NULL, 0, &endpoint, &e), &e);
-    endpoints[0] = endpoint;
-    ok(ps_pouch_client_open(&config, 0, NULL, &client, &e), &e);
+    int rc = lc_client_open(&config, &client, &e);
+    if (rc != LC_OK && e.detail)
+      fprintf(stderr, "%s\n", e.detail);
+    ok(rc, &e);
     ok(lc_client_open_collection(client, &collection_config, &collection, &e),
        &e);
     ok(lc_collection_head(collection, &after, &e), &e);
@@ -7938,7 +7931,7 @@ static void legacy_collection_import(const char *path, const char *directory) {
     lc_collection_close(collection);
     lc_client_close(client);
     lc_pouch_endpoint_free(endpoint);
-    REQUIRE(!live && unlink(path) == 0);
+    REQUIRE(!live && unlink(legacy) == 0);
   }
   lc_error_cleanup(&e);
 }
@@ -7985,7 +7978,7 @@ static int check_history_source(void *context,
   return LC_OK;
 }
 
-static void legacy_history_import(const char *path, const char *directory) {
+static void legacy_history_import(const char *directory) {
   lc_error e;
   lc_error_init(&e);
   for (int codec = 0; codec <= 3; codec += 3) {
@@ -8007,6 +8000,7 @@ static void legacy_history_import(const char *path, const char *directory) {
     input in = source(65569, 1);
     lc_pouch_generation original;
     const char *ns = "history/ns";
+    const char *unregistered = "history/unregistered";
 
     REQUIRE(snprintf(legacy, sizeof(legacy), "%s/legacy-%d", directory, codec) <
             (int)sizeof(legacy));
@@ -8024,7 +8018,7 @@ static void legacy_history_import(const char *path, const char *directory) {
     config.endpoint_count = 1;
     config.pouch_compression = o.logical.compression;
     config.pouch_crypto_key = o.logical.crypto_key;
-    ok(lc_client_open(&config, &client, &e), &e);
+    ok(lc_pouch_legacy_client_open(&config, &client, &e), &e);
     source_pouch = ((lc_client_handle *)client)->pouch;
     ok(put(source_pouch, ns, "versioned", &in, NULL, &w, &e), &e);
     original = w.index_seq;
@@ -8047,18 +8041,20 @@ static void legacy_history_import(const char *path, const char *directory) {
                                       &e),
        &e);
     lc_pouch_state_write_result_cleanup(&allocator, &w);
+    in = source(16, 3);
+    ok(put(source_pouch, unregistered, "versioned", &in, NULL, &w, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    in = source(8, 4);
+    ok(put(source_pouch, unregistered, "versioned", &in, NULL, &w, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
 
-    ok(ps_pouch_state_open(path, 1, &allocator, &o, &target, &e), &e);
-    ok(ps_pouch_import_legacy(source_pouch, target, &e), &e);
-    ok(target->storage.ops->flush(target->storage.context, &e), &e);
-    lc_pouch_close(target);
     lc_client_close(client);
-    lc_pouch_endpoint_free(endpoint);
     REQUIRE(!live);
 
-    ok(lc_pouch_endpoint_build(path, NULL, 0, &endpoint, &e), &e);
-    endpoints[0] = endpoint;
-    ok(ps_pouch_client_open(&config, 0, NULL, &client, &e), &e);
+    int rc = lc_client_open(&config, &client, &e);
+    if (rc != LC_OK && e.detail)
+      fprintf(stderr, "%s\n", e.detail);
+    ok(rc, &e);
     target = ((lc_client_handle *)client)->pouch;
     history_config.initial_acknowledged_index_seq = 0;
     ok(lc_client_new_history_consumer(client, &history_config, &consumer, &e),
@@ -8080,7 +8076,29 @@ static void legacy_history_import(const char *path, const char *directory) {
        &e);
     REQUIRE(history.generations == 6 && history.metadata);
     ps_namespace_release(history.ns);
+    memset(&history, 0, sizeof(history));
+    ok(ps_root_namespace_acquire(ps_pouch_state_root(target), unregistered, 0,
+                                 &history.ns, &e),
+       &e);
+    ok(ps_namespace_sources_visit(history.ns, check_history_source, &history,
+                                  &e),
+       &e);
+    REQUIRE(history.generations == 6);
+    ps_namespace_release(history.ns);
     read_value(target, ns, "versioned", 31, 2, 2, &e);
+
+    lc_history_consumer_close(consumer);
+    lc_client_close(client);
+    client = NULL;
+    config.pouch_compression = codec ? "none" : "zlib";
+    REQUIRE(lc_client_open(&config, &client, &e) == LC_ERR_PENDING && !client &&
+            e.server_code && !strcmp(e.server_code, "pouch_history_pinned"));
+    clear(&e);
+    config.pouch_compression = o.logical.compression;
+    ok(lc_client_open(&config, &client, &e), &e);
+    target = ((lc_client_handle *)client)->pouch;
+    ok(lc_client_new_history_consumer(client, &history_config, &consumer, &e),
+       &e);
     ok(lc_history_consumer_advance(consumer, position.current_index_seq,
                                    &position, &e),
        &e);
@@ -8091,8 +8109,117 @@ static void legacy_history_import(const char *path, const char *directory) {
     lc_history_consumer_close(consumer);
     lc_client_close(client);
     lc_pouch_endpoint_free(endpoint);
-    REQUIRE(!live && unlink(path) == 0);
+    REQUIRE(!live && unlink(legacy) == 0);
   }
+  lc_error_cleanup(&e);
+}
+
+static void same_path_migration(const char *path, const char *directory) {
+  lc_error e;
+  ps_pouch_state_options o = options(3, 0);
+  lc_pouch_open_options no_key = o.logical;
+  lc_pouch *old = NULL, *opened = NULL;
+  lc_pouch_state_write_result w = {0};
+  lc_pouch_state_write_options write_options = {0};
+  lc_client_config config;
+  lc_pouch_settings settings;
+  lc_client *client = NULL;
+  const lc_pouch_endpoint_option endpoint_option = {"disable_migration",
+                                                    "true"};
+  char *endpoint = NULL;
+  const char *endpoints[1];
+  struct stat info;
+  char unknown[1400], fresh[1400];
+  input in = source(65569, 9);
+  int fd, rc;
+  lc_error_init(&e);
+  ok(lc_pouch_open(path, &allocator, &o.logical, &old, &e), &e);
+  ok(put(old, "default", "value", &in, NULL, &w, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  REQUIRE(ps_pouch_open_managed(path, &allocator, &o.logical, 1, &opened, &e) ==
+              LC_ERR_UNSUPPORTED &&
+          !opened && !strcmp(e.server_code, "pouch_migration_disabled"));
+  clear(&e);
+  REQUIRE(ps_pouch_open_managed(path, &allocator, &o.logical, 0, &opened, &e) !=
+              LC_OK &&
+          !opened);
+  clear(&e);
+  lc_pouch_close(old);
+  old = NULL;
+  REQUIRE(stat(path, &info) == 0 && S_ISDIR(info.st_mode));
+
+  REQUIRE(snprintf(unknown, sizeof(unknown), "%s/namespaces/default/notes",
+                   path) < (int)sizeof(unknown));
+  fd = open(unknown, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+  REQUIRE(fd >= 0 && write(fd, "keep", 4) == 4 && close(fd) == 0);
+  REQUIRE(ps_pouch_open_managed(path, &allocator, &o.logical, 0, &opened, &e) ==
+              LC_ERR_INVALID &&
+          !opened && !strcmp(e.server_code, "pouch_migration_layout"));
+  clear(&e);
+  REQUIRE(stat(unknown, &info) == 0 && info.st_size == 4);
+  REQUIRE(unlink(unknown) == 0);
+
+  no_key.crypto_key = NULL;
+  REQUIRE(ps_pouch_open_managed(path, &allocator, &no_key, 0, &opened, &e) !=
+              LC_OK &&
+          !opened);
+  clear(&e);
+  REQUIRE(stat(path, &info) == 0 && S_ISDIR(info.st_mode));
+  lc_client_config_init(&config);
+  lc_pouch_settings_init(&settings);
+  ok(lc_pouch_endpoint_build(path, &endpoint_option, 1, &endpoint, &e), &e);
+  endpoints[0] = endpoint;
+  config.endpoints = endpoints;
+  config.endpoint_count = 1;
+  config.allocator = allocator;
+  config.pouch_crypto_key = o.logical.crypto_key;
+  REQUIRE(lc_client_open(&config, &client, &e) == LC_ERR_UNSUPPORTED &&
+          !client && !strcmp(e.server_code, "pouch_migration_disabled"));
+  clear(&e);
+  REQUIRE(stat(path, &info) == 0 && S_ISDIR(info.st_mode));
+  settings.set_mask =
+      LC_POUCH_SETTING_DISABLE_MIGRATION | LC_POUCH_SETTING_SINGLE_WRITER;
+  settings.disable_migration = 0;
+  settings.single_writer = 0;
+  config.pouch_settings = &settings;
+  rc = lc_client_open(&config, &client, &e);
+  if (rc != LC_OK && e.detail)
+    fprintf(stderr, "%s\n", e.detail);
+  ok(rc, &e);
+  REQUIRE(stat(path, &info) == 0 && S_ISREG(info.st_mode));
+  REQUIRE(!lc_pouch_single_writer_enabled(((lc_client_handle *)client)->pouch));
+  read_value(((lc_client_handle *)client)->pouch, "default", "value", 65569, 9,
+             1, &e);
+  lc_client *peer = NULL;
+  ok(lc_client_open(&config, &peer, &e), &e);
+  read_value(((lc_client_handle *)peer)->pouch, "default", "value", 65569, 9, 1,
+             &e);
+  lc_client_close(peer);
+  lc_client_close(client);
+  lc_pouch_endpoint_free(endpoint);
+  one_file(directory);
+
+  ok(ps_pouch_open_managed(path, &allocator, &o.logical, 1, &opened, &e), &e);
+  read_value(opened, "default", "value", 65569, 9, 1, &e);
+  lc_pouch_close(opened);
+  REQUIRE(snprintf(fresh, sizeof(fresh), "%s/fresh", directory) <
+          (int)sizeof(fresh));
+  REQUIRE(mkdir(fresh, 0700) == 0);
+  ok(ps_pouch_open_managed(fresh, &allocator, &o.logical, 1, &opened, &e), &e);
+  REQUIRE(stat(fresh, &info) == 0 && S_ISREG(info.st_mode) &&
+          info.st_size == PS_DEFAULT_CAPACITY);
+  write_options.disable_compression = 1;
+  in = source(12 * PS_MIB, 37);
+  ok(put(opened, "default", "large", &in, &write_options, &w, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  REQUIRE(stat(fresh, &info) == 0 && (uint64_t)info.st_size > 12 * PS_MIB &&
+          (uint64_t)info.st_size % PS_MIB == 0);
+  ok(opened->storage.ops->flush(opened->storage.context, &e), &e);
+  lc_pouch_close(opened);
+  ok(ps_pouch_open_managed(fresh, &allocator, &o.logical, 0, &opened, &e), &e);
+  read_value(opened, "default", "large", 12 * PS_MIB, 37, 1, &e);
+  lc_pouch_close(opened);
+  REQUIRE(!live && unlink(fresh) == 0);
   lc_error_cleanup(&e);
 }
 
@@ -8107,9 +8234,11 @@ static void *worker(void *context) {
   else if (!strcmp(r->mode, "legacy-state-import"))
     legacy_state_import(r->path, r->directory);
   else if (!strcmp(r->mode, "legacy-collection-import"))
-    legacy_collection_import(r->path, r->directory);
+    legacy_collection_import(r->directory);
   else if (!strcmp(r->mode, "legacy-history-import"))
-    legacy_history_import(r->path, r->directory);
+    legacy_history_import(r->directory);
+  else if (!strcmp(r->mode, "same-path-migration"))
+    same_path_migration(r->path, r->directory);
   else if (!strcmp(r->mode, "shared-admission"))
     shared_admission(r->path);
   else if (!strcmp(r->mode, "shared-state"))

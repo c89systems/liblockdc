@@ -204,6 +204,7 @@ struct ps_space {
   ps_io io;
   unsigned char identity[16];
   uint64_t capacity, maximum, generation, sequence, syncs, checkpoints;
+  int grow_on_write;
   uint64_t token_next, token_end, token_limit;
   uint64_t writer_id;
   int reused_open_barrier;

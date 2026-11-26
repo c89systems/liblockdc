@@ -69,6 +69,9 @@ if(TARGET lc_static AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(lc_pouch_key_failure_test test_pouch_key_failure.c
     ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_link_libraries(lc_pouch_key_failure_test PRIVATE lc_static lc::openssl_crypto_static)
+  if(lc_pouch_container_dir)
+    target_compile_definitions(lc_pouch_key_failure_test PRIVATE LOCKDC_POUCH_CONTAINER=1)
+  endif()
   target_link_options(lc_pouch_key_failure_test PRIVATE
     "LINKER:--wrap=pthread_key_create" "LINKER:--wrap=pthread_key_delete")
   lc_configure_c_test_target(lc_pouch_key_failure_test)

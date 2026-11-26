@@ -18,6 +18,7 @@
 #include "../support/lc_test_tmp.h"
 #include "lc/lc.h"
 #include "lc_pouch.h"
+#include "lc_pouch_storage.h"
 
 #define POUCH_E2E_TMP_PREFIX LC_E2E_TMP_ROOT "/liblockdc-e2e-pouch-"
 #define LOCAL_MUTATE_TMP_PREFIX LC_E2E_TMP_ROOT "/liblockdc-local-mutate-"
@@ -622,23 +623,39 @@ static void make_unique_name(const char *prefix, char *buffer,
   snprintf(buffer, capacity, "%s-%ld-%d", prefix, now, pid);
 }
 
+static const char pouch_fixture_leaf[] = "/store";
+
+static int pouch_fixture_length(const char *root) {
+  size_t length = strlen(root);
+  assert_true(length >= sizeof(pouch_fixture_leaf));
+  length -= sizeof(pouch_fixture_leaf) - 1U;
+  assert_string_equal(root + length, pouch_fixture_leaf);
+  return (int)length;
+}
+
 static void make_pouch_root(const char *suffix, char *root,
                             size_t root_capacity, char *endpoint,
                             size_t endpoint_capacity) {
-  char template_path[512];
+  char template_path[512], fixture[512];
   int written;
 
   written = snprintf(template_path, sizeof(template_path),
                      POUCH_E2E_TMP_PREFIX "%s-XXXXXX", suffix);
   assert_true(written > 0 && (size_t)written < sizeof(template_path));
-  assert_true(lc_test_tmp_mkdtemp(template_path, root, root_capacity,
+  assert_true(lc_test_tmp_mkdtemp(template_path, fixture, sizeof(fixture),
                                   POUCH_E2E_TMP_PREFIX));
+  written = snprintf(root, root_capacity, "%s%s", fixture, pouch_fixture_leaf);
+  assert_true(written > 0 && (size_t)written < root_capacity);
   written = snprintf(endpoint, endpoint_capacity, "pouch://%s", root);
   assert_true(written > 0 && (size_t)written < endpoint_capacity);
 }
 
 static void cleanup_pouch_root(const char *root) {
-  lc_test_tmp_cleanup_path(root, POUCH_E2E_TMP_PREFIX);
+  char fixture[512];
+  int length = pouch_fixture_length(root);
+  assert_true((size_t)length < sizeof(fixture));
+  snprintf(fixture, sizeof(fixture), "%.*s", length, root);
+  lc_test_tmp_cleanup_path(fixture, POUCH_E2E_TMP_PREFIX);
 }
 
 static void cleanup_all_pouch_roots(void) {
@@ -809,8 +826,8 @@ static void open_tcp_client_allow_error(const char *endpoint,
   lc_source_close(bundle_source);
 }
 
-static void open_pouch_client(const char *endpoint, lc_client **out,
-                              lc_error *error) {
+static void open_pouch_fixture_client(const char *endpoint, int legacy,
+                                      lc_client **out, lc_error *error) {
   lc_client_config config;
   const char *endpoints[1];
   int rc;
@@ -821,8 +838,14 @@ static void open_pouch_client(const char *endpoint, lc_client **out,
   config.endpoint_count = 1U;
   config.default_namespace = "default";
   config.timeout_ms = 5000L;
-  rc = lc_client_open(&config, out, error);
+  rc = legacy ? lc_pouch_legacy_client_open(&config, out, error)
+              : lc_client_open(&config, out, error);
   assert_lc_ok(rc, error);
+}
+
+static void open_pouch_client(const char *endpoint, lc_client **out,
+                              lc_error *error) {
+  open_pouch_fixture_client(endpoint, 0, out, error);
 }
 
 static void open_uds_client(const char *socket_path, lc_client **out,
@@ -4636,7 +4659,8 @@ static void test_pouch_direct_state_attachment_reopen_roundtrip(void **state) {
 
 static void pouch_e2e_run_maintenance(const char *root, const char *ns,
                                       int force, int cleanup_only,
-                                      long retention_cutoff, lc_error *error) {
+                                      long retention_cutoff, int legacy,
+                                      lc_error *error) {
   lc_pouch *pouch;
   lc_pouch_open_options open_options;
   lc_pouch_maintenance_options maintenance_options;
@@ -4647,7 +4671,8 @@ static void pouch_e2e_run_maintenance(const char *root, const char *ns,
   memset(&open_options, 0, sizeof(open_options));
   memset(&maintenance_options, 0, sizeof(maintenance_options));
   memset(&maintenance_result, 0, sizeof(maintenance_result));
-  rc = lc_pouch_open(root, NULL, &open_options, &pouch, error);
+  rc = legacy ? lc_pouch_open(root, NULL, &open_options, &pouch, error)
+              : lc_pouch_open_managed(root, NULL, &open_options, &pouch, error);
   assert_lc_ok(rc, error);
   maintenance_options.ns = ns;
   maintenance_options.force = force;
@@ -5688,8 +5713,8 @@ static int pouch_e2e_command_effect_once(const char *root,
   char marker[448];
 
   if (root == NULL || command_id == NULL || performed == NULL ||
-      snprintf(effects_dir, sizeof(effects_dir), "%s/command-effects", root) <
-          0 ||
+      snprintf(effects_dir, sizeof(effects_dir), "%.*s/command-effects",
+               pouch_fixture_length(root), root) < 0 ||
       snprintf(marker, sizeof(marker), "%s/%s", effects_dir, command_id) < 0) {
     return LC_ERR_INVALID;
   }
@@ -6680,8 +6705,8 @@ static void pouch_e2e_assert_command_effect_marker(const char *root,
   char marker[448];
   struct stat st;
 
-  assert_true(snprintf(marker, sizeof(marker), "%s/command-effects/%s", root,
-                       command_id) > 0);
+  assert_true(snprintf(marker, sizeof(marker), "%.*s/command-effects/%s",
+                       pouch_fixture_length(root), root, command_id) > 0);
   assert_int_equal(stat(marker, &st), 0);
   assert_true(S_ISDIR(st.st_mode));
 }
@@ -6691,8 +6716,8 @@ static void pouch_e2e_assert_no_command_effect_marker(const char *root,
   char marker[448];
   struct stat st;
 
-  assert_true(snprintf(marker, sizeof(marker), "%s/command-effects/%s", root,
-                       command_id) > 0);
+  assert_true(snprintf(marker, sizeof(marker), "%.*s/command-effects/%s",
+                       pouch_fixture_length(root), root, command_id) > 0);
   assert_int_equal(stat(marker, &st), -1);
   assert_int_equal(errno, ENOENT);
 }
@@ -7145,9 +7170,10 @@ test_pouch_direct_lifecycle_maintenance_reopen_roundtrip(void **state) {
   lc_client_close(client);
   client = NULL;
 
-  pouch_e2e_run_maintenance(root, "life", 1, 0, 0L, &error);
-  pouch_e2e_run_maintenance(root, "life", 0, 1, 0L, &error);
-  pouch_e2e_run_maintenance(root, "life-retention", 0, 0, 2147483647L, &error);
+  pouch_e2e_run_maintenance(root, "life", 1, 0, 0L, 0, &error);
+  pouch_e2e_run_maintenance(root, "life", 0, 1, 0L, 0, &error);
+  pouch_e2e_run_maintenance(root, "life-retention", 0, 0, 2147483647L, 0,
+                            &error);
 
   open_pouch_client(endpoint, &reader, &error);
   rows = pouch_e2e_query_key_count(reader, "life", selector_json, &error);
@@ -7217,7 +7243,7 @@ test_pouch_direct_large_namespace_segmented_index_reopen(void **state) {
 
   pouch_e2e_write_segmented_docs_direct(root, "large", kind, doc_count, &error);
 
-  open_pouch_client(endpoint, &client, &error);
+  open_pouch_fixture_client(endpoint, 1, &client, &error);
   flush_req.ns = "large";
   flush_req.mode = "wait";
   rc = client->flush_index(client, &flush_req, &flush_res, &error);
@@ -7230,9 +7256,9 @@ test_pouch_direct_large_namespace_segmented_index_reopen(void **state) {
   client = NULL;
 
   pouch_e2e_force_maintenance_expect_segments(root, "large", &error);
-  pouch_e2e_run_maintenance(root, "large", 0, 1, 0L, &error);
+  pouch_e2e_run_maintenance(root, "large", 0, 1, 0L, 1, &error);
 
-  open_pouch_client(endpoint, &client, &error);
+  open_pouch_fixture_client(endpoint, 1, &client, &error);
   memset(&flush_res, 0, sizeof(flush_res));
   rc = client->flush_index(client, &flush_req, &flush_res, &error);
   assert_lc_ok(rc, &error);
@@ -7384,7 +7410,7 @@ test_pouch_shared_hardening_churn_dispatch_and_maintenance(void **state) {
   assert_int_equal(close(start_pipe[0]), 0);
   assert_int_equal(close(result_pipe[1]), 0);
 
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_lc_ok(rc, &error);
   outbox_config.ns = "hardening-outbox";
   outbox_config.owner = "pouch-hardening-dispatcher";
@@ -7503,7 +7529,7 @@ test_pouch_shared_hardening_churn_dispatch_and_maintenance(void **state) {
   pouch_e2e_force_shared_multi_segment_compaction(root, "hardening-outbox",
                                                   &error);
 
-  rc = lc_client_open(&config, &reader, &error);
+  rc = lc_pouch_legacy_client_open(&config, &reader, &error);
   assert_lc_ok(rc, &error);
   rc = lc_client_new_outbox(reader, &outbox_config, &outbox, &error);
   assert_lc_ok(rc, &error);
@@ -7609,7 +7635,7 @@ test_pouch_direct_marker_damage_and_index_rebuild_after_snapshot(void **state) {
   pouch_e2e_write_segmented_docs_direct(root, "repair", kind, doc_count,
                                         &error);
 
-  open_pouch_client(endpoint, &client, &error);
+  open_pouch_fixture_client(endpoint, 1, &client, &error);
   flush_req.ns = "repair";
   flush_req.mode = "wait";
   rc = client->flush_index(client, &flush_req, &flush_res, &error);
@@ -7622,10 +7648,10 @@ test_pouch_direct_marker_damage_and_index_rebuild_after_snapshot(void **state) {
   client = NULL;
 
   pouch_e2e_force_maintenance_expect_segments(root, "repair", &error);
-  pouch_e2e_run_maintenance(root, "repair", 0, 1, 0L, &error);
+  pouch_e2e_run_maintenance(root, "repair", 0, 1, 0L, 1, &error);
 
   /* Recreate the post-snapshot derived index, then remove its manifest. */
-  open_pouch_client(endpoint, &client, &error);
+  open_pouch_fixture_client(endpoint, 1, &client, &error);
   memset(&flush_res, 0, sizeof(flush_res));
   rc = client->flush_index(client, &flush_req, &flush_res, &error);
   assert_lc_ok(rc, &error);
@@ -7637,7 +7663,7 @@ test_pouch_direct_marker_damage_and_index_rebuild_after_snapshot(void **state) {
   assert_int_equal(unlink(manifest_path), 0);
   pouch_e2e_write_text_file(marker_path, "damaged-marker\n");
 
-  open_pouch_client(endpoint, &client, &error);
+  open_pouch_fixture_client(endpoint, 1, &client, &error);
   memset(&flush_res, 0, sizeof(flush_res));
   rc = client->flush_index(client, &flush_req, &flush_res, &error);
   assert_lc_ok(rc, &error);

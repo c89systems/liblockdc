@@ -307,7 +307,7 @@ static void test_queries(void) {
   custom.chunk_bytes = SCRATCH_BYTES;
   lc_error_init(&error);
   CHECK(lc_test_tmp_mkdtemp(template_path, root, sizeof(root), TMP_PREFIX));
-  snprintf(endpoint, sizeof(endpoint), "pouch://%s", root);
+  snprintf(endpoint, sizeof(endpoint), "pouch://%s/store", root);
   endpoints[0] = endpoint;
   lc_client_config_init(&config);
   config.endpoints = endpoints;

@@ -7,6 +7,7 @@
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
+#include "lc_pouch_storage.h"
 #include "lc_pouch_xa.h"
 #include "lc_xa_internal.h"
 
@@ -104,7 +105,7 @@ static void open_client(fixture *f) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.disable_mtls = 1;
-  rc = lc_client_open(&config, &f->client, &f->error);
+  rc = lc_pouch_legacy_client_open(&config, &f->client, &f->error);
   if (rc != LC_OK)
     print_error("XA fixture client open failed (%d): %s (%s)\n", rc,
                 f->error.message != NULL ? f->error.message : "no summary",

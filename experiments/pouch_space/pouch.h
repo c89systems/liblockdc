@@ -8,6 +8,8 @@ typedef struct ps_pouch_state_options {
   uint64_t initial_capacity, maximum_capacity;
   const ps_io *io;
   const struct ps_coordination_io *coordination_io;
+  int grow_on_write;
+  int defer_workers;
 } ps_pouch_state_options;
 
 /* Private integration harness, never installed: ordinary state PUT, metadata
@@ -41,23 +43,22 @@ typedef struct ps_pouch_state_options {
  * recovered order epoch and canonical rows. Old epochs remain scan fallbacks.
  * Public queue delivery, batching, paired state, transaction recovery and
  * subscription/watch calls use the common engine. Shared owners use a mapped
- * advisory wake word to prompt a queue rescan. Outbox delivery, stateful checkpoints,
- * completion/dead-letter/replay, inbox/command receipts and terminal retention
- * use the same owners, with bounded durable in-file cleanup markers.
- * Public XA resource registration, external branch progress, managed owner
- * epochs, recovery snapshots, completion and history retirement use the common
- * journal/coordinator engine. Journal handoffs force completed dependencies
- * under either durability policy; external SQL execution is outside this
- * harness.
- * Public namespace queries, explicit flush and the existing index worker use
- * typed immutable artifacts in the container. Captured inputs survive replace,
- * pruning and checkpoint; encoded bounds are admitted before invoking
- * producers. Canonical application bodies remain streamed. Namespace index
- * publication still has a material performance gap against the native owner.
- * Other Pouch operations are outside this harness's current call contract.
- * The logical single_writer setting selects exclusive or shared lifetime
- * ownership. Mode changes require a reopen and codec conversion requires
- * exclusive ownership. Generated key files are unsupported. */
+ * advisory wake word to prompt a queue rescan. Outbox delivery, stateful
+ * checkpoints, completion/dead-letter/replay, inbox/command receipts and
+ * terminal retention use the same owners, with bounded durable in-file cleanup
+ * markers. Public XA resource registration, external branch progress, managed
+ * owner epochs, recovery snapshots, completion and history retirement use the
+ * common journal/coordinator engine. Journal handoffs force completed
+ * dependencies under either durability policy; external SQL execution is
+ * outside this harness. Public namespace queries, explicit flush and the
+ * existing index worker use typed immutable artifacts in the container.
+ * Captured inputs survive replace, pruning and checkpoint; encoded bounds are
+ * admitted before invoking producers. Canonical application bodies remain
+ * streamed. Namespace index publication still has a material performance gap
+ * against the native owner. Other Pouch operations are outside this harness's
+ * current call contract. The logical single_writer setting selects exclusive or
+ * shared lifetime ownership. Mode changes require a reopen and codec conversion
+ * requires exclusive ownership. Generated key files are unsupported. */
 int ps_pouch_state_open(const char *, int create, const lc_allocator *,
                         const ps_pouch_state_options *, lc_pouch **,
                         lc_error *);

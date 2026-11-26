@@ -23,6 +23,7 @@
 #include "lc_pouch_namespace.h"
 #include "lc_pouch_path.h"
 #include "lc_pouch_retention.h"
+#include "lc_pouch_storage.h"
 
 static int check_visited_retention(const lc_pouch_state_visit_entry *entry,
                                    void *context, lc_error *error) {
@@ -304,7 +305,8 @@ static void exercise_coordinated_clock(int mode) {
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1;
-  assert_int_equal(lc_client_open(&config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&config, &client, &error),
+                   LC_OK);
   pouch = ((lc_client_handle *)client)->pouch;
   assert_int_equal(lc_xid_new(xid, &error), LC_OK);
   lc_txn_decision_req_init(&decision);
@@ -423,7 +425,8 @@ static void exercise_coordinated_clock(int mode) {
   } else {
     lc_client_close(client);
     clock.now = mode == 1 ? 2000 : mode == 6 ? 200000 : 9000;
-    assert_int_equal(lc_client_open(&config, &client, &error), LC_OK);
+    assert_int_equal(lc_pouch_legacy_client_open(&config, &client, &error),
+                     LC_OK);
     pouch = ((lc_client_handle *)client)->pouch;
     for (i = 0; i < 2; ++i) {
       assert_int_equal(lc_pouch_state_read_metadata(
@@ -1203,9 +1206,9 @@ static int setup_cleanup_fixture(void **state) {
   lc_client_config_init(&fixture->config);
   fixture->config.endpoints = fixture->endpoints;
   fixture->config.endpoint_count = 1;
-  assert_int_equal(
-      lc_client_open(&fixture->config, &fixture->client, &fixture->error),
-      LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(
+                       &fixture->config, &fixture->client, &fixture->error),
+                   LC_OK);
   fixture->pouch = ((lc_client_handle *)fixture->client)->pouch;
   lc_acquire_req_init(&acquire);
   acquire.ns = "orders";
@@ -1457,9 +1460,9 @@ static void exercise_interrupted_cleanup(cleanup_fixture *fixture,
   fixture->client = NULL;
   fixture->pouch = NULL;
   fixture->clock.now = recover_time;
-  assert_int_equal(
-      lc_client_open(&fixture->config, &fixture->client, &fixture->error),
-      LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(
+                       &fixture->config, &fixture->client, &fixture->error),
+                   LC_OK);
   fixture->pouch = ((lc_client_handle *)fixture->client)->pouch;
   /* Client construction must preserve this root-owned journal for its worker.
    */
@@ -1565,9 +1568,9 @@ static void exercise_retention_worker_discovery(void **state,
   lc_pouch_state_read_result_cleanup(NULL, &read);
   lc_pouch_close(fixture->pouch);
   fixture->pouch = NULL;
-  assert_int_equal(
-      lc_client_open(&fixture->config, &fixture->client, &fixture->error),
-      LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(
+                       &fixture->config, &fixture->client, &fixture->error),
+                   LC_OK);
   fixture->pouch = ((lc_client_handle *)fixture->client)->pouch;
   assert_cleanup_state(fixture, 0, 0);
 }
@@ -1647,8 +1650,8 @@ static void test_retention_cleanup_crash_cuts(void **state) {
     child = fork();
     assert_true(child >= 0);
     if (child == 0) {
-      int rc =
-          lc_client_open(&fixture->config, &fixture->client, &fixture->error);
+      int rc = lc_pouch_legacy_client_open(&fixture->config, &fixture->client,
+                                           &fixture->error);
       if (rc != LC_OK)
         _exit(2);
       fixture->pouch = ((lc_client_handle *)fixture->client)->pouch;
@@ -1664,8 +1667,8 @@ static void test_retention_cleanup_crash_cuts(void **state) {
     fixture->clock.now = phase < LC_POUCH_RETENTION_DECIDED ? 1000
                          : phase % 2                        ? 900
                                                             : 2000;
-    reopened =
-        lc_client_open(&fixture->config, &fixture->client, &fixture->error);
+    reopened = lc_pouch_legacy_client_open(&fixture->config, &fixture->client,
+                                           &fixture->error);
     if (reopened != LC_OK)
       fail_msg("cleanup crash cut %d reopen failed: %s", phase,
                fixture->error.message != NULL ? fixture->error.message
@@ -1930,9 +1933,9 @@ test_native_retention_release_leaves_no_startup_backlog(void **state) {
     settings.durable_sync = durable;
     settings.single_writer = 0;
     fixture->config.pouch_settings = &settings;
-    assert_int_equal(
-        lc_client_open(&fixture->config, &fixture->client, &fixture->error),
-        LC_OK);
+    assert_int_equal(lc_pouch_legacy_client_open(
+                         &fixture->config, &fixture->client, &fixture->error),
+                     LC_OK);
     fixture->pouch = ((lc_client_handle *)fixture->client)->pouch;
     for (unsigned int i = 0; i < 128; ++i) {
       fixture->clock.now = 1100 + durable * 128 + i;
@@ -1981,9 +1984,9 @@ test_native_retention_release_leaves_no_startup_backlog(void **state) {
                      0); /* No replay/deletion work on the next open. */
     lc_client_close(fixture->client);
     fixture->client = NULL;
-    assert_int_equal(
-        lc_client_open(&fixture->config, &fixture->client, &fixture->error),
-        LC_OK);
+    assert_int_equal(lc_pouch_legacy_client_open(
+                         &fixture->config, &fixture->client, &fixture->error),
+                     LC_OK);
     fixture->pouch = ((lc_client_handle *)fixture->client)->pouch;
     assert_public_retention(fixture, deadline);
     assert_cleanup_state(fixture, 1, 1);
@@ -2025,9 +2028,9 @@ static void test_native_retirement_failure_preserves_recovery(void **state) {
     fixture->clock.now += 40;
     lc_client_close(fixture->client);
     fixture->client = NULL;
-    assert_int_equal(
-        lc_client_open(&fixture->config, &fixture->client, &fixture->error),
-        LC_OK);
+    assert_int_equal(lc_pouch_legacy_client_open(
+                         &fixture->config, &fixture->client, &fixture->error),
+                     LC_OK);
     fixture->pouch = ((lc_client_handle *)fixture->client)->pouch;
     assert_public_retention(fixture, 1070 + phase * 200);
     assert_cleanup_state(fixture, 1, 1);
@@ -2348,9 +2351,9 @@ test_public_retention_expired_state_can_be_extended_and_queried(void **state) {
   assert_true(snprintf(fixture->endpoint, sizeof(fixture->endpoint),
                        "pouch://%s?background_compaction=false",
                        fixture->root) > 0);
-  assert_int_equal(
-      lc_client_open(&fixture->config, &fixture->client, &fixture->error),
-      LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(
+                       &fixture->config, &fixture->client, &fixture->error),
+                   LC_OK);
   fixture->pouch = ((lc_client_handle *)fixture->client)->pouch;
   fixture->clock.now = 1050;
   assert_public_retention(fixture, 1050);

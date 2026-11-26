@@ -3158,8 +3158,15 @@ int lc_collection_owned_open(lc_pouch *pouch, lc_client_handle *client,
                                   LC_COLLECTION_AUTH_APPEND, 0U, 1, 1,
                                   &append_pin, error);
     appended = rc == LC_OK;
+    /* A peer created from a pull callback must be able to change lease
+     * metadata while the source retains append ownership. Its first data
+     * operation will load the published projection under its own authority. */
+    if (rc == LC_ERR_PENDING && lc_collection_source_callback_active()) {
+      lc_error_cleanup(error);
+      rc = LC_OK;
+    }
   }
-  if (rc == LC_OK) {
+  if (appended) {
     rc = lc_collection_metadata_enter(collection, 1, error);
     if (rc == LC_OK) {
       rc = lc_collection_reconcile(collection, error);

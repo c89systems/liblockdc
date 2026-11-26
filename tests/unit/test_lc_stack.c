@@ -506,7 +506,7 @@ static void collection_workspaces(void) {
   lc_error error;
   size_t written = 0;
   CHECK(lc_test_tmp_mkdtemp(path, root, sizeof(root), STACK_PREFIX));
-  CHECK(snprintf(endpoint, sizeof(endpoint), "pouch://%s", root) > 0);
+  CHECK(snprintf(endpoint, sizeof(endpoint), "pouch://%s/store", root) > 0);
   lc_error_init(&error);
   lc_client_config_init(&config);
   lc_pouch_settings_init(&settings);

@@ -74,8 +74,8 @@ int lc_log_unload_probe(const char *mode) {
     if (!lc_test_tmp_mkdtemp(template_path, root, sizeof(root),
                              "/tmp/liblockdc-unload-"))
       goto done;
-    if (snprintf(endpoint, sizeof(endpoint), "pouch://%s?single_writer=false",
-                 root) < 0)
+    if (snprintf(endpoint, sizeof(endpoint),
+                 "pouch://%s/store?single_writer=false", root) < 0)
       goto done;
     endpoints[0] = endpoint;
     if (strstr(mode, "encrypted") != NULL) {

@@ -304,6 +304,8 @@ typedef struct lc_pouch_endpoint_option {
 #define LC_POUCH_SETTING_CRYPTO_GENERATE_KEY_FILE ((uint64_t)1 << 15)
 /** Bit selecting `compression`. */
 #define LC_POUCH_SETTING_COMPRESSION ((uint64_t)1 << 16)
+/** Bit selecting `disable_migration`. */
+#define LC_POUCH_SETTING_DISABLE_MIGRATION ((uint64_t)1 << 17)
 
 /**
  * Optional typed local-Pouch root-open settings.
@@ -370,6 +372,10 @@ typedef struct lc_pouch_settings {
    * temporary payload space for that file rather than a second root. Any
    * interrupted conversion resumes on the next open, even with omission. */
   const char *compression;
+  /** Reject legacy directory roots without migrating them. Zero migrates
+   * eligible roots at startup. New and existing containers open either way.
+   */
+  int disable_migration;
 } lc_pouch_settings;
 
 /** Zeros a typed local-Pouch root-open settings object. */

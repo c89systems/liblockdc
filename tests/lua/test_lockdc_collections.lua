@@ -316,7 +316,7 @@ local source_path = debug.getinfo(1, "S").source:sub(2)
 local repo = assert(source_path:match("^(.*)/tests/lua/[^/]+$"))
 package.path = repo .. "/lua/?.lua;" .. repo .. "/lua/?/init.lua;" .. package.path
 local lockdc = require("lockdc")
-local facade = assert(lockdc.open({ endpoints = { "pouch://" .. lockdc_test_root .. "/facade" },
+local facade = assert(lockdc.open({ endpoints = { "pouch://" .. lockdc_test_root .. "-facade" },
   pouch = { background_compaction = false } }))
 local journal = assert(facade:create_collection({ name = "facade", max_entries = "1000" }))
 assert(facade:collection_capabilities().collections)

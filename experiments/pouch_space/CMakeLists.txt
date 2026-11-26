@@ -674,7 +674,8 @@ if(LOCKDC_BUILD_TESTS)
     target_link_libraries(pouch_space_${surface}_sdk_test PRIVATE
       pouch_space_test_experiment lc::cmocka)
     target_link_options(pouch_space_${surface}_sdk_test PRIVATE
-      "LINKER:--wrap=lc_client_open" "LINKER:--wrap=lc_pouch_open")
+      "LINKER:--wrap=lc_client_open" "LINKER:--wrap=lc_pouch_open"
+      "LINKER:--wrap=lc_pouch_legacy_client_open")
     if(surface STREQUAL "queue" OR surface STREQUAL "query")
       target_link_options(pouch_space_${surface}_sdk_test PRIVATE "LINKER:--wrap=time")
     endif()
@@ -1013,7 +1014,17 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_pouch_test)
-  foreach(mode lifecycle legacy-state-import legacy-collection-import legacy-history-import body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash queue-enqueue-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-close maintenance-capacity-schedule maintenance-checksums maintenance-append-pressure maintenance-checkpoint-batch shared-state)
+  add_executable(pouch_space_migration_restart_test migration_restart_test.c
+    ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_migration_restart_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(pouch_space_migration_restart_test PRIVATE LOCKDC_TEST_BUILD=1)
+  target_link_libraries(pouch_space_migration_restart_test PRIVATE pouch_space_test_experiment)
+  lc_configure_c_test_target(pouch_space_migration_restart_test)
+  add_test(NAME pouch_space_migration_restart
+    COMMAND pouch_space_migration_restart_test ${CMAKE_CURRENT_BINARY_DIR})
+  set_tests_properties(pouch_space_migration_restart PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space")
+  foreach(mode lifecycle legacy-state-import legacy-collection-import legacy-history-import same-path-migration body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash queue-enqueue-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-close maintenance-capacity-schedule maintenance-checksums maintenance-append-pressure maintenance-checkpoint-batch shared-state)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space")

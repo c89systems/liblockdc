@@ -1,7 +1,7 @@
 local lockdc = require("lockdc")
 
 local root = assert(os.getenv("LOCKDC_POUCH_ROOT"), "LOCKDC_POUCH_ROOT is required")
-local endpoint = "pouch://" .. root
+local endpoint = "pouch://" .. root .. "/store"
 local key_file = root .. "/pouch.key"
 local explicit_false_key_file = root .. "/explicit-false/pouch.key"
 local namespace = "lua-pouch"
@@ -57,7 +57,7 @@ if type(wrong_type_err) ~= "table" or
   error("wrong typed Pouch value did not return a structured error")
 end
 
-local typed_root = root .. "-typed"
+local typed_root = root .. "/typed"
 local typed_client, typed_err = lockdc.open({
   endpoints = { "pouch://" .. typed_root },
   pouch = {
@@ -75,18 +75,13 @@ local typed_client, typed_err = lockdc.open({
     query_fallback_engine = "index",
     query_indexing = false,
     compression = "none",
+    disable_migration = true,
   },
 })
 if typed_client == nil then
   error(("typed Pouch open failed: %s"):format(typed_err and typed_err.message or tostring(typed_err)))
 end
 typed_client:close()
-local typed_manifest = assert(io.open(typed_root .. "/manifest", "rb"))
-local typed_manifest_text = assert(typed_manifest:read("*a"))
-typed_manifest:close()
-if not typed_manifest_text:match("compression=none") then
-  error("typed Pouch compression was not recorded in the manifest")
-end
 
 local invalid_client, invalid_err = lockdc.open({
   endpoints = { endpoint },
@@ -156,7 +151,8 @@ if second_client ~= nil then
   client:close()
   error("second exclusive Pouch writer unexpectedly opened")
 end
-if type(second_err) ~= "table" or not (second_err.message or ""):match("writer") then
+if type(second_err) ~= "table" or
+    (second_err.server_code ~= "pouch_root_busy" and not (second_err.message or ""):match("writer")) then
   client:close()
   error("second Pouch writer did not return a structured writer error")
 end

@@ -356,4 +356,10 @@ typedef int (*lc_pouch_runtime_factory_fn)(void *, const char *,
 int lc_client_open_with_pouch_factory(const lc_client_config *,
                                       lc_pouch_runtime_factory_fn, void *,
                                       lc_client **, lc_error *);
+int lc_pouch_legacy_runtime_factory(void *, const char *, const lc_allocator *,
+                                    const lc_pouch_open_options *, lc_pouch **,
+                                    lc_error *);
+/* Exercise the legacy reader/writer in migration fixtures and comparisons. */
+int lc_pouch_legacy_client_open(const lc_client_config *, lc_client **,
+                                lc_error *);
 #endif

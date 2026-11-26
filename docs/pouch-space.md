@@ -2,16 +2,27 @@
 
 ## Scope
 
-The experimental backend stores a Pouch root in one persistent file. It runs
-on Linux x86_64, AArch64, and ARM hard-float with GNU libc and musl, and on
-Apple Silicon with macOS 15.0 or later. The private
-`ps_pouch_client_open` factory supports independently opened owners sharing
-that root. Normal Pouch opens multifile roots. Production cutover requires an
-explicit deployment decision. Existing-root migration and large-machine
-qualification are deferred.
+Pouch stores a root in one persistent file on Linux x86_64, AArch64, and ARM
+hard-float with GNU libc and musl, and on Apple Silicon with macOS 15.0 or
+later. New roots start at 10 MiB and grow in whole 1 MiB increments as needed.
+The implementation retains the multifile reader for migration and fixtures.
 
-Development uses a fixed 10 MiB container with explicit 1 MiB growth. The
-layout, indexing, and maintenance schedule can evolve within this contract.
+An eligible multifile directory migrates on open to a container at the same
+configured path. Migration requires exclusive ownership of the legacy root
+and the key needed to read it. Stop applications with that root open before
+starting an upgrade. The migrator streams into a verified, durable candidate
+on the same filesystem, then atomically exchanges it with the legacy
+directory. Legacy files are reclaimed only after publication is durable.
+Reopening after interruption either rebuilds an unpublished candidate from
+the legacy root or finishes reclamation for the published container.
+Canonical records and retained history carry forward, including saved consumer
+positions, pending transaction decisions, and collection retry receipts.
+Migration requires a dedicated root directory. Move any key file or unrelated
+files outside the root before opening it with the new library.
+
+`disable_migration=true` makes a legacy directory return
+`pouch_migration_disabled`. New and previously migrated roots can still open.
+See [Pouch open settings](pouch-open-settings-api.md).
 
 ## Observable behavior
 

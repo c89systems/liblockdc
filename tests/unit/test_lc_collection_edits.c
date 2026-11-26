@@ -14,6 +14,7 @@
 #include "../support/lc_test_cases.h"
 #include "../support/lc_test_tmp.h"
 #include "lc_collection_internal.h"
+#include "lc_pouch_storage.h"
 
 #define PREFIX LC_COLLECTION_TMP_PARENT "/collection-edit-"
 typedef struct fixture {
@@ -128,7 +129,7 @@ static int open_client(fixture *f) {
   config.endpoints = endpoints;
   config.endpoint_count = 1;
   config.default_namespace = "journal";
-  return lc_client_open(&config, &f->client, &f->error);
+  return lc_pouch_legacy_client_open(&config, &f->client, &f->error);
 }
 static void open_all(fixture *f, int create) {
   lc_collection_config collection;

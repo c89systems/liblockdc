@@ -1222,6 +1222,7 @@ typedef struct lc_pouch_endpoint_options {
   char *crypto_key_file;
   char *compression;
   int crypto_generate_key_file;
+  int disable_migration;
   int single_writer_set;
   int single_writer;
   int durable_sync;
@@ -1461,6 +1462,26 @@ static int lc_pouch_endpoint_parse_option(const lc_allocator *allocator,
                                                    "query option", error);
   if (decoded_key == NULL) {
     return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
+  }
+  if (lc_query_part_equal(decoded_key, strlen(decoded_key),
+                          "disable_migration")) {
+    copy = lc_pouch_endpoint_decode_component(allocator, value, value_len,
+                                              "disable_migration", error);
+    rc = LC_OK;
+    if (!copy)
+      rc = error && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
+    else if (!strcmp(copy, "true") || !strcmp(copy, "1"))
+      options->disable_migration = 1;
+    else if (!strcmp(copy, "false") || !strcmp(copy, "0"))
+      options->disable_migration = 0;
+    else
+      rc =
+          lc_error_set(error, LC_ERR_INVALID, 0L,
+                       "pouch endpoint disable_migration must be true or false",
+                       NULL, NULL, "pouch");
+    lc_free_with_allocator(allocator, copy);
+    lc_free_with_allocator(allocator, decoded_key);
+    return rc;
   }
   if (lc_query_part_equal(decoded_key, strlen(decoded_key), "single_writer")) {
     copy = lc_pouch_endpoint_decode_component(allocator, value, value_len,
@@ -2230,7 +2251,8 @@ void lc_consumer_config_init(lc_consumer_config *config) {
    LC_POUCH_SETTING_QUEUE_WATCH | LC_POUCH_SETTING_QUERY_ENGINE |              \
    LC_POUCH_SETTING_QUERY_FALLBACK_ENGINE | LC_POUCH_SETTING_QUERY_INDEXING |  \
    LC_POUCH_SETTING_CRYPTO_KEY | LC_POUCH_SETTING_CRYPTO_KEY_FILE |            \
-   LC_POUCH_SETTING_CRYPTO_GENERATE_KEY_FILE | LC_POUCH_SETTING_COMPRESSION)
+   LC_POUCH_SETTING_CRYPTO_GENERATE_KEY_FILE | LC_POUCH_SETTING_COMPRESSION |  \
+   LC_POUCH_SETTING_DISABLE_MIGRATION)
 
 static int lc_pouch_settings_boolean_valid(int value) {
   return value == 0 || value == 1;
@@ -2278,7 +2300,9 @@ static int lc_pouch_settings_validate(const lc_pouch_settings *settings,
       ((mask & LC_POUCH_SETTING_QUERY_INDEXING) != 0U &&
        !lc_pouch_settings_boolean_valid(settings->query_indexing_enabled)) ||
       ((mask & LC_POUCH_SETTING_CRYPTO_GENERATE_KEY_FILE) != 0U &&
-       !lc_pouch_settings_boolean_valid(settings->crypto_generate_key_file))) {
+       !lc_pouch_settings_boolean_valid(settings->crypto_generate_key_file)) ||
+      ((mask & LC_POUCH_SETTING_DISABLE_MIGRATION) != 0U &&
+       !lc_pouch_settings_boolean_valid(settings->disable_migration))) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch settings boolean fields must be zero or one",
                         NULL, NULL, "pouch");
@@ -2362,9 +2386,20 @@ lc_pouch_open_options_apply_settings(lc_pouch_open_options *options,
     options->crypto_generate_key_file = settings->crypto_generate_key_file;
   if ((mask & LC_POUCH_SETTING_COMPRESSION) != 0U)
     options->compression = settings->compression;
+  if ((mask & LC_POUCH_SETTING_DISABLE_MIGRATION) != 0U)
+    options->disable_migration = settings->disable_migration;
 }
 
 #undef LC_POUCH_SETTINGS_KNOWN_MASK
+
+int lc_pouch_legacy_client_open(const lc_client_config *config, lc_client **out,
+                                lc_error *error) {
+  lc_pouch_runtime_factory_fn factory = NULL;
+  if (config && config->endpoint_count == 1U && config->endpoints &&
+      lc_endpoint_is_pouch(config->endpoints[0]))
+    factory = lc_pouch_legacy_runtime_factory;
+  return lc_client_open_with_pouch_factory(config, factory, NULL, out, error);
+}
 
 int lc_client_open_with_pouch_factory(const lc_client_config *config,
                                       lc_pouch_runtime_factory_fn factory,
@@ -2561,6 +2596,8 @@ int lc_client_open_with_pouch_factory(const lc_client_config *config,
     pouch_open_options.compression = config->pouch_compression != NULL
                                          ? config->pouch_compression
                                          : pouch_endpoint_options.compression;
+    pouch_open_options.disable_migration =
+        pouch_endpoint_options.disable_migration;
     lc_pouch_open_options_apply_settings(&pouch_open_options,
                                          config->pouch_settings);
     pouch_open_options.logger = client->base_logger;
@@ -2568,9 +2605,9 @@ int lc_client_open_with_pouch_factory(const lc_client_config *config,
              ? factory(factory_context, pouch_endpoint_options.root_path,
                        &config->allocator, &pouch_open_options, &client->pouch,
                        error)
-             : lc_pouch_open(pouch_endpoint_options.root_path,
-                             &config->allocator, &pouch_open_options,
-                             &client->pouch, error);
+             : lc_pouch_open_managed(pouch_endpoint_options.root_path,
+                                     &config->allocator, &pouch_open_options,
+                                     &client->pouch, error);
     if (rc == LC_OK && client->pouch == NULL)
       rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                         "pouch runtime factory returned no owner", NULL, NULL,

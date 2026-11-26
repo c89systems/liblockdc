@@ -243,7 +243,7 @@ static void entry_init(worker *w, size_t row, lc_outbox_entry *entry,
 static void open_client(const comparison *run, const lc_client_config *config,
                         int create, lc_client **out, lc_error *e) {
   check(run->container ? ps_pouch_client_open(config, create, NULL, out, e)
-                       : lc_client_open(config, out, e),
+                       : lc_pouch_legacy_client_open(config, out, e),
         e);
 }
 typedef struct join_job {

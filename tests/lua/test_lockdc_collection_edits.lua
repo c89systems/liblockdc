@@ -92,20 +92,26 @@ local function retry_fencing(api, label)
     assert(owner:append({append_id="later"},'{"later":true}'))
     local current=assert(owner:head())
     local calls,next_owner=0,nil
+    local function checked(result, failure)
+      local message = type(failure) == "table" and failure.message or failure
+      assert(result, tostring(message))
+      return result
+    end
     local value,err,code=owner:edit(req,{read=function()
       calls=calls+1
       if calls==1 then return "{}" end
       assert(calls==2)
       if transient then
-        local temporary=assert(peer:acquire({owner="temporary",private_read=true}))
-        assert(temporary:release())
+        local temporary=checked(peer:acquire({owner="temporary",private_read=true}))
+        checked(temporary:release())
       else
-        next_owner=assert(peer:takeover({owner="replacement",private_read=true},peer:describe().lease.lease_id))
+        next_owner=checked(peer:takeover({owner="replacement",private_read=true},peer:describe().lease.lease_id))
       end
       return nil
     end})
     assert(value==nil and code==core.ERR_INVALID and calls==2)
-    assert(err.server_code==(transient and "lease_changed" or "lease_lost"))
+    assert(err.server_code==(transient and "lease_changed" or "lease_lost"),
+      tostring(err.message) .. " [" .. tostring(err.server_code) .. "]")
     assert(not err.uncertain and not err.result)
     local authorized=next_owner or public
     assert(authorized:edit_status("retry").result.head_etag==original.head_etag)

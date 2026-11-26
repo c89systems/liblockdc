@@ -358,7 +358,7 @@ local source = debug.getinfo(1, "S").source:sub(2)
 local repo = assert(source:match("^(.*)/tests/lua/[^/]+$"))
 package.path = repo .. "/lua/?.lua;" .. repo .. "/lua/?/init.lua;" .. package.path
 local lockdc = require("lockdc")
-local facade_client = assert(lockdc.open({ endpoints = { "pouch://" .. lockdc_test_root .. "/facade" },
+local facade_client = assert(lockdc.open({ endpoints = { "pouch://" .. lockdc_test_root .. "-facade" },
   pouch = { single_writer = true } }))
 local facade_coordinator = assert(facade_client:xa_coordinator())
 op = assert(facade_coordinator:begin_start())

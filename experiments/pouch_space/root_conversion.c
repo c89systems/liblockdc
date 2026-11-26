@@ -4,6 +4,7 @@
 #include "lc_collection_catalog_record.h"
 #include "lc_pouch_internal.h"
 #include "namespace.h"
+#include "outbox_markers.h"
 #include "query_index.h"
 #include "root_internal.h"
 #include <stdlib.h>
@@ -427,6 +428,27 @@ static int execute(root_conversion *c, lc_error *e) {
   c->target = NULL;
   return rc;
 }
+static int require_history_released(root_conversion *c, lc_error *e) {
+  conversion_items items;
+  size_t i;
+  int rc = items_load(c, 0, PS_CATALOG_NAMESPACE, &items, e);
+  for (i = 0; rc == LC_OK && i < items.count; ++i) {
+    ps_namespace *ns = NULL;
+    int registered = 0;
+    rc = ps_root_namespace_acquire(c->root, items.items[i].name, 0, &ns, e);
+    if (rc == LC_OK)
+      rc = ps_history_markers_present(ns, &registered, e);
+    ps_namespace_release(ns);
+    if (rc == LC_OK && registered)
+      rc = lc_error_set(
+          e, LC_ERR_PENDING, 0,
+          "codec conversion requires unregistering namespace history consumers",
+          items.items[i].name, "pouch_history_pinned", "pouch");
+  }
+  items_clear(&items);
+  return rc;
+}
+
 int ps_root_conversion_run(ps_root *root, const char *path,
                            const ps_root_options *options, lc_error *e) {
   root_conversion c;
@@ -469,7 +491,9 @@ int ps_root_conversion_run(ps_root *root, const char *path,
     c.policy = !c.source;
     c.phase = c.ns = c.completed = c.active = 0U;
     memset(&c.head, 0, sizeof(c.head));
-    rc = store(&c, e);
+    rc = require_history_released(&c, e);
+    if (rc == LC_OK)
+      rc = store(&c, e);
     if (rc == LC_OK)
       rc = execute(&c, e);
   }

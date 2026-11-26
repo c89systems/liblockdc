@@ -7,7 +7,11 @@ while retaining those URLs as a supported compatibility mechanism.
 ## Endpoint and writer policy
 
 Select Pouch through a single absolute `pouch://` endpoint, for example
-`pouch:///var/lib/my-service/lockd-root`. The default is exclusive single-writer
+`pouch:///var/lib/my-service/lockd-root`. The configured root is a file on
+platforms with container support. Eligible legacy directories migrate in
+place when no other application holds the root open. Set `disable_migration`
+to true to reject a legacy directory and leave it untouched. See
+[Pouch Space](pouch-space.md). The default is exclusive single-writer
 mode: one live process owns the root append path and normal acquire, update,
 release, queue, attachment, and query operations use the resident logstore fast
 path. Opening a second default writer for the same root fails instead of
@@ -74,7 +78,8 @@ Supported Lua keys map to the C settings: `single_writer`, `durable_sync`,
 `indexer_flush_interval_seconds`, `background_compaction`,
 `disable_compaction_throttling`, `terminal_reclaim_min_bytes`, `queue_watch`,
 `query_engine`, `query_fallback_engine`, `query_indexing`, `crypto_key`,
-`crypto_key_file`, `crypto_generate_key_file`, and `compression`. Unknown keys
+`crypto_key_file`, `crypto_generate_key_file`, `compression`, and
+`disable_migration`. Unknown keys
 and wrong Lua types are rejected. Backend and value failures return the normal
 structured `lockdc.open` error.
 
@@ -140,6 +145,8 @@ Common legacy options are:
   [compression changes](pouch-compression.md).
 - `crypto_key_file=/path/to/pouch.key` with `crypto_generate_key_file=true` for
   encrypted local roots
+- `disable_migration=true` to make open reject a legacy directory without
+  changing it
 - `durable_sync=true` and `fsync_batch_max_ops=<u64>` for root-scoped durable
   group commit
 - `segment_target_bytes=<u64>` for rolling segment sizing

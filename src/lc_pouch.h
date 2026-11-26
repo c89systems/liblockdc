@@ -78,6 +78,7 @@ typedef struct lc_pouch_open_options {
    * none/zlib requests offline conversion when it differs; active writers
    * prevent conversion and the open adopts the stored mode. */
   const char *compression;
+  int disable_migration;
   pslog_logger *logger;
   /**
    * Wait for a durable root-scoped fsync group commit at each public mutation.
@@ -358,6 +359,9 @@ typedef int (*lc_pouch_state_read_many_fn)(
 int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
                   const lc_pouch_open_options *options, lc_pouch **out,
                   lc_error *error);
+int lc_pouch_open_managed(const char *root_path, const lc_allocator *allocator,
+                          const lc_pouch_open_options *options, lc_pouch **out,
+                          lc_error *error);
 void lc_pouch_close(lc_pouch *pouch);
 /**
  * Stops Pouch-owned worker loops, closes resident descriptor and derived-cache

@@ -168,6 +168,7 @@ typedef struct ps_options {
    */
   const struct ps_coordination_io *coordination_io;
   int shared; /* zero selects exclusive lifetime ownership */
+  int grow_on_write;
 } ps_options;
 
 /* create != 0 requires a new pathname; open never creates or truncates. */

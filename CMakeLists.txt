@@ -92,7 +92,7 @@ set(LOCKDC_CMOCKA_VERSION "2.0.2" CACHE STRING "Pinned cmocka release used for u
 set(LOCKDC_PSLOG_VERSION "0.13.0" CACHE STRING "Pinned libpslog release used for SDK logging." FORCE)
 set(LOCKDC_CPKT_VERSION "0.7.0" CACHE STRING "Pinned cpkt dependency bundle version." FORCE)
 set(LOCKDC_CPKTDB_VERSION "0.4.0" CACHE STRING "Pinned cpktdb database bundle version." FORCE)
-set(LOCKDC_MIN_ABI_VERSION "9")
+set(LOCKDC_MIN_ABI_VERSION "10")
 set(LOCKDC_ABI_VERSION "${LOCKDC_MIN_ABI_VERSION}" CACHE STRING "Shared-library ABI/SOVERSION for liblockdc.")
 if(LOCKDC_ABI_VERSION MATCHES "^[0-9]+$" AND LOCKDC_ABI_VERSION LESS LOCKDC_MIN_ABI_VERSION)
     set(LOCKDC_ABI_VERSION "${LOCKDC_MIN_ABI_VERSION}" CACHE STRING "Shared-library ABI/SOVERSION for liblockdc." FORCE)
@@ -660,6 +660,7 @@ if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
         namespace_retention.c namespace_work.c outbox_markers.c query_index.c
         query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c
         coordination.c readiness.c crc.c migration_state.c migration_collection.c
+        migration.c migration_inventory.c
     )
     list(TRANSFORM lc_pouch_container_sources PREPEND "${lc_pouch_container_dir}/")
     list(APPEND lc_sources ${lc_pouch_container_sources})
@@ -733,6 +734,7 @@ function(lc_configure_library_target target)
         target_sources(${target} PRIVATE ${lc_sources})
         if(lc_pouch_container_dir)
             target_include_directories(${target} PRIVATE "${lc_pouch_container_dir}")
+            target_compile_definitions(${target} PRIVATE LOCKDC_POUCH_CONTAINER=1)
         endif()
     endif()
     target_include_directories(${target}

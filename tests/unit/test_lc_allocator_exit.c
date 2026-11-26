@@ -397,8 +397,8 @@ static int exercise_pouch(void) {
   if (!lc_test_tmp_mkdtemp(template_path, root, sizeof(root),
                            "/tmp/liblockdc-allocator-exit-"))
     return 1;
-  if (snprintf(endpoint, sizeof(endpoint), "pouch://%s?single_writer=false",
-               root) < 0)
+  if (snprintf(endpoint, sizeof(endpoint),
+               "pouch://%s/store?single_writer=false", root) < 0)
     return 1;
   endpoints[0] = endpoint;
   lc_error_init(&error);

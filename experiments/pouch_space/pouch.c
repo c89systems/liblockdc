@@ -968,6 +968,17 @@ int ps_pouch_state_open(const char *path, int create,
                         "container roots do not generate external key files",
                         NULL, NULL, "pouch");
   }
+  if (options && options->logical.crypto_key_file &&
+      options->logical.crypto_key_file[0] &&
+      (!options->logical.crypto_key || !options->logical.crypto_key[0])) {
+    pouch->crypto_key_file = lc_strdup_with_allocator(
+        &pouch->allocator, options->logical.crypto_key_file);
+    if (!pouch->crypto_key_file) {
+      lc_pouch_close(pouch);
+      return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot retain pouch key path",
+                          NULL, NULL, "pouch");
+    }
+  }
   owner = lc_calloc_with_allocator(&pouch->allocator, 1, sizeof(*owner));
   if (!owner) {
     lc_pouch_close(pouch);
@@ -987,6 +998,7 @@ int ps_pouch_state_open(const char *path, int create,
     root_options.storage.maximum_capacity = options->maximum_capacity;
     root_options.storage.io = options->io;
     root_options.storage.coordination_io = options->coordination_io;
+    root_options.storage.grow_on_write = options->grow_on_write;
     root_options.crypto.key_string = options->logical.crypto_key;
     root_options.crypto.key_file = options->logical.crypto_key_file;
     root_options.compression_explicit = options->logical.compression != NULL;
@@ -1029,9 +1041,11 @@ int ps_pouch_state_open(const char *path, int create,
   }
   lc_free_with_allocator(&pouch->allocator, pouch->compression);
   pouch->compression = compression;
-  rc = lc_pouch_runtime_start_maintenance(pouch, e);
-  if (rc == LC_OK)
-    rc = lc_pouch_runtime_start_indexing(pouch, e);
+  if (!options || !options->defer_workers) {
+    rc = lc_pouch_runtime_start_maintenance(pouch, e);
+    if (rc == LC_OK)
+      rc = lc_pouch_runtime_start_indexing(pouch, e);
+  }
   if (rc != LC_OK) {
     lc_pouch_close(pouch);
     return rc;

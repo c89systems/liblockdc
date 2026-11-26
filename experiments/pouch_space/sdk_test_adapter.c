@@ -117,3 +117,8 @@ int __wrap_lc_client_open(const lc_client_config *config, lc_client **out,
     return __real_lc_client_open(config, out, e);
   return lc_client_open_with_pouch_factory(config, factory, NULL, out, e);
 }
+
+int __wrap_lc_pouch_legacy_client_open(const lc_client_config *config,
+                                       lc_client **out, lc_error *e) {
+  return __wrap_lc_client_open(config, out, e);
+}

@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "../support/lc_test_cases.h"
+#include "lc_pouch_storage.h"
 
 #define OUTBOX_TMP_PREFIX "/tmp/liblockdc-unit-outbox-"
 #define OUTBOX_RECONCILIATION_RECORDS 256U
@@ -1537,7 +1538,7 @@ outbox_shared_process_claim(const char *root, const char *ns, int start_fd) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  result.rc = lc_client_open(&client_config, &client, &error);
+  result.rc = lc_pouch_legacy_client_open(&client_config, &client, &error);
   if (result.rc == LC_OK) {
     lc_outbox_config_init(&outbox_config);
     outbox_config.ns = ns;
@@ -1608,7 +1609,7 @@ static outbox_process_result outbox_shared_process_drain(const char *root,
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  result.rc = lc_client_open(&client_config, &client, &error);
+  result.rc = lc_pouch_legacy_client_open(&client_config, &client, &error);
   if (result.rc == LC_OK) {
     lc_outbox_config_init(&outbox_config);
     outbox_config.ns = ns;
@@ -1899,7 +1900,8 @@ static void test_pouch_claim_recovery_respects_combined_capacity(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-claim-capacity";
   outbox_config.owner = "outbox-claim-capacity-test";
@@ -1971,7 +1973,8 @@ test_pouch_outbox_duplicate_rejects_immutable_envelope_conflicts(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox";
   outbox_config.owner = "outbox-immutable-envelope";
@@ -2119,7 +2122,8 @@ static void outbox_assert_stateful_remote_rejected(void) {
   config.endpoints = &endpoint;
   config.endpoint_count = 1U;
   config.disable_mtls = 1;
-  assert_int_equal(lc_client_open(&config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "stateful-rejection";
   assert_int_equal(
@@ -2200,7 +2204,8 @@ static void test_pouch_outbox_stateful_delivery_lifecycle(void **state) {
   memset(&attachments, 0, sizeof(attachments));
   lc_attachment_list_req_init(&attachment_list);
   lc_outbox_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-stateful-lifecycle";
   outbox_config.owner = "outbox-stateful-lifecycle-owner";
@@ -2691,7 +2696,8 @@ static void outbox_renewal_terminal_case(int shared, int sequence, int terminal,
                       LC_POUCH_SETTING_QUERY_INDEXING;
   settings.single_writer = !shared;
   config.pouch_settings = &settings;
-  assert_int_equal(lc_client_open(&config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-renewal";
   outbox_config.claim_ttl_seconds = 30L;
@@ -2897,7 +2903,8 @@ test_pouch_outbox_stateful_handoff_failure_rolls_back(void **state) {
   payload = NULL;
   memset(&failure, 0, sizeof(failure));
   lc_outbox_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-stateful-handoff-failure";
   outbox_config.owner = "outbox-stateful-handoff-failure-owner";
@@ -2993,7 +3000,8 @@ static void test_pouch_outbox_transaction_and_duplicate(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox";
   outbox_config.owner = "outbox-test";
@@ -3277,7 +3285,8 @@ test_pouch_duplicate_inbox_handles_json_runtime_failure(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-json-runtime";
   outbox_config.owner = "outbox-json-runtime-test";
@@ -3386,7 +3395,8 @@ test_pouch_participant_cleanup_after_transaction_close(void **state) {
   outbox = NULL;
   transaction = NULL;
   participant = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "participant-lifetime";
   outbox_config.owner = "participant-lifetime-test";
@@ -3472,7 +3482,8 @@ test_pouch_participant_allocation_failure_rolls_back_enrollment(void **state) {
   outbox = NULL;
   transaction = NULL;
   participant = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "participant-oom";
   outbox_config.owner = "participant-oom-test";
@@ -3564,7 +3575,8 @@ static void test_pouch_command_receipt_allocation_failure_rolls_back_enrollment(
   outbox = NULL;
   transaction = NULL;
   lc_command_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "command-oom";
   outbox_config.owner = "command-oom-test";
@@ -3659,7 +3671,8 @@ test_pouch_command_terminal_load_failure_cleans_record(void **state) {
   outbox = NULL;
   transaction = NULL;
   lc_command_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "command-terminal-load";
   assert_int_equal(
@@ -3728,7 +3741,8 @@ test_pouch_outbox_allocation_failures_roll_back_enrollment(void **state) {
   participant = NULL;
   payload = NULL;
   lc_outbox_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-oom";
   outbox_config.owner = "outbox-oom-test";
@@ -3897,7 +3911,8 @@ test_pouch_notification_allocation_failure_reconciles_committed_outbox(
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "notify-oom";
   outbox_config.owner = "notify-oom-test";
@@ -3975,7 +3990,8 @@ test_pouch_retry_notification_allocation_failure_recovers_at_deadline(
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "retry-oom";
   outbox_config.owner = "retry-oom-test";
@@ -4139,7 +4155,8 @@ static void test_pouch_transient_claim_failure_is_rescheduled(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "claim-retry";
   outbox_config.owner = "claim-retry-test";
@@ -4239,7 +4256,8 @@ test_pouch_reconciliation_preserves_earliest_claim_recovery(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "claim-recovery-deadline";
   outbox_config.owner = "claim-recovery-deadline-test";
@@ -4329,7 +4347,8 @@ static void test_pouch_overflowing_foreground_retry_reconciles(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "claim-retry-overflow";
   outbox_config.owner = "claim-retry-overflow-test";
@@ -4415,7 +4434,8 @@ static void test_pouch_auto_retry_long_max_cap_is_safe(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "retry-long-max";
   outbox_config.owner = "retry-long-max-test";
@@ -4487,7 +4507,8 @@ test_pouch_claim_recovery_allocation_failure_recovers_at_expiry(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "claim-recovery-oom";
   outbox_config.owner = "claim-recovery-oom-test";
@@ -4587,7 +4608,8 @@ test_pouch_command_receipt_commits_with_outbox_and_result(void **state) {
   lc_command_receipt_init(&active_receipt);
   lc_command_receipt_init(&active_duplicate_receipt);
   lc_outbox_receipt_init(&outbox_receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "command-outbox";
   outbox_config.owner = "command-owner";
@@ -4809,7 +4831,8 @@ static void test_pouch_generated_command_key_waits_by_id(void **state) {
   outbox = NULL;
   transaction = NULL;
   lc_command_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "generated-command-outbox";
   outbox_config.owner = "generated-command-owner";
@@ -4941,7 +4964,8 @@ test_pouch_command_attachment_failure_aborts_transaction(void **state) {
   command.identity.idempotency_key = "attachment-failure-request";
   command.request_digest = "attachment-failure-digest";
   command.operation_id = "attachment-failure-operation";
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "command-attachment-failure";
   assert_int_equal(
@@ -5035,7 +5059,8 @@ static void test_pouch_outbox_rejects_overflowing_deadlines(void **state) {
   job = NULL;
   payload = NULL;
   lc_outbox_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
 
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "deadline-overflow";
@@ -5142,7 +5167,8 @@ test_pouch_outbox_periodic_schedule_failure_does_not_deadlock(void **state) {
   lc_outbox_test_before_periodic_recovery_schedule_hook =
       outbox_periodic_recovery_schedule_failure;
   lc_outbox_test_before_periodic_recovery_schedule_context = &race;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "periodic-schedule-race";
   outbox_config.recovery_interval_seconds = 1L;
@@ -5206,8 +5232,9 @@ static void test_pouch_shared_command_resume_is_durable(void **state) {
   command.identity.command_type = "orders.cancel.v1";
   command.identity.idempotency_key = "shared-request";
   command.request_digest = "shared-request-digest";
-  assert_int_equal(lc_client_open(&client_config, &first_client, &error),
-                   LC_OK);
+  assert_int_equal(
+      lc_pouch_legacy_client_open(&client_config, &first_client, &error),
+      LC_OK);
   assert_int_equal(
       lc_client_new_outbox(first_client, &outbox_config, &first_outbox, &error),
       LC_OK);
@@ -5220,8 +5247,9 @@ static void test_pouch_shared_command_resume_is_durable(void **state) {
   lc_outbox_close(first_outbox);
   lc_client_close(first_client);
   outbox_config.owner = "command-shared-second";
-  assert_int_equal(lc_client_open(&client_config, &second_client, &error),
-                   LC_OK);
+  assert_int_equal(
+      lc_pouch_legacy_client_open(&client_config, &second_client, &error),
+      LC_OK);
   assert_int_equal(lc_client_new_outbox(second_client, &outbox_config,
                                         &second_outbox, &error),
                    LC_OK);
@@ -5299,7 +5327,8 @@ test_pouch_multikey_prevote_failure_publishes_nothing(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client_config.default_namespace = "outbox-atomic";
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-atomic";
   outbox_config.owner = "outbox-atomic-test";
@@ -5398,7 +5427,8 @@ test_pouch_multikey_commit_retry_retains_outbox_notification(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-atomic-retry";
   outbox_config.owner = "outbox-atomic-retry-test";
@@ -5495,7 +5525,8 @@ test_pouch_partial_command_commit_freezes_transaction(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "partial-command";
   outbox_config.owner = "partial-command-test";
@@ -5593,7 +5624,8 @@ test_pouch_indeterminate_first_vote_freezes_transaction(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "indeterminate-first-vote";
   outbox_config.owner = "indeterminate-first-vote-test";
@@ -5686,7 +5718,8 @@ static void test_pouch_indeterminate_commit_replay_retains_outbox_notification(
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-indeterminate-replay";
   outbox_config.owner = "outbox-indeterminate-replay-test";
@@ -5788,7 +5821,8 @@ test_pouch_expired_commit_reports_rollback_without_signal(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client_config.default_namespace = "outbox-expired-terminal";
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-expired-terminal";
   outbox_config.owner = "outbox-expired-terminal-test";
@@ -5931,7 +5965,8 @@ static void outbox_recovery_overflow_resumes_after_capacity_frees(int claimed) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-recovery-overflow-resume";
   outbox_config.owner = "outbox-recovery-overflow-resume-owner";
@@ -6030,7 +6065,8 @@ test_pouch_delayed_wake_does_not_block_ready_reconciliation(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-delayed-wake-progress";
   outbox_config.owner = "outbox-delayed-wake-progress-owner";
@@ -6104,7 +6140,8 @@ static void test_pouch_evicted_claim_wake_recovers_at_expiry(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-evicted-claim-wake";
   outbox_config.owner = "outbox-evicted-claim-wake-owner";
@@ -6195,7 +6232,8 @@ static void test_pouch_claim_recovery_survives_capacity_pause(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-claim-recovery-capacity-pause";
   outbox_config.owner = "outbox-claim-recovery-capacity-pause-owner";
@@ -6274,7 +6312,8 @@ test_pouch_concurrent_dispatcher_acquisition_keeps_one_attachment_ref(
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
 
   for (iteration = 0U; iteration < 20U; ++iteration) {
     pthread_barrier_t barrier;
@@ -6357,7 +6396,8 @@ static void test_pouch_reconciliation_retains_overflow_request(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client_config.default_namespace = "outbox-reconcile-overflow";
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-reconcile-overflow";
   outbox_config.owner = "outbox-reconcile-overflow-test";
@@ -6433,7 +6473,8 @@ static void test_pouch_reconciliation_skips_disappeared_outbox(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client_config.default_namespace = ns;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = ns;
   outbox_config.owner = "outbox-reconcile-disappeared-test";
@@ -6510,7 +6551,8 @@ static void test_pouch_handoff_skips_disappeared_outbox(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client_config.default_namespace = ns;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = ns;
   outbox_config.owner = "outbox-handoff-disappeared-test";
@@ -6620,7 +6662,8 @@ static void test_pouch_dead_letter_operations(void **state) {
   memset(&export_hook, 0, sizeof(export_hook));
   memset(&attachments, 0, sizeof(attachments));
   memset(&retained_marker, 0, sizeof(retained_marker));
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-dead-letter";
   outbox_config.owner = "outbox-dead-letter-test";
@@ -6912,7 +6955,8 @@ static void test_pouch_startup_replay_precedes_due_retention(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-startup-retention";
   outbox_config.owner = "outbox-startup-retention-test";
@@ -6977,7 +7021,8 @@ test_pouch_dead_letter_management_rejects_invalid_candidates(void **state) {
   sink = NULL;
   memset(&attachments, 0, sizeof(attachments));
   memset(&get_result, 0, sizeof(get_result));
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_dead_letter_outbox_with_replay_count(
       client, "outbox-dead-letter-boundary", unreserved_key, "0", &error);
   seed_malformed_dead_letter_outbox(client, "outbox-dead-letter-boundary",
@@ -7071,7 +7116,8 @@ static void test_pouch_startup_recovery_claims_seeded_outbox(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-recovery",
                        "__lockdc_io/v1/outbox/recovery", &error);
   lc_outbox_config_init(&outbox_config);
@@ -7145,7 +7191,8 @@ static void test_pouch_reopen_reconciles_durable_index_mode(int shared) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   for (index = 0U; index < OUTBOX_CLEAN_REOPEN_FOREIGN_CHURN; ++index) {
     size_t key_index;
 
@@ -7177,7 +7224,8 @@ static void test_pouch_reopen_reconciles_durable_index_mode(int shared) {
   lc_client_close(client);
   client = NULL;
 
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_query_req_init(&query_request);
   memset(&query_handler, 0, sizeof(query_handler));
   memset(&query_result, 0, sizeof(query_result));
@@ -7262,7 +7310,8 @@ test_pouch_compacted_reopen_reconciles_released_outbox(void **state) {
   client_config.endpoint_count = 1U;
   client = NULL;
   outbox = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   for (rewrite = 0U; rewrite < 5U; ++rewrite) {
     for (index = 0U; index < 64U; ++index) {
       char key[128];
@@ -7295,7 +7344,8 @@ test_pouch_compacted_reopen_reconciles_released_outbox(void **state) {
   lc_client_close(client);
   client = NULL;
 
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-compacted-reopen";
   outbox_config.owner = "outbox-compacted-reopen-test";
@@ -7366,7 +7416,8 @@ test_pouch_dispatcher_wakeup_isolated_from_next_waiters(void **state) {
   lc_outbox_test_before_dispatcher_wait_context = &race;
   lc_outbox_test_before_next_wait_hook = outbox_next_wait_hook;
   lc_outbox_test_before_next_wait_context = &race;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "dispatcher-wakeup";
   /* This race asserts only dispatcher/foreground wake isolation. Disable
@@ -7465,7 +7516,8 @@ static void test_pouch_next_timeout_uses_one_deadline(void **state) {
   outbox_reset_allocation_failures();
   lc_outbox_test_before_next_wait_hook = outbox_next_wait_observed_hook;
   lc_outbox_test_before_next_wait_context = &race;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "next-deadline";
   assert_int_equal(
@@ -7527,7 +7579,8 @@ test_pouch_next_long_max_timeout_waits_until_dispatcher_stops(void **state) {
   outbox_reset_allocation_failures();
   lc_outbox_test_before_next_wait_hook = outbox_next_wait_observed_hook;
   lc_outbox_test_before_next_wait_context = &race;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "next-long-max";
   assert_int_equal(
@@ -7587,7 +7640,8 @@ static void test_pouch_reconciliation_pages_large_outbox(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   memset(seen, 0, sizeof(seen));
   for (index = 0U; index < OUTBOX_RECONCILIATION_RECORDS; ++index) {
     char key[128];
@@ -7676,7 +7730,8 @@ test_pouch_reconciled_terminal_transport_failure_is_retryable(void **state) {
   job = NULL;
   memset(&failure, 0, sizeof(failure));
   failure.failure_call = 0U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-reconcile-terminal-retry", outbox_key,
                        &error);
   lc_outbox_config_init(&outbox_config);
@@ -7749,7 +7804,8 @@ test_pouch_reconciled_terminal_release_failure_is_retryable(void **state) {
   /* The first append advances the lease's staged-version cursor; fail the
    * second append, which is the terminal release/commit batch. */
   failure.failure_call = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-reconcile-terminal-release-retry",
                        outbox_key, &error);
   lc_outbox_config_init(&outbox_config);
@@ -7826,7 +7882,8 @@ static void test_pouch_dispatcher_wait_includes_worker_release(void **state) {
   config.allocator.realloc_fn = outbox_tracking_realloc;
   config.allocator.free_fn = outbox_tracking_free;
   config.allocator.context = &allocator;
-  assert_int_equal(lc_client_open(&config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "worker-release";
   assert_int_equal(
@@ -7885,7 +7942,8 @@ test_pouch_reconciliation_preserves_allocator_domains(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   for (index = 0U; index < 3U; ++index) {
     char key[128];
 
@@ -7900,7 +7958,8 @@ test_pouch_reconciliation_preserves_allocator_domains(void **state) {
   client_config.allocator.free_fn = outbox_tracking_free;
   client_config.allocator.context = &allocator;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-reconcile-cursor";
   outbox_config.owner = "outbox-reconcile-cursor-test";
@@ -7956,7 +8015,8 @@ test_pouch_dispatcher_is_passive_until_consumer_demand(void **state) {
   outbox = NULL;
   dispatcher = NULL;
   job = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   for (index = 0U; index < OUTBOX_PREFETCH_RECORDS; ++index) {
     char key[128];
 
@@ -8063,7 +8123,8 @@ test_pouch_dispatcher_scan_recovery_when_indexing_is_disabled(void **state) {
   outbox = NULL;
   dispatcher = NULL;
   job = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-scan-recovery", outbox_key, &error);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-scan-recovery";
@@ -8190,7 +8251,8 @@ static void test_pouch_client_close_from_source_callback(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-client-close-callback";
   outbox_config.owner = "outbox-client-close-callback-owner";
@@ -8272,8 +8334,9 @@ static void outbox_callback_fixture_open(outbox_callback_fixture *fixture,
   lc_client_config_init(&client_config);
   client_config.endpoints = fixture->endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(
-      lc_client_open(&client_config, &fixture->client, &fixture->error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &fixture->client,
+                                               &fixture->error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = ns;
   outbox_config.owner = "outbox-callback-owner-test";
@@ -8552,7 +8615,8 @@ test_pouch_dispatcher_rejects_client_closed_replacement(void **state) {
   outbox = NULL;
   rejected_outbox = NULL;
   dispatcher = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-client-closed";
   assert_int_equal(client->new_outbox(client, &outbox_config, &outbox, &error),
@@ -8606,7 +8670,8 @@ test_pouch_dispatcher_stop_timeout_preserves_handed_out_job(void **state) {
   dispatcher = NULL;
   second_dispatcher = NULL;
   job = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-stop-timeout", outbox_key, &error);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-stop-timeout";
@@ -8686,7 +8751,8 @@ static void test_pouch_dispatcher_stop_retains_inflight_receiver(void **state) {
   assert_int_equal(pthread_mutex_init(&race.mutex, NULL), 0);
   assert_int_equal(pthread_cond_init(&race.condition, NULL), 0);
   outbox_reset_allocation_failures();
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "dispatcher-core-race";
   outbox_config.owner = "dispatcher-core-race-test";
@@ -8749,7 +8815,8 @@ static void test_pouch_shared_process_dispatches_once(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-shared-process",
                        "__lockdc_io/v1/outbox/shared-process", &error);
   lc_client_close(client);
@@ -8775,7 +8842,8 @@ static void test_pouch_shared_process_dispatches_once(void **state) {
   outbox = NULL;
   job = NULL;
   parent_got_job = 0;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-shared-process";
   outbox_config.owner = "outbox-shared-parent";
@@ -8840,7 +8908,8 @@ test_pouch_shared_process_reconciles_each_outbox_once(void **state) {
   client_config.endpoint_count = 1U;
   client_config.default_namespace = "outbox-shared-reconcile";
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   for (index = 0U; index < OUTBOX_SHARED_PROCESS_RECORDS; ++index) {
     char key[160];
 
@@ -8909,7 +8978,8 @@ test_pouch_shared_process_reconciles_each_outbox_once(void **state) {
   }
   assert_int_equal(delivered, OUTBOX_SHARED_PROCESS_RECORDS);
 
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   for (index = 0U; index < OUTBOX_SHARED_PROCESS_RECORDS; ++index) {
     char key[160];
 
@@ -8959,7 +9029,8 @@ test_pouch_shared_renewal_publishes_recovery_deadline(void **state) {
   job = NULL;
   payload = NULL;
   lc_outbox_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&first_config);
   first_config.ns = "outbox-renewed-claim";
   first_config.owner = "outbox-renewed-claim-first";
@@ -9074,7 +9145,8 @@ static void test_pouch_failed_renew_does_not_publish_future_recovery_deadline(
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-failed-renew";
   outbox_config.owner = "outbox-failed-renew-test";
@@ -9159,7 +9231,8 @@ test_pouch_failed_renew_refreshes_recovery_from_server_expiry(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-failed-renew-recovery";
   outbox_config.owner = "outbox-failed-renew-recovery-test";
@@ -9236,7 +9309,8 @@ static void test_pouch_expired_claim_rejects_stale_terminal(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-stale-terminal",
                        "__lockdc_io/v1/outbox/stale-terminal", &error);
   lc_outbox_config_init(&config);
@@ -9304,7 +9378,8 @@ test_pouch_expired_claim_recovers_and_preserves_attempt_budget(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-expired-budget",
                        "__lockdc_io/v1/outbox/expired-budget", &error);
   lc_outbox_config_init(&config);
@@ -9397,7 +9472,8 @@ test_pouch_outbox_dead_letters_persisted_exhausted_attempts(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox_with_attempt_count(
       client, "outbox-persisted-budget",
       "__lockdc_io/v1/outbox/persisted-budget", "2", &error);
@@ -9469,7 +9545,8 @@ static void test_pouch_outbox_rejects_malformed_durable_outbox(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_malformed_recovery_outbox(client, "outbox-malformed-outbox",
                                  "__lockdc_io/v1/outbox/malformed-outbox",
                                  &error);
@@ -9535,7 +9612,8 @@ static void test_outbox_rejects_oversized_outbox_envelope(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-envelope-limit";
   outbox_config.owner = "outbox-envelope-limit-test";
@@ -9607,7 +9685,8 @@ static void test_outbox_rejects_oversized_receipt_metadata(void **state) {
   outbox = NULL;
   transaction = NULL;
   lc_command_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-receipt-limit";
   outbox_config.owner = "outbox-receipt-limit-test";
@@ -9709,7 +9788,8 @@ test_outbox_rejects_oversized_terminal_receipt_metadata(void **state) {
   outbox = NULL;
   transaction = NULL;
   lc_command_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-terminal-receipt-limit";
   outbox_config.owner = "outbox-terminal-receipt-limit-test";
@@ -9825,7 +9905,8 @@ static void test_pouch_participant_attach_refreshes_version(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "participant-attach";
   outbox_config.owner = "participant-attach-test";
@@ -9916,7 +9997,8 @@ test_pouch_outbox_rejects_out_of_range_durable_attempt_counts(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   for (index = 0U; index < sizeof(keys) / sizeof(keys[0]); ++index) {
     seed_recovery_outbox_with_attempt_count(client, "outbox-attempt-range",
                                             keys[index], attempt_counts[index],
@@ -10000,7 +10082,8 @@ test_pouch_outbox_rejects_out_of_range_durable_replay_counts(void **state) {
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   for (index = 0U; index < sizeof(keys) / sizeof(keys[0]); ++index) {
     seed_dead_letter_outbox_with_replay_count(client, "outbox-replay-range",
                                               keys[index], replay_counts[index],
@@ -10086,7 +10169,8 @@ static void test_pouch_outbox_validates_durable_input_contracts(void **state) {
   second_payload = NULL;
   oversized_diagnostic = NULL;
   lc_outbox_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-input-contracts";
   outbox_config.owner = "outbox-input-contracts-test";
@@ -10262,7 +10346,8 @@ static void test_pouch_outbox_close_serializes_ready_job_detach(void **state) {
   client_config.endpoint_count = 1U;
   client = NULL;
   outbox = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   seed_recovery_outbox(client, "outbox-shutdown-race",
                        "__lockdc_io/v1/outbox/shutdown-race", &error);
   lc_outbox_config_init(&outbox_config);
@@ -10391,7 +10476,8 @@ static void test_pouch_dispatcher_stop_retains_blocked_next(void **state) {
   lc_outbox_test_before_next_release_hook =
       outbox_blocked_next_close_before_release;
   lc_outbox_test_before_next_release_context = &race;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "blocked-next-close";
   assert_int_equal(client->new_outbox(client, &outbox_config, &outbox, &error),
@@ -10513,7 +10599,8 @@ test_pouch_command_receipt_rejects_malformed_terminal_records(void **state) {
   lease = NULL;
   source = NULL;
   lc_command_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "command-malformed";
   outbox_config.owner = "command-malformed-test";
@@ -10647,7 +10734,8 @@ static void test_pouch_outbox_completion_evidence_is_bounded(void **state) {
   job = NULL;
   payload = NULL;
   lc_outbox_receipt_init(&receipt);
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "completion-evidence";
   outbox_config.owner = "completion-evidence-test";
@@ -10723,7 +10811,8 @@ static void terminal_retention_open(terminal_retention_fixture *f) {
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&config, &f->client, &f->error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&config, &f->client, &f->error),
+                   LC_OK);
   lc_outbox_config_init(&f->config);
   f->config.ns = "terminal-retention";
   assert_int_equal(
@@ -11169,7 +11258,8 @@ test_pouch_terminal_retention_live_dispatcher_restart(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &f.client, &f.error), LC_OK);
+  assert_int_equal(
+      lc_pouch_legacy_client_open(&client_config, &f.client, &f.error), LC_OK);
   f.config.dead_letter_retention_seconds = -1L;
   assert_int_equal(outbox_public_new(f.client, &f.config, &f.outbox, &f.error),
                    LC_OK);
@@ -11629,7 +11719,8 @@ test_pouch_dead_letter_retention_is_bounded_and_generation_safe(void **state) {
   hold_lease = NULL;
   second_hold_lease = NULL;
   memset(&selected_marker, 0, sizeof(selected_marker));
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   /* A successful empty maintenance turn must schedule a bounded future
    * rediscovery. A shared writer can publish a marker after that first scan;
    * the dispatcher will observe it without ever adding retention work to
@@ -11966,7 +12057,8 @@ test_pouch_dead_letter_retention_is_bounded_and_generation_safe(void **state) {
   outbox = NULL;
   lc_client_close(client);
   client = NULL;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   client_handle = (lc_client_handle *)client;
   assert_int_equal(outbox_public_new(client, &config, &outbox, &error), LC_OK);
   reclaimed = 0U;
@@ -12122,7 +12214,8 @@ static void test_outbox_public_rejections_clear_handle_outputs(void **state) {
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;
   client_config.endpoint_count = 1U;
-  assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  assert_int_equal(lc_pouch_legacy_client_open(&client_config, &client, &error),
+                   LC_OK);
   outbox = (lc_outbox *)(uintptr_t)1U;
   assert_int_equal(client->new_outbox_with_dispatcher(client, &config, NULL,
                                                       &outbox, &error),

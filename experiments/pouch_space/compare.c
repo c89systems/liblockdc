@@ -588,7 +588,7 @@ static void open_stores(comparison *c, int create, lc_error *e) {
     config.pouch_settings = &settings;
     check(c->runtime
               ? ps_pouch_client_open(&config, create, NULL, &c->client, e)
-              : lc_client_open(&config, &c->client, e),
+              : lc_pouch_legacy_client_open(&config, &c->client, e),
           e);
     c->pouch = ((lc_client_handle *)c->client)->pouch;
     return;
@@ -637,7 +637,7 @@ static void open_stores(comparison *c, int create, lc_error *e) {
   config.default_namespace = "bench";
   config.pouch_settings = &settings;
   check(c->runtime ? ps_pouch_client_open(&config, create, NULL, &c->client, e)
-                   : lc_client_open(&config, &c->client, e),
+                   : lc_pouch_legacy_client_open(&config, &c->client, e),
         e);
   c->pouch = ((lc_client_handle *)c->client)->pouch;
   if (c->compaction) {
@@ -649,7 +649,7 @@ static void open_stores(comparison *c, int create, lc_error *e) {
     if (c->peers) {
       check(c->runtime
                 ? ps_pouch_client_open(&config, 0, NULL, &c->workers[i].peer, e)
-                : lc_client_open(&config, &c->workers[i].peer, e),
+                : lc_pouch_legacy_client_open(&config, &c->workers[i].peer, e),
             e);
       client = c->workers[i].peer;
     }

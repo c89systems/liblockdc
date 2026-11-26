@@ -4,7 +4,7 @@ local root = os.getenv("LOCKDC_POUCH_ROOT") or "/var/lib/lockdc-lua"
 local namespace = os.getenv("LOCKDC_NAMESPACE") or "default"
 local key = os.getenv("LOCKDC_KEY") or "examples/lua/pouch-local-storage"
 local owner = os.getenv("LOCKDC_OWNER") or "lua-pouch-example"
-local key_file = os.getenv("LOCKDC_POUCH_KEY_FILE") or (root .. "/pouch.key")
+local key_file = os.getenv("LOCKDC_POUCH_KEY_FILE") or (root .. ".key")
 local compression = os.getenv("LOCKDC_POUCH_COMPRESSION") or "zlib"
 
 if root:sub(1, 1) ~= "/" then

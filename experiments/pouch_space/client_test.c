@@ -356,7 +356,7 @@ static void lifecycle(const char *directory) {
         lc_client *client = NULL;
         char *config_etag = NULL;
         for (int cold = 0; cold < 2; ++cold) {
-          ok(native ? lc_client_open(&cfg, &client, &e)
+          ok(native ? lc_pouch_legacy_client_open(&cfg, &client, &e)
                     : ps_pouch_client_open(&cfg, !cold, NULL, &client, &e),
              &e);
           lc_client_handle *handle = (lc_client_handle *)client;
@@ -2937,7 +2937,7 @@ static void guard_public(const char *directory) {
       cfg.pouch_settings = &settings;
       for (int cold = 0; cold < 2; ++cold) {
         lc_client *client = NULL;
-        ok(native ? lc_client_open(&cfg, &client, &e)
+        ok(native ? lc_pouch_legacy_client_open(&cfg, &client, &e)
                   : ps_pouch_client_open(&cfg, !cold, NULL, &client, &e),
            &e);
         if (cold) {

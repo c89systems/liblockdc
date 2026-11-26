@@ -28,6 +28,7 @@
 #include "lc_pouch_path.h"
 #include "lc_pouch_query_index.h"
 #include "lc_pouch_record.h"
+#include "lc_pouch_storage.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -7868,7 +7869,7 @@ static void test_pouch_typed_settings_override_endpoint_options(void **state) {
   config.endpoint_count = 1U;
   config.pouch_settings = &settings;
 
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   handle = (lc_client_handle *)client;
   rc = lc_pouch_status_read(handle->pouch, &status, &error);
@@ -7913,7 +7914,7 @@ test_pouch_typed_settings_validate_backend_and_values(void **state) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.pouch_settings = &settings;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_ERR_INVALID);
   assert_null(client);
   assert_string_equal(error.message,
@@ -7924,7 +7925,7 @@ test_pouch_typed_settings_validate_backend_and_values(void **state) {
   settings.set_mask = LC_POUCH_SETTING_QUERY_INDEXING;
   settings.query_indexing_enabled = 2;
   endpoints[0] = "pouch:///tmp/liblockdc-invalid-pouch-settings";
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_ERR_INVALID);
   assert_null(client);
   assert_string_equal(error.message,
@@ -7933,7 +7934,7 @@ test_pouch_typed_settings_validate_backend_and_values(void **state) {
   lc_error_init(&error);
 
   settings.set_mask = UINT64_C(1) << 63;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_ERR_INVALID);
   assert_null(client);
   assert_string_equal(error.message,
@@ -7978,7 +7979,7 @@ static void test_pouch_typed_settings_override_crypto_options(void **state) {
   config.endpoint_count = 1U;
   config.pouch_settings = &settings;
 
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   handle = (lc_client_handle *)client;
   rc = lc_pouch_status_read(handle->pouch, &status, &error);
@@ -8028,7 +8029,7 @@ test_pouch_typed_settings_override_crypto_file_generation(void **state) {
   config.endpoint_count = 1U;
   config.pouch_settings = &settings;
 
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_ERR_TRANSPORT);
   assert_null(client);
   assert_int_equal(access(key_path, F_OK), -1);
@@ -9349,7 +9350,7 @@ static int pouch_shared_process_open_client(const char *root, lc_client **out,
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  rc = lc_client_open(&config, out, error);
+  rc = lc_pouch_legacy_client_open(&config, out, error);
   return rc;
 }
 
@@ -10424,7 +10425,7 @@ static void open_pouch_client(const char *root, lc_client **out,
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  rc = lc_client_open(&config, out, error);
+  rc = lc_pouch_legacy_client_open(&config, out, error);
   assert_int_equal(rc, LC_OK);
   assert_non_null(*out);
 }
@@ -10450,7 +10451,7 @@ static void open_pouch_client_endpoint(const char *endpoint, lc_client **out,
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  rc = lc_client_open(&config, out, error);
+  rc = lc_pouch_legacy_client_open(&config, out, error);
   assert_int_equal(rc, LC_OK);
   assert_non_null(*out);
 }
@@ -14160,7 +14161,7 @@ test_pouch_endpoint_opens_new_backend_without_http_engine(void **state) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
 
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   assert_non_null(client);
   assert_int_equal(((lc_client_handle *)client)->disable_mtls, 1);
@@ -14255,14 +14256,14 @@ static void test_pouch_endpoint_build_and_option_presence(void **state) {
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   lc_client_close(client);
   client = NULL;
   assert_true(snprintf(invalid_endpoint, sizeof(invalid_endpoint),
                        "pouch://%s?pouch_single_writer=false", root) > 0);
   endpoints[0] = invalid_endpoint;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_ERR_INVALID);
   assert_string_equal(error.message, "unsupported pouch endpoint query option");
   lc_error_cleanup(&error);
@@ -14308,7 +14309,7 @@ test_pouch_endpoint_option_presence_selects_crypto_default(void **state) {
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   lc_client_close(client);
   client = NULL;
@@ -14324,7 +14325,7 @@ test_pouch_endpoint_option_presence_selects_crypto_default(void **state) {
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   lc_client_close(client);
   client = NULL;
@@ -14341,7 +14342,7 @@ test_pouch_endpoint_option_presence_selects_crypto_default(void **state) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.pouch_crypto_key = crypto_key;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   lc_client_close(client);
 
@@ -14373,7 +14374,7 @@ static void test_pouch_endpoint_rejects_unix_socket_mix(void **state) {
   config.endpoint_count = 1U;
   config.unix_socket_path = "/tmp/lockd.sock";
 
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_ERR_INVALID);
   assert_null(client);
   assert_string_equal(error.message,
@@ -14986,7 +14987,7 @@ test_pouch_crypto_endpoint_key_is_not_retained_in_endpoint_copy(void **state) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
 
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   assert_non_null(client);
   handle = (lc_client_handle *)client;
@@ -22219,7 +22220,7 @@ static void test_pouch_compression_public_config_is_retained(void **state) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.pouch_compression = "zlib";
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
   handle = (lc_client_handle *)client;
   assert_string_equal(handle->pouch_compression, "zlib");
@@ -23163,7 +23164,7 @@ static void test_pouch_crypto_public_config_false_overrides_endpoint_generation(
   config.pouch_crypto_generate_key_file = 0;
   config.pouch_crypto_generate_key_file_set = 1;
 
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_ERR_TRANSPORT);
   assert_null(client);
   assert_int_equal(access(key_path, F_OK), -1);
@@ -23315,7 +23316,7 @@ static void test_pouch_crypto_rejects_wrong_key(void **state) {
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  rc = lc_client_open(&config, &reader, &error);
+  rc = lc_pouch_legacy_client_open(&config, &reader, &error);
   assert_int_equal(rc, LC_ERR_INVALID);
   assert_null(reader);
   assert_string_equal(
@@ -24863,7 +24864,7 @@ test_client_queue_dequeue_with_state_rolls_back_partial_delivery(void **state) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.allocator = allocator;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
 
   enqueue_req.queue = "jobs";
@@ -25917,7 +25918,7 @@ static int pouch_watch_commit_txn_ack_child(const char *root, const char *queue,
   lc_client_config_init(&config);
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   if (rc == LC_OK) {
     rc = pouch_watch_commit_txn_ack_with_client(client, queue, txn_id, &error);
   }
@@ -27338,7 +27339,7 @@ static void test_acquire_allocation_failure_rolls_back_claim(void **state) {
   config.allocator = allocator;
   client = NULL;
   lease = NULL;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
 
   acquire_req.key = key;
@@ -28341,7 +28342,7 @@ static void test_release_closes_state_bound_lease(void **state) {
   config.allocator = allocator;
   client = NULL;
   lease = NULL;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
 
   acquire_req.key = key;
@@ -33939,7 +33940,7 @@ test_query_scan_body_cache_warms_only_full_consumption(void **state) {
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.allocator = allocator;
-  rc = lc_client_open(&config, &client, &error);
+  rc = lc_pouch_legacy_client_open(&config, &client, &error);
   assert_int_equal(rc, LC_OK);
 
   /* A scan with a discard sink decides at /status and must not allocate a

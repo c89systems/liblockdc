@@ -10,7 +10,6 @@ typedef struct state_import {
   lc_pouch *source;
   lc_pouch *target;
   ps_namespace *destination;
-  int preserve_history;
 } state_import;
 
 static int import_entry(void *context, const lc_pouch_state_entry *entry,
@@ -47,13 +46,10 @@ static int import_entry(void *context, const lc_pouch_state_entry *entry,
     lc_pouch_record_io output = ps_namespace_append_output(append);
     const char *leaf = ps_namespace_append_leaf(append);
 
-    if (binding && work->preserve_history)
+    if (binding)
       rc = lc_pouch_state_record_import_history(allocator, crypto, input,
                                                 output, leaf, entry, binding,
                                                 &converted, e);
-    else if (binding)
-      rc = lc_pouch_state_record_recode(allocator, crypto, input, output, leaf,
-                                        entry, binding, &converted, e);
     else
       rc = lc_pouch_state_record_write_snapshot(allocator, output, leaf, entry,
                                                 NULL, NULL, 0, e);
@@ -69,16 +65,16 @@ static int import_namespace(void *context, const char *ns, lc_error *e) {
   state_import *work = context;
   lc_pouch_retention_work retention = {0};
   lc_pouch_generation oldest;
-  int rc = lc_pouch_history_oldest_acknowledged(
-      work->source, ns, &work->preserve_history, &oldest, e);
+  int consumers, rc = lc_pouch_history_oldest_acknowledged(
+                     work->source, ns, &consumers, &oldest, e);
   if (rc == LC_OK)
     rc = ps_root_namespace_acquire(ps_pouch_state_root(work->target), ns, 1,
                                    &work->destination, e);
-  if (rc == LC_OK && work->preserve_history)
+  if (rc == LC_OK && consumers)
     rc = lc_pouch_history_import(work->source, work->target, ns, e);
   if (rc == LC_OK)
-    rc = lc_pouch_legacy_state_visit(work->source, ns, work->preserve_history,
-                                     import_entry, work, e);
+    rc =
+        lc_pouch_legacy_state_visit(work->source, ns, 1, import_entry, work, e);
   if (rc == LC_OK)
     rc = ps_namespace_checkpoint_flush(work->destination, e);
   if (rc == LC_OK)
@@ -90,6 +86,8 @@ static int import_namespace(void *context, const char *ns, lc_error *e) {
   lc_pouch_retention_work_cleanup(work->source, &retention);
   if (rc == LC_OK)
     rc = lc_pouch_outbox_markers_import(work->source, work->target, ns, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_import_terminal_reclaim(work->source, work->target, ns, e);
   if (rc == LC_OK)
     rc = ps_pouch_import_legacy_collections(work->source, work->target,
                                             work->destination, ns, e);

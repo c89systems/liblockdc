@@ -238,6 +238,7 @@ const ps_io ps_native_io = {
 };
 static int sync_file_if(ps_space *, int recovery_only, lc_error *);
 static void mark_durable(ps_space *, uint64_t sequence);
+static int grow_locked(ps_space *, uint64_t, lc_error *);
 static int settle_recovery(ps_space *s, lc_error *error) {
   return __atomic_load_n(&s->deferred_recovery, __ATOMIC_ACQUIRE)
              ? sync_file_if(s, 1, error)
@@ -4295,6 +4296,15 @@ static int reclaim_capacity(ps_space *s, uint64_t missing, int *attempted,
     collect_retired(s);
   return rc == LC_OK ? healthy(s, e) : rc;
 }
+static int grow_shortfall(ps_space *s, uint64_t missing, lc_error *e) {
+  uint64_t bytes;
+  if (missing > PS_MAX_CAPACITY - PS_MIB)
+    return err(e, LC_ERR_INVALID, "container growth exceeds maximum capacity");
+  bytes = ((missing + PS_MIB - 1) / PS_MIB) * PS_MIB;
+  lc_error_cleanup(e);
+  return grow_locked(s, bytes, e);
+}
+
 int ps_internal_budget_admit(ps_space *s, int maintenance,
                              const ps_budget_plan *prior,
                              const ps_budget_plan *proposed, lc_error *e) {
@@ -4328,6 +4338,8 @@ int ps_internal_budget_admit(ps_space *s, int maintenance,
   s->reserved_entries =
       s->reserved_entries - proposed->entries + prior->entries;
   rc = reclaim_capacity(s, missing, &attempted, e);
+  if (rc == LC_ERR_INVALID && !attempted && s->grow_on_write)
+    rc = grow_shortfall(s, missing, e);
   s->reserved_payload =
       s->reserved_payload - prior->payload_bytes + proposed->payload_bytes;
   s->reserved_metadata =
@@ -7619,6 +7631,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     }
   }
   s->durable = options->durable_sync;
+  s->grow_on_write = options->grow_on_write;
   s->maximum = options->maximum_capacity;
   s->capacity = options->initial_capacity ? options->initial_capacity
                                           : PS_DEFAULT_CAPACITY;
@@ -7641,8 +7654,9 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
   rc = ps_coordination_open(s->fd, &coordination, &s->coordination, error);
   if (rc != LC_OK) {
     if (rc == LC_ERR_PENDING)
-      rc = err(error, LC_ERR_INVALID,
-               "container already open; another owner is active");
+      rc = lc_error_set(error, LC_ERR_INVALID, 0,
+                        "container already open; another owner is active", NULL,
+                        "pouch_root_busy", "pouch-space");
     destroy(s);
     return rc;
   }
@@ -9725,14 +9739,15 @@ static ps_run *metadata_ungrow(ps_space *s, uint64_t capacity, ps_run *spare) {
   }
   return spare;
 }
-int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
-  uint64_t capacity;
+/* The caller holds the local mutex and refreshed allocation authority. */
+static int grow_locked(ps_space *s, uint64_t bytes, lc_error *error) {
+  uint64_t capacity = s->capacity;
   ps_run *run, *rollback, *trim;
-  ps_coordination_guard *guard;
   int rc;
-  if (!s || !bytes || bytes % PS_MIB)
+  if (bytes > PS_MAX_CAPACITY - capacity ||
+      (s->maximum && bytes > s->maximum - capacity))
     return err(error, LC_ERR_INVALID,
-               "growth requires positive whole MiB increment");
+               "container growth exceeds maximum capacity");
   run = lc_calloc_with_allocator(NULL, 1, sizeof(*run));
   if (!run)
     return err(error, LC_ERR_NOMEM, "cannot allocate growth interval");
@@ -9748,17 +9763,7 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
     return err(error, LC_ERR_NOMEM,
                "cannot allocate growth rollback trim interval");
   }
-  pthread_mutex_lock(&s->mutex);
-  /* Refresh capacity before expanding the file. Holding allocator authority
-   * through selection keeps peer growth from racing reserve or checkpoint. */
-  rc = ps_internal_admission_begin(s, &guard, error);
-  capacity = s->capacity;
-  if (rc == LC_OK && (bytes > PS_MAX_CAPACITY - capacity ||
-                      (s->maximum && bytes > s->maximum - capacity)))
-    rc =
-        err(error, LC_ERR_INVALID, "container growth exceeds maximum capacity");
-  if (rc == LC_OK)
-    rc = reserve_file(s, capacity, bytes, error);
+  rc = reserve_file(s, capacity, bytes, error);
   if (rc == LC_OK) {
     s->capacity += bytes;
     /* These pages remain private under the allocator mutex until the new
@@ -9791,6 +9796,20 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   lc_free_with_allocator(NULL, run);
   lc_free_with_allocator(NULL, rollback);
   lc_free_with_allocator(NULL, trim);
+  return rc;
+}
+int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
+  ps_coordination_guard *guard;
+  int rc;
+  if (!s || !bytes || bytes % PS_MIB)
+    return err(error, LC_ERR_INVALID,
+               "growth requires positive whole MiB increment");
+  pthread_mutex_lock(&s->mutex);
+  /* Refresh capacity before expanding the file. Holding allocator authority
+   * through selection keeps peer growth from racing reserve or checkpoint. */
+  rc = ps_internal_admission_begin(s, &guard, error);
+  if (rc == LC_OK)
+    rc = grow_locked(s, bytes, error);
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
@@ -10430,9 +10449,13 @@ static int owned_allowance(ps_space *s, ps_budget *budget, uint64_t payload,
   int rc = capacity_allowance(
       s, s->metadata + PS_OWNED_DESCRIPTOR_BYTES, s->live_entries + 1, payload,
       PS_MAINTENANCE_RESERVE, budget,
-      attempted && !*attempted ? &missing : NULL, error);
+      ((attempted && !*attempted) || s->grow_on_write) ? &missing : NULL,
+      error);
   if (rc == LC_ERR_INVALID && missing) {
-    rc = reclaim_capacity(s, missing, attempted, error);
+    if (attempted)
+      rc = reclaim_capacity(s, missing, attempted, error);
+    if (rc == LC_ERR_INVALID && (!attempted || !*attempted) && s->grow_on_write)
+      rc = grow_shortfall(s, missing, error);
     if (rc == LC_OK)
       rc = checkpoint_allowance_floor(
           s, s->metadata + PS_OWNED_DESCRIPTOR_BYTES, s->live_entries + 1,

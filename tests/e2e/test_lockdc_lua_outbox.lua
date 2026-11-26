@@ -3,7 +3,7 @@ local lockdc = require("lockdc")
 local root = assert(os.getenv("LOCKDC_POUCH_ROOT"), "LOCKDC_POUCH_ROOT is required")
 -- Keep auxiliary stores below the scratch root cleared before every test run.
 local client, open_err = lockdc.open({
-  endpoints = { "pouch://" .. root },
+  endpoints = { "pouch://" .. root .. "/store" },
   default_namespace = "lua-outbox-domain",
   pouch = {
     single_writer = false,
@@ -1035,7 +1035,7 @@ end
 -- Pouch root.  The second supervisor owns terminalization while the route
 -- client observes the durable failure receipt.
 local supervisor_client = assert_ok(lockdc.open({
-  endpoints = { "pouch://" .. root },
+  endpoints = { "pouch://" .. root .. "/store" },
   pouch = {
     single_writer = false,
     segment_target_bytes = 4096,
