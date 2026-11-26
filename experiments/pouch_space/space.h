@@ -300,6 +300,9 @@ int ps_metadata_repack(ps_space *, lc_error *);
  * metadata become visible together after root publication; healthy failure
  * retains the old capacity. Uncertain I/O requires reopen/reconciliation. */
 int ps_grow(ps_space *, uint64_t, lc_error *);
+/* Admit a measured offline import against ordinary free capacity. The
+ * private, exclusive destination may expand in whole MiB increments. */
+int ps_migration_fund(ps_space *, uint64_t bytes, lc_error *);
 /* Cached logical owners still check admission after uncertain I/O. Success
  * performs no allocation, lock acquisition, I/O or durability barrier. Existing
  * reader pins and diagnostic status remain usable after admission is poisoned.

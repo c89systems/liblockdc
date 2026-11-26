@@ -9812,6 +9812,26 @@ static int sample_headroom(ps_space *s, uint64_t *available, lc_error *e) {
     (void)ordinary_shortfall(s, metadata_target(s, bound), 0, floor, available);
   return rc;
 }
+int ps_migration_fund(ps_space *s, uint64_t bytes, lc_error *e) {
+  uint64_t available, needed, growth;
+  int rc;
+
+  if (bytes > PS_MAX_CAPACITY / 2)
+    return err(e, LC_ERR_INVALID, "import record exceeds container capacity");
+  /* Leave room for stream grants, metadata and the next admission. */
+  needed = bytes + bytes / 8 + 2 * PS_MIB;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, e);
+  if (rc == LC_OK)
+    rc = sample_headroom(s, &available, e);
+  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK || needed <= available)
+    return rc;
+  growth = needed - available;
+  growth = ((growth + PS_MIB - 1) / PS_MIB) * PS_MIB;
+  return ps_grow(s, growth, e);
+}
+
 int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
                             uint64_t *available, lc_error *error) {
   ps_coordination_guard *guard = NULL;

@@ -33,6 +33,9 @@ static int import_entry(void *context, const lc_pouch_state_entry *entry,
     rc = lc_pouch_state_record_measure_snapshot(allocator, segment_leaf, entry,
                                                 0, &bytes, e);
   }
+  if (rc == LC_OK)
+    rc = ps_migration_fund(ps_root_space(ps_pouch_state_root(work->target)),
+                           bytes, e);
   if (rc == LC_OK && entry->found && entry->retention)
     rc = ps_namespace_retention_hint_ensure(work->destination, e);
   if (rc == LC_OK)

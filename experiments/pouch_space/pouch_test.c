@@ -7759,7 +7759,8 @@ static void legacy_state_import(const char *path, const char *directory) {
     lc_pouch_generation index, query, observed;
     char xid[LC_XID_STRING_SIZE];
     char *marker, *outbox_key, *state_key;
-    input in = source(262147, 4);
+    size_t body_length = codec == 0 ? 12 * PS_MIB + 3 : 262147;
+    input in = source(body_length, 4);
     o.logical.segment_target_bytes = 1;
     REQUIRE(snprintf(legacy, sizeof(legacy), "%s/legacy-%d", directory, codec) <
             (int)sizeof(legacy));
@@ -7805,7 +7806,12 @@ static void legacy_state_import(const char *path, const char *directory) {
     REQUIRE(!live);
 
     ok(ps_pouch_state_open(path, 0, &allocator, &o, &target, &e), &e);
-    read_value(target, "tenant/log", "live", 262147, 4, 1, &e);
+    read_value(target, "tenant/log", "live", body_length, 4, 1, &e);
+    if (codec == 0) {
+      struct stat info;
+      REQUIRE(stat(path, &info) == 0 && (uint64_t)info.st_size > body_length &&
+              info.st_size % PS_MIB == 0);
+    }
     ok(lc_pouch_state_read_metadata(target, "tenant/log", "live", &r, &e), &e);
     REQUIRE(r.retention == meta.retention && r.metadata_length == 8 &&
             !memcmp(r.metadata, "imported", 8));

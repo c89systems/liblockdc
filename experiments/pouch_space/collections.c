@@ -1501,8 +1501,10 @@ static int import_part(void *context, lc_u64 id, lc_pouch_record_io input,
   lc_pouch_record_io output;
   struct iovec bytes;
   uint64_t offset = 0;
-  int rc = open_segment(work->owner, id, 1, 0, &part, e);
+  int rc = ps_migration_fund(space(work->owner), end, e);
 
+  if (rc == LC_OK)
+    rc = open_segment(work->owner, id, 1, 0, &part, e);
   if (rc == LC_OK)
     output = ps_collection_segment_io(part.segment);
   bytes.iov_base = work->buffer;
