@@ -93,6 +93,8 @@ typedef struct lc_collection_segments {
    */
   lc_u64 private_limit;
   int publish_reservations;
+  /* Active replay can read ahead within its selected, densely mapped tail. */
+  int active_replay_read_ahead;
 } lc_collection_segments;
 struct lc_collection_handle;
 lc_collection_segments

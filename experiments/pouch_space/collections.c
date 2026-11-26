@@ -1231,6 +1231,7 @@ static int receiver_attach(void *context, lc_collection_handle *c,
   }
   c->segments.context = owner;
   c->segments.private_limit = PS_MIB;
+  c->segments.active_replay_read_ahead = 1;
   c->control.load = control_load;
   c->control.store = control_store;
   c->control.context = owner;

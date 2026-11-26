@@ -915,6 +915,48 @@ int lc_collection_refresh_view(lc_collection_handle *collection,
 
 static int lc_cc_rebuild(lc_collection_handle *, int, lc_error *);
 
+typedef struct lc_collection_replay_reader {
+  lc_pouch_record_io input;
+  lc_u64 offset, end;
+  size_t used;
+  unsigned char bytes[1024];
+} lc_collection_replay_reader;
+
+static int lc_collection_replay_read(void *context, uint64_t offset,
+                                     const struct iovec *parts, int count,
+                                     lc_error *error) {
+  lc_collection_replay_reader *reader = context;
+  uint64_t end = offset;
+  size_t start;
+  int i, rc;
+  for (i = 0; i < count; ++i)
+    end += parts[i].iov_len;
+  if (end > reader->end)
+    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
+                                 "collection replay exceeds captured tail");
+  if (end - offset > sizeof(reader->bytes))
+    return lc_pouch_record_io_read(reader->input, offset, parts, count, error);
+  if (offset < reader->offset || end > reader->offset + reader->used) {
+    struct iovec part;
+    uint64_t remaining = reader->end - offset;
+    part.iov_base = reader->bytes;
+    part.iov_len = remaining < sizeof(reader->bytes) ? (size_t)remaining
+                                                     : sizeof(reader->bytes);
+    rc = lc_pouch_record_io_read(reader->input, offset, &part, 1, error);
+    if (rc != LC_OK)
+      return rc;
+    reader->offset = offset;
+    reader->used = part.iov_len;
+  }
+  start = (size_t)(offset - reader->offset);
+  for (i = 0; i < count; ++i) {
+    if (parts[i].iov_len)
+      memcpy(parts[i].iov_base, reader->bytes + start, parts[i].iov_len);
+    start += parts[i].iov_len;
+  }
+  return LC_OK;
+}
+
 int lc_collection_replay_into(lc_collection_handle *collection,
                               lc_collection_order *order,
                               lc_collection_ids *ids, lc_u64 segment,
@@ -927,6 +969,8 @@ int lc_collection_replay_into(lc_collection_handle *collection,
   lc_u64 accounted_segment = order->replay_segment;
   lc_u64 accounted_offset = order->replay_offset;
   lc_collection_segment input;
+  lc_collection_replay_reader reader;
+  lc_pouch_record_io replay_io;
   int rc;
   int changed;
   int captured = collection->segments.replay &&
@@ -973,13 +1017,24 @@ int lc_collection_replay_into(lc_collection_handle *collection,
         error, LC_ERR_PROTOCOL, "collection_corrupt",
         "collection canonical tail is shorter than its projection");
   }
+  replay_io = input.io;
+  if (collection->segments.active_replay_read_ahead && !snapshot &&
+      segment == collection->head.active) {
+    static const lc_pouch_record_io_ops ops = {lc_collection_replay_read, NULL,
+                                               NULL, NULL, NULL};
+    reader.input = input.io;
+    reader.end = limit;
+    reader.offset = reader.used = 0;
+    replay_io.ops = &ops;
+    replay_io.context = &reader;
+  }
   memset(&prior, 0, sizeof(prior));
   while (offset < limit) {
     /* Torn pending headers have no published outcome. Complete malformed
      * headers and truncated published bodies remain explicit corruption. */
     rc = limit - offset < LC_POUCH_RECORD_HEADER_BYTES
              ? LC_ERR_PENDING
-             : lc_pouch_collection_record_read(input.io, offset, limit, leaf,
+             : lc_pouch_collection_record_read(replay_io, offset, limit, leaf,
                                                &record, error);
     if (rc == LC_ERR_PENDING && !snapshot &&
         segment == collection->head.active) {
