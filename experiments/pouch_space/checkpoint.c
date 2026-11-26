@@ -57,7 +57,7 @@ struct key_slot {
       unsigned int height;
     } tree;
   } range;
-  int retained;
+  int retained, detached;
   char leaf[LC_POUCH_SNAPSHOT_LEAF_BYTES];
 };
 struct slot_change {
@@ -98,6 +98,7 @@ struct ps_checkpoint_delta {
   slot_change **buckets;
   size_t capacity, count, created;
   ps_budget_plan claim;
+  key_slot *folded_stage;
   int prepared, accepted, maintenance, planning, planned;
   int metadata_only;
   int body_replacement;
@@ -443,9 +444,14 @@ static int settle_retired(ps_key_checkpoint *c, lc_error *e) {
   for (s = c->retiring; rc == LC_OK && s; s = next) {
     next = s->retire_next;
     if (s->retire_sequence <= durable) {
-      rc = reserve_slot(c, s, s->summary.deletion_bytes, 0, e);
-      if (rc == LC_OK)
+      if (s->detached) {
         retire_remove(s);
+        close_slot(c, s);
+      } else {
+        rc = reserve_slot(c, s, s->summary.deletion_bytes, 0, e);
+        if (rc == LC_OK)
+          retire_remove(s);
+      }
     }
   }
   return rc;
@@ -1109,7 +1115,7 @@ int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *c,
                  "selected checkpoint changed during recovery");
   return rc;
 }
-static void drop_selected_slot(ps_key_checkpoint *c, key_slot *slot) {
+static void unlink_slot(ps_key_checkpoint *c, key_slot *slot) {
   key_slot **at;
   key_summary empty = {0};
   size_t bucket = (size_t)(slot->hash & (c->capacity - 1));
@@ -1130,6 +1136,9 @@ static void drop_selected_slot(ps_key_checkpoint *c, key_slot *slot) {
   retire_remove(slot);
   bind_source(c, slot, NULL, &empty);
   --c->count;
+}
+static void drop_selected_slot(ps_key_checkpoint *c, key_slot *slot) {
+  unlink_slot(c, slot);
   close_slot(c, slot);
 }
 typedef struct checkpoint_rebase {
@@ -1260,6 +1269,11 @@ void ps_key_checkpoint_close(ps_key_checkpoint *c) {
   size_t i;
   if (!c)
     return;
+  for (slot = c->retiring; slot; slot = next) {
+    next = slot->retire_next;
+    if (slot->detached)
+      close_slot(c, slot);
+  }
   for (slot = c->slots; slot; slot = next) {
     next = slot->next;
     close_slot(c, slot);
@@ -2206,9 +2220,10 @@ static int fund_completion_claim(ps_key_checkpoint *c,
   (void)ps_budget_close(parent, NULL);
   return rc;
 }
-int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
+static int metadata_begin(ps_key_checkpoint *c, int maintenance,
                           const lc_pouch_storage_batch *batch, uint64_t bytes,
-                          ps_checkpoint_delta **out, lc_error *e) {
+                          key_slot *folded_stage, ps_checkpoint_delta **out,
+                          lc_error *e) {
   ps_checkpoint_delta *d = NULL;
   ps_budget_plan cost, inline_cost = {0};
   lc_pouch_record_header h;
@@ -2221,7 +2236,7 @@ int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
     return failure(e, LC_ERR_INVALID,
                    "native metadata requires prefixes and output");
   pthread_mutex_lock(&c->mutex);
-  rc = c->changed || c->dirty
+  rc = !folded_stage && (c->changed || c->dirty)
            ? failure(e, LC_ERR_INVALID,
                      "native metadata requires completed stream debt")
            : LC_OK;
@@ -2261,11 +2276,58 @@ int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
   }
   if (rc == LC_OK) {
     d->metadata_only = 1;
+    d->folded_stage = folded_stage;
     d->metadata_count = batch->count;
     d->metadata_bytes = bytes;
     *out = d;
   } else
     ps_checkpoint_delta_close(d);
+  return rc;
+}
+int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
+                          const lc_pouch_storage_batch *batch, uint64_t bytes,
+                          ps_checkpoint_delta **out, lc_error *e) {
+  return metadata_begin(c, maintenance, batch, bytes, NULL, out, e);
+}
+int ps_key_metadata_try_pending_stage(ps_key_checkpoint *c,
+                                      const lc_pouch_storage_batch *batch,
+                                      uint64_t bytes, ps_checkpoint_delta **out,
+                                      lc_error *e) {
+  lc_pouch_record_header h = {0};
+  const void *key, *meta;
+  key_slot *stage;
+  size_t length, i;
+  int rc;
+  *out = NULL;
+  if (!batch || !batch->prefix || batch->count != 3)
+    return LC_OK;
+  pthread_mutex_lock(&c->mutex);
+  stage = c->dirty;
+  if (c->dirty_count != 1 || !stage || stage->selected_incarnation ||
+      stage->kind != PS_KEY_METADATA || !stage->summary.found ||
+      !stage->summary.body || !lc_pouch_state_key_is_staged(stage->key))
+    stage = NULL;
+  pthread_mutex_unlock(&c->mutex);
+  if (!stage)
+    return LC_OK;
+  length = strlen(stage->key);
+  rc = batch->prefix(batch->context, 0, &h, &key, &meta, e);
+  if (rc != LC_OK || (h.type != LC_POUCH_STATE_RECORD_STATE_LINK &&
+                      h.type != LC_POUCH_STATE_RECORD_STATE_META))
+    return rc;
+  for (i = 1; i < 3; ++i) {
+    rc = batch->prefix(batch->context, i, &h, &key, &meta, e);
+    if (rc != LC_OK ||
+        h.type != (i == 1 ? LC_POUCH_STATE_RECORD_DECISION
+                          : LC_POUCH_STATE_RECORD_STATE_DELETE) ||
+        !key || h.key_len != length || memcmp(key, stage->key, length))
+      return rc;
+  }
+  rc = metadata_begin(c, 0, batch, bytes, stage, out, e);
+  if (rc == LC_ERR_INVALID) {
+    lc_error_cleanup(e);
+    rc = LC_OK;
+  }
   return rc;
 }
 static size_t prepare_completed_stages(ps_checkpoint_delta *d) {
@@ -2279,10 +2341,9 @@ static size_t prepare_completed_stages(ps_checkpoint_delta *d) {
     if (!lc_pouch_state_key_is_staged(key))
       continue;
     stage = delta_find(d, key, strlen(key), PS_KEY_METADATA);
-    /* The prior stage is already covered. The same native revision selects
-     * the accepted tombstone and the new coverage or neither of them. A
-     * standalone recovery decision still needs a slot, as do decisions in a
-     * stream whose checkpoint can publish rows before advancing coverage. */
+    /* One native revision selects the terminal state and its coverage.
+     * Standalone decisions and checkpoints that publish in multiple revisions
+     * still need a decision slot for recovery. */
     if (stage && stage->prepared && stage->slot->summary.found &&
         (stage->summary.type == LC_POUCH_STATE_RECORD_STATE_DELETE ||
          stage->summary.type == LC_POUCH_STATE_RECORD_OBJECT_DELETE) &&
@@ -2293,7 +2354,9 @@ static size_t prepare_completed_stages(ps_checkpoint_delta *d) {
       /* A selected descriptor carries its standing deletion obligation
        * until the retirement frame is durable. Keep the ordinary tombstone
        * if an additional local obligation still belongs to the stage. */
-      if (stage->slot->selected_incarnation && !stage->slot->reserve) {
+      if (stage->slot == d->folded_stage)
+        stage->remove = 1;
+      else if (stage->slot->selected_incarnation && !stage->slot->reserve) {
         stage->remove = 1;
         ++remove;
       }
@@ -2309,6 +2372,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
   ps_writer **writers = NULL;
   ps_revision_retirement *retirements = NULL;
   slot_change *change;
+  slot_change *folded = NULL, *target = NULL;
   ps_checkpoint_info selected = {0};
   lc_pouch_state_entry entry = {0};
   lc_pouch_record_header h;
@@ -2360,6 +2424,8 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
           change->summary.index == entry.index_seq)
         change->ordinal = i;
     }
+    if (d->folded_stage && !i)
+      target = change;
     lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   }
   if (rc == LC_OK &&
@@ -2368,6 +2434,18 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
                  "native metadata preparation exceeds its plan");
   if (rc == LC_OK) {
     retire_count = prepare_completed_stages(d);
+    if (d->folded_stage) {
+      key_slot *stage = d->folded_stage;
+      folded = delta_find(d, stage->key, strlen(stage->key), PS_KEY_METADATA);
+      if (!folded || !folded->remove || !target || !target->prepared ||
+          target->body != stage->body ||
+          target->summary.body_start != stage->summary.body_start ||
+          target->summary.body_end != stage->summary.body_end)
+        rc = failure(e, LC_ERR_PROTOCOL,
+                     "native completion differs from its pending staged body");
+    }
+  }
+  if (rc == LC_OK) {
     selected.segment = c->latest_segment;
     selected.offset = c->latest_offset;
     selected.state_index =
@@ -2402,8 +2480,10 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     physical.key = change->slot->id;
     physical.kind = change->slot->kind;
     if (change->remove) {
-      retirements[retired].key = physical;
-      retirements[retired++].incarnation = change->slot->selected_incarnation;
+      if (change != folded) {
+        retirements[retired].key = physical;
+        retirements[retired++].incarnation = change->slot->selected_incarnation;
+      }
       continue;
     }
     rc = ps_checkpoint_record_write(c->ns->root->space, c->budget, physical,
@@ -2436,22 +2516,39 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
       key_slot *s = change->slot;
       if (!change->prepared)
         continue;
-      if (change->remove) {
+      if (change == folded) {
+        /* The new coverage retires this stage. Keep its deletion reserve
+         * until the revision is durable in case recovery selects the stage. */
+        unlink_slot(c, s);
+        ps_checkpoint_record_close(&s->pending);
+        s->detached = 1;
+        if (s->reserve)
+          retire_note(c, s, prefix);
+        else
+          close_slot(c, s);
+        change->slot = NULL;
+      } else if (change->remove) {
         --c->selected_count;
         drop_selected_slot(c, s);
         change->slot = NULL;
-        continue;
+      } else {
+        if (change->created) {
+          insert_slot(c, s);
+          change->created = 0;
+        }
+        select_incarnation(c, s, change->selected_incarnation,
+                           change->summary.deletion_bytes);
+        bind_source(c, s, change->body, &change->summary);
+        release_prepared_source(c, change->body);
+        change->body = NULL;
+        retire_note(c, s, prefix);
       }
-      if (change->created) {
-        insert_slot(c, s);
-        change->created = 0;
-      }
-      select_incarnation(c, s, change->selected_incarnation,
-                         change->summary.deletion_bytes);
-      bind_source(c, s, change->body, &change->summary);
-      release_prepared_source(c, change->body);
-      change->body = NULL;
-      retire_note(c, s, prefix);
+    }
+    if (folded) {
+      c->changed = 0;
+      c->dirty_bytes = c->uncovered_bytes = 0;
+      memset(&c->claim, 0, sizeof(c->claim));
+      d->folded_stage = NULL;
     }
     selected.control = control_ref.incarnation;
     c->selected = selected;

@@ -1,4 +1,5 @@
 #include "namespace_metadata.h"
+#include "coordination.h"
 #include "lc_api_internal.h"
 #include "namespace_internal.h"
 
@@ -29,12 +30,16 @@ int ps_namespace_metadata_begin(ps_namespace *ns, int maintenance,
     return rc;
   }
   rc = ps_ns_finish_seal(d, e);
-  if (rc == LC_OK) {
+  if (rc == LC_OK && !maintenance &&
+      !ps_coordination_shared(ps_space_coordination(ns->root->space)))
+    rc = ps_key_metadata_try_pending_stage(d->checkpoint, batch, bytes,
+                                           &metadata->delta, e);
+  if (rc == LC_OK && !metadata->delta) {
     pthread_mutex_lock(&d->mutex);
     rc = ps_key_checkpoint_flush_deferred(d->checkpoint, e);
     pthread_mutex_unlock(&d->mutex);
   }
-  if (rc == LC_OK)
+  if (rc == LC_OK && !metadata->delta)
     rc = ps_key_metadata_begin(d->checkpoint, maintenance, batch, bytes,
                                &metadata->delta, e);
   if (rc == LC_OK) {

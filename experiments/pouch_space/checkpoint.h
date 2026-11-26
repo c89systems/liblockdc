@@ -77,6 +77,12 @@ int ps_key_checkpoint_flush_deferred(ps_key_checkpoint *, lc_error *);
 int ps_key_metadata_begin(ps_key_checkpoint *, int maintenance,
                           const lc_pouch_storage_batch *, uint64_t,
                           ps_checkpoint_delta **, lc_error *);
+/* Caller holds the exclusive namespace edit guard. The typed revision may
+ * cover the sole pending stage along with its completion. An ineligible batch
+ * leaves out empty. */
+int ps_key_metadata_try_pending_stage(ps_key_checkpoint *,
+                                      const lc_pouch_storage_batch *, uint64_t,
+                                      ps_checkpoint_delta **, lc_error *);
 int ps_key_metadata_commit(ps_checkpoint_delta *,
                            const lc_pouch_storage_batch *, enum ps_commit_mode,
                            lc_error *);

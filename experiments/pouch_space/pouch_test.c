@@ -6693,14 +6693,13 @@ static uint32_t staged_revision_u32(const void *bytes) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
          ((uint32_t)p[3] << 24);
 }
-/* A terminal revision removes the stage's binding or selects a tombstone
- * with zero deletion reservation. The fixture's preceding stream checkpoint
- * only covers live seed records. */
+/* A terminal revision retires the stage with removal or a tombstone. For a
+ * pending stage the fixture also recognizes target and coverage publication. */
 static size_t staged_terminal_revision(const void *bytes, size_t length,
-                                       off_t at) {
+                                       off_t at, int folded) {
   const unsigned char *p = bytes;
   size_t cursor = REVISION_HEADER_BYTES, members;
-  int terminal = 0;
+  int terminal = 0, coverage = 0, key = 0;
   if (at < PS_JOURNAL_OFFSET || at >= PS_DATA ||
       length < REVISION_HEADER_BYTES ||
       staged_revision_u32(p) != REVISION_MAGIC)
@@ -6712,6 +6711,7 @@ static size_t staged_terminal_revision(const void *bytes, size_t length,
     size_t member = staged_revision_u32(p + cursor);
     REQUIRE(member >= REVISION_MEMBER_BYTES && member <= length - cursor);
     if (staged_revision_u32(p + cursor + 4) == PS_KEY_METADATA) {
+      key = 1;
       if (member == REVISION_MEMBER_BYTES)
         terminal = 1; /* Physical removal contains no extent or reserve. */
       else {
@@ -6720,16 +6720,17 @@ static size_t staged_terminal_revision(const void *bytes, size_t length,
             !staged_revision_u32(p + cursor + REVISION_MEMBER_BYTES) &&
             !staged_revision_u32(p + cursor + REVISION_MEMBER_BYTES + 4);
       }
-    }
+    } else if (staged_revision_u32(p + cursor + 4) == PS_NAMESPACE_CHECKPOINT)
+      coverage = 1;
     cursor += member;
   }
   REQUIRE(cursor == length);
-  return terminal ? members : 0;
+  return terminal || (folded && key && coverage) ? members : 0;
 }
 static ssize_t staged_crash_write(void *context, int fd, const void *bytes,
                                   size_t length, off_t at) {
   (void)context;
-  if (staged_crash_armed && staged_terminal_revision(bytes, length, at)) {
+  if (staged_crash_armed && staged_terminal_revision(bytes, length, at, 0)) {
     size_t first = REVISION_HEADER_BYTES +
                    staged_revision_u32((const unsigned char *)bytes +
                                        REVISION_HEADER_BYTES);
@@ -6796,10 +6797,44 @@ static void staging_crash(const char *path) {
   REQUIRE(!live && unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+static void staging_pending_reserve(const char *path) {
+  ps_pouch_state_options o = options(0, 0);
+  lc_pouch *p = NULL;
+  lc_pouch_state_write_result w = {0};
+  lc_error e = {0};
+  uint64_t selected, durable;
+  staged_open(path, 0, 1, &o, &p, &e);
+  ps_root *root = ps_pouch_state_root(p);
+  ps_space *space = ps_root_space(root);
+  ps_namespace *ns = NULL;
+  input in = source(31, 11);
+  ok(put(p, "staged", "key", &in, NULL, &w, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  ok(ps_root_namespace_acquire(root, "staged", 0, &ns, &e), &e);
+  ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+  size_t baseline = space->reserve_count;
+  staged_put(p, "attempt", 31, 12, 2, 0, 0, 0, &e);
+  REQUIRE(space->reserve_count == baseline + 1);
+  ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, &e), &e);
+  ok(ps_publication_prefix(space, &selected, &durable, &e), &e);
+  REQUIRE(w.version == 2 && durable < selected &&
+          space->reserve_count == baseline + 1);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  ok(ps_flush(space, &e), &e);
+  ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+  ok(ps_publication_prefix(space, &selected, &durable, &e), &e);
+  REQUIRE(durable == selected && space->reserve_count == baseline);
+  staged_absent(p, "key/.staging/attempt", &e);
+  read_value(p, "staged", "key", 31, 12, 2, &e);
+  ps_namespace_release(ns);
+  lc_pouch_close(p);
+  REQUIRE(!live && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
 typedef struct batch_crash_model {
   unsigned char *stable, *dirty, *scratch;
   size_t calls, stop, terminal_members;
-  int armed, cut;
+  int armed, cut, folded;
 } batch_crash_model;
 static int batch_crash_here(batch_crash_model *m) {
   return m->armed && ++m->calls == m->stop;
@@ -6814,7 +6849,7 @@ static ssize_t batch_model_write(void *context, int fd, const void *p, size_t n,
   batch_crash_model *m = context;
   int cut = batch_crash_here(m);
   size_t boundary = 0;
-  size_t members = m->armed ? staged_terminal_revision(p, n, at) : 0;
+  size_t members = m->armed ? staged_terminal_revision(p, n, at, m->folded) : 0;
   if (members) {
     REQUIRE(!m->terminal_members);
     m->terminal_members = members;
@@ -6948,6 +6983,7 @@ typedef struct batch_crash_counts {
 static batch_crash_counts batch_crash_case(const char *path, size_t stop,
                                            int cut, int crypto, int sync,
                                            int rotating, int operation) {
+  int folded = operation == 3;
   if (stop == SIZE_MAX)
     fprintf(stderr, "batch crash baseline crypto=%d sync=%d rotate=%d op=%d\n",
             crypto, sync, rotating, operation);
@@ -6957,6 +6993,9 @@ static batch_crash_counts batch_crash_case(const char *path, size_t stop,
   int image = open(image_path, O_RDWR | O_CREAT | O_EXCL, 0600);
   REQUIRE(image >= 0 && ftruncate(image, PS_DEFAULT_CAPACITY) == 0);
   batch_crash_model m = {0};
+  m.folded = folded;
+  if (folded)
+    operation = 0;
   m.stable = mmap(NULL, PS_DEFAULT_CAPACITY, PROT_READ | PROT_WRITE, MAP_SHARED,
                   image, 0);
   m.dirty = calloc(PS_DEFAULT_CAPACITY / PS_PAGE, 1);
@@ -6980,6 +7019,13 @@ static batch_crash_counts batch_crash_case(const char *path, size_t stop,
   input in = source(31, 11);
   ok(put(p, "staged", "key", &in, NULL, &w, &e), &e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
+  if (folded) {
+    ps_namespace *ns = NULL;
+    ok(ps_root_namespace_acquire(ps_pouch_state_root(p), "staged", 0, &ns, &e),
+       &e);
+    ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+    ps_namespace_release(ns);
+  }
   staged_put(p, "attempt", operation == 2 ? 0 : 31, 12, 2, 0, 0, operation == 2,
              &e);
   /* Establish the seed independently of structural barriers. In particular,
@@ -7050,10 +7096,13 @@ static batch_crash_counts batch_crash_case(const char *path, size_t stop,
 static void staging_crash_matrix(const char *path, int crypto, int sync,
                                  int rotating) {
   size_t cases = 0, sites = 0;
-  for (int operation = 0; operation < 3; ++operation) {
+  int operations = rotating ? 3 : 4;
+  for (int operation = 0; operation < operations; ++operation) {
     batch_crash_counts counts =
         batch_crash_case(path, SIZE_MAX, 0, crypto, sync, rotating, operation);
     REQUIRE(counts.calls && counts.members > 1);
+    if (operation == 3)
+      REQUIRE(counts.members == 2);
     ++cases;
     sites += counts.calls;
     for (size_t stop = 1; stop <= counts.calls; ++stop)
@@ -7791,9 +7840,10 @@ int main(int argc, char **argv) {
     cold_append_crash(r.path);
   else if (!strcmp(r.mode, "nosync-mutation-checkpoint"))
     nosync_mutation_checkpoint(r.path);
-  else if (!strcmp(r.mode, "staging-crash"))
+  else if (!strcmp(r.mode, "staging-crash")) {
     staging_crash(r.path);
-  else if (!strcmp(r.mode, "staging-crash-matrix")) {
+    staging_pending_reserve(r.path);
+  } else if (!strcmp(r.mode, "staging-crash-matrix")) {
     REQUIRE(argc == 6 && strlen(argv[3]) == 1 && argv[3][0] >= '0' &&
             argv[3][0] <= '3' && strlen(argv[4]) == 1 && argv[4][0] >= '0' &&
             argv[4][0] <= '1' && strlen(argv[5]) == 1 && argv[5][0] >= '0' &&
