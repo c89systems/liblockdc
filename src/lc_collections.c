@@ -919,7 +919,7 @@ typedef struct lc_collection_replay_reader {
   lc_pouch_record_io input;
   lc_u64 offset, end;
   size_t used;
-  unsigned char bytes[1024];
+  unsigned char bytes[4096];
 } lc_collection_replay_reader;
 
 static int lc_collection_replay_read(void *context, uint64_t offset,
