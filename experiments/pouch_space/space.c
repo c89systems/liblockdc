@@ -10121,7 +10121,7 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
     ++p->pins; /* Stream heads own no payload extents. */
     ++s->readers;
     owned_status(head, status);
-    if (initial && !status->sealed)
+    if (initial && initial->edit && !status->sealed)
       rc = claim_writer_stamp(s, p, PS_STREAM_OWNER, &continued, error);
     if (rc == LC_OK && initial)
       rc = pin_runs_locked(s, p, key, ref, 0, 0, 0, NULL, &initial->runs,
@@ -10150,9 +10150,24 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
 }
 int ps_owned_open_guarded(ps_space *s, ps_budget *budget, ps_key key,
                           int create, const ps_ref *ref, ps_owned_head **out,
-                          ps_owned_status *status, lc_error *error) {
-  return owned_open(s, budget, key, create, ref, 1, 0, 0, out, status, NULL,
-                    error);
+                          ps_owned_status *status, ps_owned_initial *capture,
+                          lc_error *error) {
+  int rc;
+  if (capture)
+    memset(capture, 0, sizeof(*capture));
+  rc = owned_open(s, budget, key, create, ref, 1, 0, 0, out, status, capture,
+                  error);
+  if (capture && rc == LC_OK)
+    rc = ps_owned_runs_verify(capture->runs, capture->count, NULL, error);
+  if (capture && rc != LC_OK) {
+    ps_owned_runs_close(capture->runs, capture->count);
+    memset(capture, 0, sizeof(*capture));
+    if (out) {
+      ps_owned_close(*out);
+      *out = NULL;
+    }
+  }
+  return rc;
 }
 int ps_owned_stage_empty(ps_space *s, ps_budget *budget, ps_key key,
                          ps_owned_head **out, ps_ref *ref, lc_error *error) {

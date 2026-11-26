@@ -466,6 +466,7 @@ static void held_barrier(const char *path, int remove, int durable) {
   pthread_t thread;
   ps_space *s;
   lc_collection_disk_head old = sample(), got;
+  ps_collection_head_cache cache = {0};
   lc_error e;
   struct timespec deadline;
   lc_error_init(&e);
@@ -473,8 +474,14 @@ static void held_barrier(const char *path, int remove, int durable) {
   REQUIRE(pthread_mutex_init(&m.mutex, NULL) == 0);
   REQUIRE(pthread_cond_init(&m.cond, NULL) == 0);
   ok(ps_open(path, 1, &options, &s, &e), &e);
-  if (remove != 2)
+  if (remove != 2) {
     ok(ps_collection_head_store(s, 11, &old, NULL, &e), &e);
+    ok(ps_collection_head_load_cached(s, 11, &cache, &got, &e), &e);
+    size_t reads = m.reads;
+    ok(ps_collection_head_load_cached(s, 11, &cache, &got, &e), &e);
+    equal_head(&old, &got, &e);
+    REQUIRE(m.reads == reads);
+  }
   a.space = s;
   a.owner = 11;
   a.remove = remove == 1;
@@ -488,7 +495,7 @@ static void held_barrier(const char *path, int remove, int durable) {
   while (!m.entered)
     REQUIRE(pthread_cond_timedwait(&m.cond, &m.mutex, &deadline) == 0);
   pthread_mutex_unlock(&m.mutex);
-  int observed = ps_collection_head_load(s, 11, NULL, &got, &e);
+  int observed = ps_collection_head_load_cached(s, 11, &cache, &got, &e);
   if (remove == 2) {
     REQUIRE(observed == LC_ERR_INVALID);
     clear(&e);
@@ -505,7 +512,7 @@ static void held_barrier(const char *path, int remove, int durable) {
   if (!durable)
     ok(ps_publish(private, NULL, &e), &e);
   ps_writer_close(private);
-  observed = ps_collection_head_load(s, 11, NULL, &got, &e);
+  observed = ps_collection_head_load_cached(s, 11, &cache, &got, &e);
   if (remove == 2) {
     REQUIRE(observed == LC_ERR_INVALID);
     clear(&e);
@@ -519,7 +526,7 @@ static void held_barrier(const char *path, int remove, int durable) {
   pthread_mutex_unlock(&m.mutex);
   REQUIRE(pthread_join(thread, NULL) == 0);
   ok(a.rc, &e);
-  int rc = ps_collection_head_load(s, 11, NULL, &got, &e);
+  int rc = ps_collection_head_load_cached(s, 11, &cache, &got, &e);
   if (remove == 1) {
     REQUIRE(rc == LC_ERR_INVALID);
     clear(&e);
@@ -532,6 +539,32 @@ static void held_barrier(const char *path, int remove, int durable) {
   lc_error_cleanup(&e);
   REQUIRE(pthread_cond_destroy(&m.cond) == 0);
   REQUIRE(pthread_mutex_destroy(&m.mutex) == 0);
+}
+static void cached_peer_head(const char *path, int durable) {
+  ps_options options = {0};
+  ps_space *writer, *peer;
+  ps_collection_head_cache cache = {0};
+  lc_collection_disk_head head = sample(), got;
+  lc_error e = {0};
+  options.shared = 1;
+  options.durable_sync = durable;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  ok(ps_collection_head_store(writer, 11, &head, NULL, &e), &e);
+  ok(ps_open(path, 0, &options, &peer, &e), &e);
+  ok(ps_collection_head_load_cached(peer, 11, &cache, &got, &e), &e);
+  equal_head(&head, &got, &e);
+  ++head.tail_offset;
+  ok(ps_collection_head_store(writer, 11, &head, NULL, &e), &e);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_collection_head_load_cached(peer, 11, &cache, &got, &e), &e);
+  equal_head(&head, &got, &e);
+  ok(ps_delete(writer, key(11), &e), &e);
+  REQUIRE(ps_collection_head_load_cached(peer, 11, &cache, &got, &e) ==
+          LC_ERR_INVALID);
+  clear(&e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(unlink(path) == 0);
 }
 static void groups(const char *path, int durable) {
   model m = {0};
@@ -720,9 +753,11 @@ static void *run(void *v) {
   read_fault(path);
   groups(path, 0);
   groups(path, 1);
-  for (int durable = 0; durable < 2; ++durable)
+  for (int durable = 0; durable < 2; ++durable) {
+    cached_peer_head(path, durable);
     for (int remove = 0; remove < 3; ++remove)
       held_barrier(path, remove, durable);
+  }
   return NULL;
 }
 int main(int argc, char **argv) {

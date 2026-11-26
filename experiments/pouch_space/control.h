@@ -22,4 +22,14 @@ int ps_collection_head_store(ps_space *, uint64_t collection,
 int ps_collection_head_load(ps_space *, uint64_t collection, const ps_ref *,
                             lc_collection_disk_head *, lc_error *);
 
+/* The collection owner retains one decoded value for its immutable identity.
+ * The space mutex protects the cache, which is specific to that owner. */
+typedef struct ps_collection_head_cache {
+  lc_collection_disk_head head;
+  uint64_t incarnation;
+} ps_collection_head_cache;
+int ps_collection_head_load_cached(ps_space *, uint64_t collection,
+                                   ps_collection_head_cache *,
+                                   lc_collection_disk_head *, lc_error *);
+
 #endif

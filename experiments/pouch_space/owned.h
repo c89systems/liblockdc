@@ -54,10 +54,11 @@ typedef struct ps_owned_initial {
 int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                   ps_owned_head **, ps_owned_status *, lc_error *);
 /* Shared canonical stream views can overlap during staged cache replacement.
- * All their byte and mapping mutations use the same edit guard. */
+ * All their byte and mapping mutations use the same edit guard. An optional
+ * capture returns verified, pinned mappings alongside the selected head. */
 int ps_owned_open_guarded(ps_space *, ps_budget *, ps_key, int create,
                           const ps_ref *, ps_owned_head **, ps_owned_status *,
-                          lc_error *);
+                          ps_owned_initial *, lc_error *);
 /* Select and pin an exact shared stream under its edit guard. On success
  * the caller owns the head, edit guard, mappings and checked footers. */
 int ps_owned_open_initial(ps_space *, ps_key, const ps_ref *, ps_owned_head **,

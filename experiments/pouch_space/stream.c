@@ -380,7 +380,7 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
     edit = initial.edit;
   } else
     rc = ps_owned_open_guarded(space, budget, key, create, ref, &s->head,
-                               &status, error);
+                               &status, NULL, error);
   if (rc == LC_OK && !selected &&
       ps_coordination_shared(ps_space_coordination(space))) {
     /* Head creation is structural. Independent peers must be able to pass it

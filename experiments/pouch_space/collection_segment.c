@@ -325,15 +325,13 @@ static int cs_new(ps_space *space, int writable, ps_collection_segment **out,
   return LC_OK;
 }
 
-static int cs_load(ps_collection_segment *s, ps_key key, const ps_ref *ref,
-                   ps_owned_status *status, lc_error *e) {
-  ps_owned_mapping *captured = NULL;
+static int cs_install_mappings(ps_collection_segment *s,
+                               const ps_owned_status *status,
+                               ps_owned_mapping *captured, size_t count,
+                               lc_error *e) {
   uint64_t capacity = 0;
-  size_t count = 0U, i;
-  int rc = s->head ? ps_owned_runs_capture_status(s->head, status, &captured,
-                                                  &count, e)
-                   : ps_owned_runs_key_status(s->space, key, ref, status,
-                                              &captured, &count, e);
+  size_t i;
+  int rc = LC_OK;
   for (i = 0U; rc == LC_OK && i < count; ++i) {
     const ps_owned_mapping *mapping = &captured[i];
     if ((!status->sealed && mapping->base != capacity) ||
@@ -359,6 +357,16 @@ static int cs_load(ps_collection_segment *s, ps_key key, const ps_ref *ref,
   } else
     ps_owned_runs_close(captured, count);
   return rc;
+}
+static int cs_load(ps_collection_segment *s, ps_key key, const ps_ref *ref,
+                   ps_owned_status *status, lc_error *e) {
+  ps_owned_mapping *captured;
+  size_t count;
+  int rc = s->head ? ps_owned_runs_capture_status(s->head, status, &captured,
+                                                  &count, e)
+                   : ps_owned_runs_key_status(s->space, key, ref, status,
+                                              &captured, &count, e);
+  return rc == LC_OK ? cs_install_mappings(s, status, captured, count, e) : rc;
 }
 
 static int cs_recover(ps_collection_segment *s, const ps_owned_status *status,
@@ -404,22 +412,26 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
                                lc_error *e) {
   ps_collection_segment *s = NULL;
   ps_owned_status status;
-  int rc;
+  ps_owned_initial capture;
+  int rc, capture_head;
   if (out)
     *out = NULL;
   if (!space || !out)
     return cs_error(e, LC_ERR_INVALID,
                     "collection canonical owner requires a space and output");
   rc = cs_new(space, 1, &s, e);
+  capture_head = rc == LC_OK && s->shared && (create || expected);
   if (rc == LC_OK && !create && !expected)
     rc = ps_owned_open_prepared(space, key, &s->head, &status, e);
-  else if (rc == LC_OK && s->shared)
+  else if (capture_head)
     rc = ps_owned_open_guarded(space, NULL, key, create, expected, &s->head,
-                               &status, e);
+                               &status, &capture, e);
   else if (rc == LC_OK)
     rc =
         ps_owned_open(space, NULL, key, create, expected, &s->head, &status, e);
-  if (rc == LC_OK)
+  if (rc == LC_OK && capture_head)
+    rc = cs_install_mappings(s, &status, capture.runs, capture.count, e);
+  else if (rc == LC_OK)
     rc = cs_load(s, key, expected, &status, e);
   if (rc == LC_OK && s->shared && recover && status.sealed)
     rc = cs_error(e, LC_ERR_PROTOCOL, "selected collection writer is sealed");

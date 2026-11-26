@@ -49,6 +49,7 @@ struct ps_collection_owner {
   char query_id[LC_XID_STRING_SIZE];
   uint64_t numeric;
   ps_catalog_info binding;
+  ps_collection_head_cache head_cache;
   ps_collection_segment *identity;
   collection_segment *segments;
   collection_topology *topologies;
@@ -516,7 +517,8 @@ static void owner_release(ps_collection_owner *owner) {
 static int control_load(void *context, lc_collection_disk_head *head,
                         lc_error *e) {
   ps_collection_owner *owner = context;
-  return ps_collection_head_load(space(owner), owner->numeric, NULL, head, e);
+  return ps_collection_head_load_cached(space(owner), owner->numeric,
+                                        &owner->head_cache, head, e);
 }
 static int control_store(void *context, const lc_collection_disk_head *head,
                          lc_error *e) {
