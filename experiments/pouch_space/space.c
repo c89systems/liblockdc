@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 struct ps_writer {
@@ -464,14 +465,26 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
     *completed = target;
   return rc;
 }
+#define PS_COMMIT_GROUP_WAIT_NS 200000L
+static int slow_sync_handoff(const struct timespec *start) {
+  struct timespec now;
+  int64_t elapsed;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    return 0;
+  elapsed = ((int64_t)now.tv_sec - start->tv_sec) * 1000000000L + now.tv_nsec -
+            start->tv_nsec;
+  return elapsed >= 4 * PS_COMMIT_GROUP_WAIT_NS;
+}
 /* The caller has already published complete immutable bytes. One caller leads
  * a sync of the ready prefix; arrivals during I/O form the next group. Neither
  * the directory mutex nor the commit mutex is held across the actual sync.
  * Structural and commit barriers share the separate sync I/O mutex. */
 static int wait_ready(ps_space *s, uint64_t sequence, uint64_t ticket,
-                      lc_error *error) {
+                      int canonical, lc_error *error) {
   uint64_t target, covered, completed;
-  int rc = LC_OK, synced;
+  struct timespec wait_start;
+  int rc = LC_OK, synced, followed = 0;
+  int can_wait_for_group = canonical && !s->readiness;
   pthread_mutex_lock(&s->commit_mutex);
   ++s->sync_requests;
   while (__atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED) < sequence) {
@@ -479,12 +492,31 @@ static int wait_ready(ps_space *s, uint64_t sequence, uint64_t ticket,
     if (rc != LC_OK)
       break;
     if (s->syncing) {
+      if (can_wait_for_group && !followed)
+        followed = clock_gettime(CLOCK_MONOTONIC, &wait_start) == 0;
       pthread_cond_wait(&s->commit_cond, &s->commit_mutex);
       continue;
     }
     target = __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
     covered = target - __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED);
     s->syncing = 1;
+    if (followed && covered == 1 && slow_sync_handoff(&wait_start)) {
+      const struct timespec pause = {0, PS_COMMIT_GROUP_WAIT_NS};
+      uint64_t durable;
+      /* Give the preceding leader a chance to prepare another append after
+       * a slow sync. Capture the completed prefix again before issuing I/O. */
+      pthread_mutex_unlock(&s->commit_mutex);
+      (void)nanosleep(&pause, NULL);
+      pthread_mutex_lock(&s->commit_mutex);
+      durable = __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED);
+      if (durable >= sequence) {
+        s->syncing = 0;
+        pthread_cond_broadcast(&s->commit_cond);
+        break;
+      }
+      target = __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+      covered = target - durable;
+    }
     pthread_mutex_unlock(&s->commit_mutex);
     completed = target;
     synced = 1;
@@ -508,12 +540,12 @@ static int wait_ready(ps_space *s, uint64_t sequence, uint64_t ticket,
   return rc;
 }
 static int wait_durable(ps_space *s, uint64_t sequence, lc_error *error) {
-  return wait_ready(s, sequence, 0, error);
+  return wait_ready(s, sequence, 0, 0, error);
 }
 static int wait_prepared(ps_space *s, uint64_t sequence, lc_error *error) {
   uint64_t ticket;
   int rc = ps_readiness_prepare_ticket(s, &ticket, error);
-  return rc == LC_OK ? wait_ready(s, sequence, ticket, error) : rc;
+  return rc == LC_OK ? wait_ready(s, sequence, ticket, 0, error) : rc;
 }
 static int reserve_file(ps_space *s, uint64_t begin, uint64_t bytes,
                         lc_error *error) {
@@ -11803,7 +11835,7 @@ static int owned_commit(ps_owned_head *head, uint64_t tail, int complete,
       pthread_mutex_unlock(&s->mutex);
     }
   } else if (rc == LC_OK && s->durable && mode == PS_COMMIT_DEFAULT)
-    rc = wait_durable(s, sequence, error);
+    rc = wait_ready(s, sequence, 0, complete, error);
   return rc;
 }
 int ps_owned_commit(ps_owned_head *head, uint64_t tail,

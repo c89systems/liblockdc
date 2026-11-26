@@ -87,6 +87,9 @@ any that are nonzero. An unchanged suffix can reuse the existing tail proof.
 Private preparation reserves payload and descriptor capacity before spending it.
 Publication revalidates its logical authority. Producers run outside
 allocator publication authority. Independent owners can share durability work.
+On exclusive durable roots, a canonical append taking over after a slow sync
+can briefly wait for the previous writer's next append. One barrier covers
+the completed prefix captured after that wait.
 Protected maintenance capacity funds checkpoint and completion work when
 foreground admission exhausts common space. A failed capacity admission
 preserves the previous selection.

@@ -3720,7 +3720,9 @@ static void await_stream_finished(commit_gate *g, int count) {
   pthread_mutex_unlock(&g->mutex);
   CHECK(done && !rc);
 }
-static void canonical_stream_concurrency(void) {
+static void canonical_stream_concurrency(int pair) {
+  const size_t stream_count = pair ? 2 : 4;
+  const size_t commits = stream_count + !pair;
   commit_gate gate;
   stream_actor actors[4];
   commit_actor state_actor;
@@ -3747,7 +3749,7 @@ static void canonical_stream_concurrency(void) {
   io.zero = NULL;
   space = create(PS_MIB, 1, &io);
   memset(body, 'O', sizeof(body));
-  for (i = 0; i < 4; ++i) {
+  for (i = 0; i < stream_count; ++i) {
     streams[i] = stream_open(space, i, 1, NULL, NULL);
     OK(canonical_append(streams[i], body, 64, 7, 1, &start, &error));
     actors[i].stream = streams[i];
@@ -3762,19 +3764,28 @@ static void canonical_stream_concurrency(void) {
   CHECK(pthread_create(&threads[0], NULL, stream_commit_worker, &actors[0]) ==
         0);
   await_gate(&gate, 0);
-  for (i = 1; i < 4; ++i)
+  for (i = 1; i < stream_count; ++i)
     CHECK(pthread_create(&threads[i], NULL, stream_commit_worker, &actors[i]) ==
           0);
-  state_actor.space = space;
-  state_actor.gate = &gate;
-  CHECK(pthread_create(&threads[4], NULL, commit_worker, &state_actor) == 0);
-  await_stream_requests(space, before.sync_requests + 5);
-  for (i = 0; i < 4; ++i) {
+  if (!pair) {
+    state_actor.space = space;
+    state_actor.gate = &gate;
+    CHECK(pthread_create(&threads[stream_count], NULL, commit_worker,
+                         &state_actor) == 0);
+  }
+  await_stream_requests(space, before.sync_requests + commits);
+  for (i = 0; i < stream_count; ++i) {
     OK(ps_stream_status(streams[i], &info, &error));
     CHECK(info.tail == 107);
     stream_expect(streams[i], 0, body, 64, 1);
   }
   expect(space, state(1), NULL, "old", 3);
+  if (pair) {
+    const struct timespec pause = {0, 2000000L};
+    /* Keep the first barrier held long enough for a lone follower to take
+     * the slow-sync path before it issues the second barrier. */
+    CHECK(nanosleep(&pause, NULL) == 0);
+  }
   pthread_mutex_lock(&gate.mutex);
   gate.released = 1;
   pthread_cond_broadcast(&gate.cond);
@@ -3783,7 +3794,7 @@ static void canonical_stream_concurrency(void) {
   await_stream_finished(&gate, 1);
   OK(ps_stream_status(streams[0], &info, &error));
   CHECK(info.tail == 1174);
-  for (i = 1; i < 4; ++i) {
+  for (i = 1; i < stream_count; ++i) {
     OK(ps_stream_status(streams[i], &info, &error));
     CHECK(info.tail == 107);
   }
@@ -3792,9 +3803,9 @@ static void canonical_stream_concurrency(void) {
   gate.second_released = 1;
   pthread_cond_broadcast(&gate.cond);
   pthread_mutex_unlock(&gate.mutex);
-  for (i = 0; i < 5; ++i)
+  for (i = 0; i < commits; ++i)
     CHECK(pthread_join(threads[i], NULL) == 0);
-  for (i = 0; i < 4; ++i) {
+  for (i = 0; i < stream_count; ++i) {
     CHECK(actors[i].rc == LC_OK && actors[i].start == 107);
     memset(body, 'A' + (int)i, sizeof(body));
     stream_expect(streams[i], 107, body, sizeof(body), 2);
@@ -3804,13 +3815,14 @@ static void canonical_stream_concurrency(void) {
   OK(ps_status(space, &after, &error));
   CHECK(gate.syncs == syncs + 2 &&
         after.sync_batches == before.sync_batches + 2 &&
-        after.max_sync_batch >= 4);
+        after.max_sync_batch >= commits - 1);
   OK(ps_close(space, &error));
   CHECK(pthread_cond_destroy(&gate.cond) == 0);
   CHECK(pthread_mutex_destroy(&gate.mutex) == 0);
   clean();
-  puts("streams: held root barriers, independent ready producers, exact prefix "
-       "visibility and mixed immutable/stream commit groups");
+  printf("streams: %zu commits over two held barriers with exact prefix "
+         "visibility\n",
+         commits);
 }
 static void canonical_stream_clean_probe(int durable) {
   model m;
@@ -8223,6 +8235,11 @@ static int run_portable_case(const char *mode) {
     budget_capacity(1);
     return 1;
   }
+  if (!strcmp(mode, "stream-commit")) {
+    canonical_stream_concurrency(0);
+    canonical_stream_concurrency(1);
+    return 1;
+  }
   if (!strcmp(mode, "commit")) {
     commit_coordination();
     return 1;
@@ -8534,7 +8551,6 @@ int main(int argc, char **argv) {
       canonical_stream_lifecycle();
       canonical_stream_faults();
       canonical_stream_reused_grants();
-      canonical_stream_concurrency();
       canonical_stream_private_grant(0);
       canonical_stream_private_grant(1);
       canonical_stream_private_capacity();

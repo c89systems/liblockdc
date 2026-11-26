@@ -153,7 +153,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         root-covered-admission root-obligations
         standing-capacity standing-deletion native-metadata-shared-reserve
         budget-capacity value-budget-capacity value-budget-concurrency value-budget-process
-        stream-recovery stream-pieces stream-piece-repair metadata-growth
+        stream-recovery stream-pieces stream-piece-repair stream-commit metadata-growth
         namespace-repack namespace-repack-concurrency namespace-repack-shared-refresh
         namespace-repack-churn)
       pouch_space_darwin_case(pouch_space_${mode} pouch_space_test 240 ${mode})
@@ -1254,7 +1254,7 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_metadata-growth COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-growth)
   add_test(NAME pouch_space_metadata-growth-faults COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-growth-faults)
   add_test(NAME pouch_space_packing COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} packing)
-  foreach(mode streams stream-open-abort-faults stream-preparation stream-preparation-faults)
+  foreach(mode streams stream-commit stream-open-abort-faults stream-preparation stream-preparation-faults)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 180
       LABELS "unit;local;pouch-space")
