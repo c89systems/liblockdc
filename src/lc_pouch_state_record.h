@@ -209,4 +209,16 @@ int lc_pouch_state_record_write_high_water(const lc_allocator *,
                                            lc_pouch_generation query_version,
                                            lc_error *);
 
+/* Import input from an exclusively owned legacy root. Visits the recovered
+ * high-water mark, selected key records (including stages and tombstones), and
+ * retained decisions. A body supplies a borrowed positioned reader and its
+ * binding. Other records supply an empty reader and no binding. */
+typedef int (*lc_pouch_legacy_state_visit_fn)(void *,
+                                              const lc_pouch_state_entry *,
+                                              lc_pouch_record_io, const char *,
+                                              lc_error *);
+int lc_pouch_legacy_state_visit(lc_pouch *, const char *,
+                                lc_pouch_legacy_state_visit_fn, void *,
+                                lc_error *);
+
 #endif

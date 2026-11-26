@@ -25,4 +25,6 @@ struct lc_pouch_outbox_store {
 int lc_pouch_outbox_store_open(lc_pouch *, const char *, int, int,
                                lc_pouch_outbox_store *, lc_error *);
 int lc_pouch_outbox_store_close(lc_pouch_outbox_store *, int, lc_error *);
+int lc_pouch_outbox_markers_import(lc_pouch *source, lc_pouch *target,
+                                   const char *ns, lc_error *);
 #endif

@@ -10372,6 +10372,115 @@ static int lc_pouch_state_cache_refresh_for_mode(
   return rc;
 }
 
+static int lc_pouch_legacy_visit_entry(lc_pouch *pouch, const char *ns,
+                                       const char *path,
+                                       const lc_pouch_state_entry *entry,
+                                       lc_pouch_legacy_state_visit_fn visit,
+                                       void *context, lc_error *error) {
+  lc_pouch_record_io input = {0};
+  char *body_path, *binding;
+  int fd, rc;
+
+  if (!entry->payload_span.present)
+    return visit(context, entry, input, NULL, error);
+  body_path = lc_pouch_state_payload_span_path(&pouch->allocator, path,
+                                               &entry->payload_span, error);
+  if (!body_path)
+    return error && error->code
+               ? error->code
+               : lc_error_set(error, LC_ERR_NOMEM, 0,
+                              "cannot allocate legacy pouch payload path", NULL,
+                              NULL, "pouch");
+  rc = lc_pouch_state_source_cache_dup_fd(pouch, body_path, &fd, error);
+  lc_free_with_allocator(&pouch->allocator, body_path);
+  if (rc != LC_OK)
+    return rc;
+  binding = lc_pouch_state_crypto_context(
+      &pouch->allocator, ns, entry->key, entry->version,
+      lc_pouch_state_payload_class(entry->record_type, entry->object_link));
+  if (!binding)
+    rc = lc_error_set(error, LC_ERR_NOMEM, 0,
+                      "cannot allocate legacy pouch payload binding", NULL,
+                      NULL, "pouch");
+  else
+    rc = visit(context, entry, lc_pouch_record_file_io(fd), binding, error);
+  lc_free_with_allocator(&pouch->allocator, binding);
+  close(fd);
+  return rc;
+}
+
+int lc_pouch_legacy_state_visit(lc_pouch *pouch, const char *ns,
+                                lc_pouch_legacy_state_visit_fn visit,
+                                void *context, lc_error *error) {
+  lc_pouch_namespace_manifest manifest = {0};
+  lc_pouch_namespace_logstore cache = {0};
+  lc_pouch_state_cache_record *record;
+  lc_pouch_state_decision *decisions = NULL, *decision;
+  lc_pouch_state_entry entry = {0};
+  lc_pouch_record_io no_body = {0};
+  int rc;
+
+  if (!pouch || pouch->storage.ops || !pouch->single_writer || !ns || !visit)
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "legacy state import requires an exclusive source",
+                        NULL, NULL, "pouch");
+  rc = lc_pouch_namespace_manifest_open(&pouch->allocator, pouch->root_path, ns,
+                                        &manifest, NULL, NULL, error);
+  if (rc == LC_OK && manifest.latest_snapshot) {
+    struct stat info;
+    char *path =
+        lc_pouch_state_child_path(&pouch->allocator, manifest.namespace_path,
+                                  "snapshots", manifest.latest_snapshot);
+    if (!path)
+      rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "cannot allocate legacy pouch snapshot path", NULL,
+                        NULL, "pouch");
+    else if (lstat(path, &info) != 0 || !S_ISREG(info.st_mode))
+      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "legacy pouch snapshot is missing or invalid", path,
+                        NULL, "pouch");
+    lc_free_with_allocator(&pouch->allocator, path);
+  }
+  if (rc == LC_OK)
+    rc = lc_pouch_state_cache_refresh(pouch, &cache, &manifest, 1, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_collect_decisions(pouch, &manifest, &cache, &decisions,
+                                          error);
+  if (rc == LC_OK) {
+    entry.key = LC_POUCH_STATE_HIGH_WATER_KEY;
+    entry.record_type = LC_POUCH_STATE_RECORD_HIGH_WATER;
+    entry.control = entry.seen = entry.has_query_index_seq = 1;
+    entry.version = entry.index_seq = cache.max_version;
+    entry.query_index_seq = cache.max_query_index_seq;
+    rc = visit(context, &entry, no_body, NULL, error);
+  }
+  for (record = lc_pouch_state_order_bound(&cache, NULL, 0);
+       rc == LC_OK && record; record = lc_pouch_state_order_next(record)) {
+    lc_pouch_state_entry_borrow_cache_record(record, &entry);
+    rc = lc_pouch_legacy_visit_entry(pouch, ns, manifest.namespace_path, &entry,
+                                     visit, context, error);
+  }
+  for (decision = decisions; rc == LC_OK && decision;
+       decision = decision->next) {
+    memset(&entry, 0, sizeof(entry));
+    entry.key = decision->staged_key;
+    entry.etag = decision->etag;
+    entry.decision = decision->decision;
+    entry.index_seq = decision->index_seq;
+    entry.version = decision->version;
+    entry.control = entry.seen = 1;
+    entry.record_type = LC_POUCH_STATE_RECORD_DECISION;
+    rc = visit(context, &entry, no_body, NULL, error);
+  }
+  lc_pouch_state_decisions_cleanup(&pouch->allocator, decisions);
+  lc_pouch_namespace_logstore_clear_records(&pouch->allocator, &cache);
+  lc_free_with_allocator(&pouch->allocator, cache.namespace_path);
+  lc_free_with_allocator(&pouch->allocator, cache.active_segment_leaf);
+  lc_free_with_allocator(&pouch->allocator, cache.latest_snapshot_leaf);
+  lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
+  return rc;
+}
+
 static int lc_pouch_state_cache_set_active_segment(
     lc_pouch *pouch, lc_pouch_namespace_logstore *cache,
     const lc_pouch_namespace_manifest *manifest, uint64_t offset,

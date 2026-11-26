@@ -61,6 +61,11 @@ typedef struct ps_pouch_state_options {
 int ps_pouch_state_open(const char *, int create, const lc_allocator *,
                         const ps_pouch_state_options *, lc_pouch **,
                         lc_error *);
+/* Import canonical namespace state into a private new container. Both roots
+ * must be exclusively owned and quiescent throughout the import. The caller
+ * discards the target on failure and supplies the final durability barrier. */
+int ps_pouch_import_legacy_state(lc_pouch *source, lc_pouch *target,
+                                 lc_error *);
 typedef struct ps_pouch_client_options {
   uint64_t initial_capacity, maximum_capacity;
   const ps_io *io;

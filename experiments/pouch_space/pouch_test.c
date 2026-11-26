@@ -7744,6 +7744,106 @@ static void shared_state_crash(const char *path) {
   REQUIRE(live == 0 && unlink(path) == 0);
   clear(&e);
 }
+static void legacy_state_import(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int codec = 0; codec < 4; ++codec) {
+    char legacy[1400];
+    ps_pouch_state_options o = options(codec, 0);
+    lc_pouch *source_pouch = NULL, *target = NULL;
+    lc_pouch_state_write_result w = {0};
+    lc_pouch_state_read_result r = {0};
+    lc_pouch_state_write_options meta = {0};
+    lc_pouch_retention_work retention = {0};
+    lc_pouch_generation index, query, observed;
+    char xid[LC_XID_STRING_SIZE];
+    char *marker, *outbox_key, *state_key;
+    input in = source(262147, 4);
+    o.logical.segment_target_bytes = 1;
+    REQUIRE(snprintf(legacy, sizeof(legacy), "%s/legacy-%d", directory, codec) <
+            (int)sizeof(legacy));
+    ok(lc_pouch_open(legacy, &allocator, &o.logical, &source_pouch, &e), &e);
+    ok(put(source_pouch, "tenant/log", "live", &in, NULL, &w, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    in = source(19, 8);
+    ok(put(source_pouch, "tenant/log", "deleted", &in, NULL, &w, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    ok(lc_pouch_state_delete(source_pouch, "tenant/log", "deleted", NULL, &w,
+                             &e),
+       &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    sequence_recovery_compact(source_pouch, "tenant/log", 1, &e);
+    meta.has_metadata = 1;
+    meta.metadata = (const unsigned char *)"imported";
+    meta.metadata_length = 8;
+    meta.has_retention = 1;
+    meta.retention = 4102444800LL;
+    ok(lc_pouch_state_update_metadata(source_pouch, "tenant/log", "live", &meta,
+                                      &w, &e),
+       &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    staged_put(source_pouch, "pending", 65569, 5, 1, 0, 0, 0, &e);
+    ok(lc_xid_new(xid, &e), &e);
+    ok(lc_pouch_retention_work_write(source_pouch, "tenant/log",
+                                     LC_POUCH_RETENTION_ACTIVE, xid, "live", 2,
+                                     1, &e),
+       &e);
+    ok(lc_pouch_outbox_state_reclaim_marker_write(source_pouch, "tenant/log",
+                                                  "pending", "outbox/key",
+                                                  "state/key", &e),
+       &e);
+    ok(lc_pouch_state_index_seq(source_pouch, "tenant/log", &index, &e), &e);
+    ok(lc_pouch_state_query_index_seq(source_pouch, "tenant/log", &query, &e),
+       &e);
+
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &target, &e), &e);
+    ok(ps_pouch_import_legacy_state(source_pouch, target, &e), &e);
+    ok(target->storage.ops->flush(target->storage.context, &e), &e);
+    lc_pouch_close(target);
+    lc_pouch_close(source_pouch);
+    REQUIRE(!live);
+
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &target, &e), &e);
+    read_value(target, "tenant/log", "live", 262147, 4, 1, &e);
+    ok(lc_pouch_state_read_metadata(target, "tenant/log", "live", &r, &e), &e);
+    REQUIRE(r.retention == meta.retention && r.metadata_length == 8 &&
+            !memcmp(r.metadata, "imported", 8));
+    lc_pouch_state_read_result_cleanup(&allocator, &r);
+    ok(lc_pouch_state_read_metadata(target, "tenant/log", "deleted", &r, &e),
+       &e);
+    REQUIRE(!r.found);
+    lc_pouch_state_read_result_cleanup(&allocator, &r);
+    ok(lc_pouch_state_index_seq(target, "tenant/log", &observed, &e), &e);
+    REQUIRE(observed == index);
+    ok(lc_pouch_state_query_index_seq(target, "tenant/log", &observed, &e), &e);
+    REQUIRE(observed == query);
+    ok(lc_pouch_retention_work_read(target, "tenant/log", &retention, &e), &e);
+    REQUIRE(retention.present && retention.phase == LC_POUCH_RETENTION_ACTIVE &&
+            !strcmp(retention.key, "live") && !strcmp(retention.txn_id, xid) &&
+            retention.fencing_token == 2 && retention.state_version == 1);
+    lc_pouch_retention_work_cleanup(target, &retention);
+    ok(lc_pouch_outbox_state_reclaim_marker_take(
+           target, "tenant/log", NULL, &marker, &outbox_key, &state_key, &e),
+       &e);
+    REQUIRE(marker && outbox_key && state_key && !strcmp(marker, "pending") &&
+            !strcmp(outbox_key, "outbox/key") &&
+            !strcmp(state_key, "state/key"));
+    lc_free_with_allocator(&allocator, marker);
+    lc_free_with_allocator(&allocator, outbox_key);
+    lc_free_with_allocator(&allocator, state_key);
+    read_value(target, "staged", "key/.staging/pending", 65569, 5, 1, &e);
+    ok(lc_pouch_state_commit_staged(target, "staged", "key", "pending", &w, &e),
+       &e);
+    REQUIRE(w.version == 1);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    read_value(target, "staged", "key", 65569, 5, 1, &e);
+    staged_absent(target, "key/.staging/pending", &e);
+    lc_pouch_close(target);
+    REQUIRE(!live && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+
 typedef struct run {
   const char *path, *directory, *mode;
   int codec, profile, durable;
@@ -7752,6 +7852,8 @@ static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "lifecycle"))
     lifecycle(r->path, r->directory);
+  else if (!strcmp(r->mode, "legacy-state-import"))
+    legacy_state_import(r->path, r->directory);
   else if (!strcmp(r->mode, "shared-admission"))
     shared_admission(r->path);
   else if (!strcmp(r->mode, "shared-state"))

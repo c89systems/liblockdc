@@ -524,6 +524,51 @@ static int lc_pouch_terminal_retention_filename(const char *name,
   *due = (lc_pouch_unix_seconds)value;
   return 1;
 }
+/* Both roots are private to the migration. Enumerate through the same name
+ * rules as dispatcher recovery so abandoned temporary writes stay invisible. */
+static int lc_pouch_outbox_import_kind(lc_pouch *source, lc_pouch *target,
+                                       const char *ns, int kind,
+                                       lc_error *error) {
+  lc_pouch_outbox_store input = {0}, output = {0};
+  const char *name = NULL;
+  int rc = lc_pouch_outbox_store_open(source, ns, kind, 0, &input, error);
+
+  while (rc == LC_OK &&
+         (rc = input.ops->next(input.context, &name, error)) == LC_OK && name) {
+    lc_pouch_unix_seconds due;
+    unsigned char *bytes = NULL;
+    size_t length;
+    int valid = kind == -1 ? lc_pouch_outbox_state_reclaim_marker_id_valid(name)
+                : kind == LC_POUCH_RETENTION_DEAD_LETTER
+                    ? lc_xid_is_valid(name)
+                    : lc_pouch_terminal_retention_filename(name, &due);
+    if (!valid)
+      continue;
+    rc = input.ops->read(input.context, name, &source->allocator, 0,
+                         LC_POUCH_OUTBOX_MARKER_MAX_BYTES, &bytes, &length,
+                         error);
+    if (rc == LC_POUCH_OUTBOX_MARKER_MISSING)
+      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "legacy outbox marker disappeared during import", name,
+                        NULL, "pouch");
+    if (rc == LC_OK && !output.ops)
+      rc = lc_pouch_outbox_store_open(target, ns, kind, 1, &output, error);
+    if (rc == LC_OK)
+      rc = output.ops->write(output.context, name, bytes, length, error);
+    lc_free_with_allocator(&source->allocator, bytes);
+  }
+  rc = lc_pouch_outbox_store_close(&output, rc, error);
+  return lc_pouch_outbox_store_close(&input, rc, error);
+}
+
+int lc_pouch_outbox_markers_import(lc_pouch *source, lc_pouch *target,
+                                   const char *ns, lc_error *error) {
+  int kind, rc = LC_OK;
+  for (kind = -1; rc == LC_OK && kind < LC_POUCH_RETENTION_KIND_COUNT; ++kind)
+    rc = lc_pouch_outbox_import_kind(source, target, ns, kind, error);
+  return rc;
+}
+
 static void lc_pouch_terminal_retention_keep_name(char *selected,
                                                   const char *candidate) {
   if (selected[0] == '\0' || strcmp(candidate + 17U, selected + 17U) < 0)
