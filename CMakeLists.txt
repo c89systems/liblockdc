@@ -647,6 +647,24 @@ set(lc_sources
     src/lc_xid.c
 )
 
+if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    LOCKDC_TARGET_ARCH MATCHES "^(x86_64|aarch64|armhf)$") OR
+   (CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND LOCKDC_TARGET_ARCH STREQUAL "arm64"))
+    set(lc_pouch_container_dir "${CMAKE_CURRENT_SOURCE_DIR}/experiments/pouch_space")
+    set(lc_pouch_container_sources
+        space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c
+        collection_segment.c collection_reclaim.c collection_conversion.c
+        collection_walk.c collection_transform.c collections.c root.c root_conversion.c
+        namespace.c namespace_index.c namespace_metadata.c namespace_reclaim.c
+        namespace_recode.c namespace_conversion.c namespace_repack.c
+        namespace_retention.c namespace_work.c outbox_markers.c query_index.c
+        query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c
+        coordination.c readiness.c crc.c migration_state.c migration_collection.c
+    )
+    list(TRANSFORM lc_pouch_container_sources PREPEND "${lc_pouch_container_dir}/")
+    list(APPEND lc_sources ${lc_pouch_container_sources})
+endif()
+
 set(LOCKDC_PSLOG_STATIC_INCLUDE_DIR "${LOCKDC_EXTERNAL_ROOT}/pslog/install/include")
 set(LOCKDC_PSLOG_SHARED_INCLUDE_DIR "${LOCKDC_EXTERNAL_ROOT}/pslog/install/include")
 set(LOCKDC_LONEJSON_STATIC_INCLUDE_DIR "${LOCKDC_EXTERNAL_ROOT}/lonejson/install/include")
@@ -713,6 +731,9 @@ function(lc_configure_library_target target)
         target_sources(${target} PRIVATE $<TARGET_OBJECTS:lc_objects>)
     else()
         target_sources(${target} PRIVATE ${lc_sources})
+        if(lc_pouch_container_dir)
+            target_include_directories(${target} PRIVATE "${lc_pouch_container_dir}")
+        endif()
     endif()
     target_include_directories(${target}
         PUBLIC

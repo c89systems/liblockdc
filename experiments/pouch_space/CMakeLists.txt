@@ -1,19 +1,11 @@
-# Experimental targets, never installed or linked into the product.
-if(NOT TARGET lc_static OR
-   NOT ((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-         LOCKDC_TARGET_ARCH MATCHES "^(x86_64|aarch64|armhf)$") OR
-        (CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND LOCKDC_TARGET_ARCH STREQUAL "arm64")))
+# Private tests and benchmarks for the container implementation in liblockdc.
+if(NOT TARGET lc_static OR NOT lc_pouch_container_dir)
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collection_conversion.c collection_walk.c collection_transform.c collections.c root.c root_conversion.c namespace.c namespace_index.c namespace_metadata.c namespace_reclaim.c namespace_recode.c namespace_conversion.c namespace_repack.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
-list(APPEND pouch_space_sources coordination.c readiness.c crc.c
-  migration_state.c migration_collection.c)
-add_library(pouch_space_experiment STATIC ${pouch_space_sources})
-target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-  PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(pouch_space_experiment PUBLIC lc_static)
-lc_configure_c_target(pouch_space_experiment)
+add_library(pouch_space_experiment INTERFACE)
+target_include_directories(pouch_space_experiment INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pouch_space_experiment INTERFACE lc_static)
 
 if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   add_executable(pouch_space_platform_test platform_test.c)
@@ -68,12 +60,9 @@ endif()
 if(LOCKDC_BUILD_TESTS)
   # Same owner sources against the existing logical-engine test library, so
   # logical expiry clocks never alter filesystem writer-heartbeat clocks.
-  add_library(pouch_space_test_experiment STATIC ${pouch_space_sources})
-  target_include_directories(pouch_space_test_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-    PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  target_compile_definitions(pouch_space_test_experiment PRIVATE LOCKDC_TEST_BUILD=1)
-  target_link_libraries(pouch_space_test_experiment PUBLIC lc_test_static lc::zlib_static)
-  lc_configure_c_target(pouch_space_test_experiment)
+  add_library(pouch_space_test_experiment INTERFACE)
+  target_include_directories(pouch_space_test_experiment INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(pouch_space_test_experiment INTERFACE lc_test_static lc::zlib_static)
 
   add_executable(pouch_space_lease_test lease_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_lease_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
