@@ -103,6 +103,12 @@ int lc_pouch_state_record_read(lc_pouch_record_io, const lc_allocator *,
 int lc_pouch_state_record_decode_span(const unsigned char *, size_t,
                                       const lc_allocator *, const char *leaf,
                                       lc_pouch_state_entry *, lc_error *);
+/* Validate and decode a borrowed typed prefix that has no physical body.
+ * The resulting entry owns its fields, just like a decoded wire record. */
+int lc_pouch_state_record_decode_metadata(const lc_pouch_record_header *,
+                                          const void *key, const void *meta,
+                                          const lc_allocator *, const char *,
+                                          lc_pouch_state_entry *, lc_error *);
 /* A key and, for a decision or tombstone, its terminal fields from a checked
  * span. Strings are length-delimited and borrowed. Type zero leaves the key
  * available while the ordinary decoder validates the rest of the record. */

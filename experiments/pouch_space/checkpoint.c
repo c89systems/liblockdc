@@ -2268,45 +2268,6 @@ int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
     ps_checkpoint_delta_close(d);
   return rc;
 }
-typedef struct metadata_input {
-  struct iovec parts[3];
-  uint64_t bytes;
-} metadata_input;
-static int metadata_read(void *context, uint64_t offset,
-                         const struct iovec *parts, int count, lc_error *e) {
-  metadata_input *input = context;
-  int i, j;
-  for (i = 0; i < count; ++i) {
-    unsigned char *to = parts[i].iov_base;
-    size_t left = parts[i].iov_len;
-    if (offset > input->bytes || left > input->bytes - offset)
-      return failure(e, LC_ERR_PROTOCOL,
-                     "native metadata prefix read exceeds its span");
-    while (left) {
-      uint64_t base = 0;
-      for (j = 0; j < 3; ++j) {
-        if (offset - base < input->parts[j].iov_len) {
-          size_t at = (size_t)(offset - base);
-          size_t take = input->parts[j].iov_len - at;
-          if (take > left)
-            take = left;
-          memcpy(to, (const unsigned char *)input->parts[j].iov_base + at,
-                 take);
-          to += take;
-          offset += take;
-          left -= take;
-          break;
-        }
-        base += input->parts[j].iov_len;
-      }
-      if (j == 3)
-        return failure(e, LC_ERR_PROTOCOL,
-                       "native metadata prefix is incomplete");
-    }
-  }
-  return LC_OK;
-}
-
 static size_t prepare_completed_stages(ps_checkpoint_delta *d) {
   slot_change *decision, *stage;
   const char *key;
@@ -2344,8 +2305,6 @@ static size_t prepare_completed_stages(ps_checkpoint_delta *d) {
 int ps_key_metadata_commit(ps_checkpoint_delta *d,
                            const lc_pouch_storage_batch *batch,
                            enum ps_commit_mode mode, lc_error *e) {
-  static const lc_pouch_record_io_ops ops = {metadata_read, NULL, NULL, NULL,
-                                             NULL};
   ps_key_checkpoint *c;
   ps_writer **writers = NULL;
   ps_revision_retirement *retirements = NULL;
@@ -2353,21 +2312,16 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
   ps_checkpoint_info selected = {0};
   lc_pouch_state_entry entry = {0};
   lc_pouch_record_header h;
-  unsigned char header[LC_POUCH_RECORD_HEADER_BYTES];
-  metadata_input input;
-  lc_pouch_record_io io;
   const void *key, *meta;
   ps_ref control_ref, slot_ref;
-  uint64_t next, bytes, total = 0, prefix = 0;
+  uint64_t bytes, total = 0, prefix = 0;
   size_t i, count = 0, retire_count = 0, retired = 0;
-  int rc = LC_OK, found, truncated;
+  int rc = LC_OK;
   if (!d || !d->metadata_only || d->accepted || d->prepared || !batch ||
       !batch->prefix || batch->count != d->metadata_count ||
       (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC))
     return failure(e, LC_ERR_INVALID, "native metadata plan is not open");
   c = d->checkpoint;
-  io.ops = &ops;
-  io.context = &input;
   pthread_mutex_lock(&c->mutex);
   for (i = 0; rc == LC_OK && i < batch->count; ++i) {
     memset(&h, 0, sizeof(h));
@@ -2376,6 +2330,8 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     rc = batch->prefix(batch->context, i, &h, &key, &meta, e);
     if (rc == LC_OK && (h.payload_len || h.flags || h.payload_crc))
       rc = failure(e, LC_ERR_PROTOCOL, "native metadata gained producer bytes");
+    if (rc == LC_OK && h.meta_len && !meta)
+      rc = failure(e, LC_ERR_PROTOCOL, "native metadata bytes are missing");
     /* Borrowed providers and admission run outside the owner mutex. */
     if (rc == LC_OK)
       rc = admission(d, &h, key, meta, e);
@@ -2389,28 +2345,15 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
       break;
     }
     total += bytes;
-    lc_pouch_record_header_encode(&h, header);
-    input.parts[0].iov_base = header;
-    input.parts[0].iov_len = sizeof(header);
-    input.parts[1].iov_base = (void *)key;
-    input.parts[1].iov_len = (size_t)h.key_len;
-    input.parts[2].iov_base = (void *)meta;
-    input.parts[2].iov_len = (size_t)h.meta_len;
-    input.bytes = bytes;
     change = key ? delta_find(d, key, (size_t)h.key_len,
                               h.type == LC_POUCH_STATE_RECORD_DECISION
                                   ? PS_KEY_DECISION
                                   : PS_KEY_METADATA)
                  : NULL;
-    found = truncated = 0;
-    next = 0;
-    rc = lc_pouch_state_record_read(
-        io, &c->allocator,
-        change ? change->slot->leaf : "snapshot-00000000000000000001.log", 0,
-        bytes, 0, 0, NULL, &entry, &next, &found, &truncated, e);
-    if (rc == LC_OK && (!found || truncated || next != bytes))
-      rc = failure(e, LC_ERR_PROTOCOL,
-                   "native metadata has an incomplete record");
+    rc = lc_pouch_state_record_decode_metadata(
+        &h, key, meta, &c->allocator,
+        change ? change->slot->leaf : "snapshot-00000000000000000001.log",
+        &entry, e);
     if (rc == LC_OK) {
       rc = prepare_entry(d, &entry, e);
       if (rc == LC_OK && change && change->prepared &&
@@ -2611,13 +2554,8 @@ void ps_key_body_close(ps_checkpoint_body *body) {
 int ps_key_body_plan(ps_key_checkpoint *c, const lc_pouch_state_entry *expected,
                      uint64_t maximum, ps_checkpoint_body **out,
                      ps_budget_plan *cost, lc_error *e) {
-  static const lc_pouch_record_io_ops ops = {metadata_read, NULL, NULL, NULL,
-                                             NULL};
   ps_checkpoint_body *body = NULL;
-  metadata_input input;
-  lc_pouch_record_io io;
-  uint64_t next = 0;
-  int rc, found = 0, truncated = 0;
+  int rc;
   if (out)
     *out = NULL;
   if (!c || !expected || !expected->found || expected->control ||
@@ -2637,18 +2575,10 @@ int ps_key_body_plan(ps_key_checkpoint *c, const lc_pouch_state_entry *expected,
   rc = ps_checkpoint_record_encode(&c->allocator, expected, &body->original, e);
   if (rc == LC_OK)
     rc = replacement_expected(c, expected, &body->original, e);
-  memset(&input, 0, sizeof(input));
-  input.parts[0].iov_base = body->original.bytes;
-  input.parts[0].iov_len = body->original.length;
-  input.bytes = body->original.length;
-  io.ops = &ops;
-  io.context = &input;
   if (rc == LC_OK)
-    rc = lc_pouch_state_record_read(
-        io, &c->allocator, "snapshot-00000000000000000001.log", 0, input.bytes,
-        0, 0, NULL, &body->source, &next, &found, &truncated, e);
-  if (rc == LC_OK && (!found || truncated || next != input.bytes))
-    rc = failure(e, LC_ERR_PROTOCOL, "body replacement source is incomplete");
+    rc = lc_pouch_state_record_decode_span(
+        body->original.bytes, body->original.length, &c->allocator,
+        "snapshot-00000000000000000001.log", &body->source, e);
   if (rc == LC_OK)
     rc = ps_checkpoint_delta_open(c, 0, &body->delta, e);
   if (rc == LC_OK) {

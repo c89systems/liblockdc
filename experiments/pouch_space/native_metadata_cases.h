@@ -9,6 +9,7 @@ typedef struct native_metadata_batch {
   lc_pouch_storage_batch batch;
   uint64_t bytes;
   allocation_pause *pause;
+  size_t missing_metadata;
 } native_metadata_batch;
 static int native_metadata_prefix(void *context, size_t at,
                                   lc_pouch_record_header *header,
@@ -26,7 +27,9 @@ static int native_metadata_prefix(void *context, size_t at,
   }
   *header = b->headers[at];
   *key_bytes = header->key_len ? b->records[at].bytes + 32 : NULL;
-  *meta = b->records[at].bytes + 32 + header->key_len;
+  *meta = b->missing_metadata == at + 1
+              ? NULL
+              : b->records[at].bytes + 32 + header->key_len;
   return LC_OK;
 }
 static void native_metadata_free(native_metadata_batch *b) {
@@ -352,6 +355,16 @@ static void native_metadata_lifecycle(int durable) {
   ps_namespace_metadata_close(plan);
   plan = NULL;
   CHECK(!native_metadata_observe(ns));
+  /* A missing prefix after one valid record cannot select a partial batch. */
+  OK(ps_namespace_metadata_begin(ns, 0, &changed.batch, changed.bytes, &plan,
+                                 &error));
+  changed.missing_metadata = 2;
+  CHECK(ps_namespace_metadata_commit(plan, &changed.batch, PS_COMMIT_DEFAULT,
+                                     &error) == LC_ERR_PROTOCOL);
+  lc_error_cleanup(&error);
+  changed.missing_metadata = 0;
+  ps_namespace_metadata_close(plan);
+  CHECK(!native_metadata_observe(ns));
   OK(ps_status(ps_root_space(root), &before, &error));
   OK(native_metadata_write(ns, &changed, PS_COMMIT_DEFER_SYNC, &error));
   OK(ps_status(ps_root_space(root), &after, &error));
@@ -393,6 +406,8 @@ static void native_metadata_faults(int durable, int kind) {
   ps_namespace *ns = NULL;
   native_metadata_batch original, changed;
   size_t sites = 0;
+  /* Crash replay uses the model's durable bytes for every fault site. */
+  m.snapshot_only = 1;
   options.storage.initial_capacity = options.storage.maximum_capacity = PS_MIB;
   options.storage.durable_sync = durable;
   options.storage.io = &io;

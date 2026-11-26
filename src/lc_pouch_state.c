@@ -8511,6 +8511,29 @@ int lc_pouch_state_record_decode_span(const unsigned char *span, size_t bytes,
                                       payload, entry, error);
 }
 
+int lc_pouch_state_record_decode_metadata(const lc_pouch_record_header *header,
+                                          const void *key, const void *meta,
+                                          const lc_allocator *allocator,
+                                          const char *leaf,
+                                          lc_pouch_state_entry *entry,
+                                          lc_error *error) {
+  uint64_t payload;
+  if (!header || !allocator || !leaf || !entry)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch metadata decode requires a prefix and output",
+                        NULL, NULL, "pouch");
+  if (header->flags || header->payload_len || header->payload_crc ||
+      header->key_len > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES ||
+      header->meta_len > LC_POUCH_STATE_RECORD_META_MAX_BYTES ||
+      (header->key_len && !key) || (header->meta_len && !meta))
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "invalid pouch state metadata prefix", NULL, NULL,
+                        "pouch");
+  payload = LC_POUCH_RECORD_HEADER_BYTES + header->key_len + header->meta_len;
+  return lc_pouch_state_record_select(allocator, header, key, meta, leaf, 0,
+                                      payload, entry, error);
+}
+
 int lc_pouch_state_record_terminal_span(const unsigned char *span, size_t bytes,
                                         lc_pouch_state_terminal *out,
                                         lc_error *error) {
