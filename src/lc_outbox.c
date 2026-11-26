@@ -5115,6 +5115,9 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
       "{\"eq\":{\"field\":\"/dispatch_state\",\"value\":\"retry_wait\"}}";
   static const char claimed_selector[] =
       "{\"eq\":{\"field\":\"/dispatch_state\",\"value\":\"claimed\"}}";
+  static const char claimed_or_pending_selector[] =
+      "{\"in\":{\"field\":\"/"
+      "dispatch_state\",\"any\":[\"claimed\",\"pending\"]}}";
   lc_query_req request;
   lc_query_key_handler handler;
   lc_query_res result;
@@ -5125,6 +5128,7 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
   size_t available;
   int consume_claim_recovery;
   int canonical_scan;
+  int scan_claims_with_pending;
   int use_index;
   int scan_mode;
   int rc;
@@ -5192,6 +5196,8 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
       lc_pouch_single_writer_enabled(outbox->dispatcher_client->pouch);
   if (canonical_scan)
     use_index = 0;
+  scan_claims_with_pending =
+      canonical_scan && scan_mode == LC_OUTBOX_RECOVERY_SCAN_CLAIMS;
   /* A recovery sweep starts from a durable boundary. An exclusive NoSync
    * container can stabilize the canonical prefix and scan ordered outbox
    * keys. Candidate lookup then needs no synchronous index publication. */
@@ -5216,11 +5222,17 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
     }
   }
   request.ns = outbox->ns;
-  request.selector_json =
-      scan_mode == LC_OUTBOX_RECOVERY_SCAN_CLAIMS
-          ? claimed_selector
-          : (scan_mode == LC_OUTBOX_RECOVERY_SCAN_RETRIES ? retry_selector
-                                                          : pending_selector);
+  /* Both states use the same key range and candidate handler. A membership
+   * predicate walks that range once and keeps one cursor across capacity
+   * pauses. The targeted claim still checks eligibility. */
+  if (scan_claims_with_pending)
+    request.selector_json = claimed_or_pending_selector;
+  else if (scan_mode == LC_OUTBOX_RECOVERY_SCAN_CLAIMS)
+    request.selector_json = claimed_selector;
+  else if (scan_mode == LC_OUTBOX_RECOVERY_SCAN_RETRIES)
+    request.selector_json = retry_selector;
+  else
+    request.selector_json = pending_selector;
   request.limit = (long)available;
   request.cursor = outbox->recovery_cursor;
   request.engine = use_index ? "index" : "scan";
@@ -5270,6 +5282,10 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
    * overflow signal raised while the query was in flight, otherwise the final
    * page could strand a newly committed durable key until a restart. */
   if (capture.overflowed) {
+    /* Without a cursor the resumed scan reselects its predicate. Preserve the
+     * consumed claim request when none of that page can be advanced. */
+    if (consume_claim_recovery)
+      outbox->recovery_claims_pending = 1;
     if (outbox->notification_count + outbox->delayed_notification_count <
         outbox->notification_capacity) {
       /* A consumer can free a slot while the query callback is still running.
@@ -5286,14 +5302,15 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
       outbox->recovery_resume_pending = 1;
     }
   } else if (outbox->recovery_cursor == NULL &&
-             scan_mode == LC_OUTBOX_RECOVERY_SCAN_CLAIMS) {
+             scan_mode == LC_OUTBOX_RECOVERY_SCAN_CLAIMS &&
+             !scan_claims_with_pending) {
     outbox->recovery_scan_mode = LC_OUTBOX_RECOVERY_SCAN_PENDING;
     /* Claims are recovery preparation. Follow with the ordinary pending pass
      * without making claims part of every hot reconciliation sweep. */
     outbox->recovery_needed = 1;
     outbox->recovery_immediate = 1;
   } else if (outbox->recovery_cursor == NULL &&
-             scan_mode == LC_OUTBOX_RECOVERY_SCAN_PENDING) {
+             scan_mode != LC_OUTBOX_RECOVERY_SCAN_RETRIES) {
     if (outbox->recovery_needed && outbox->recovery_immediate) {
       /* A foreground claim failed while this page was running. Preserve that
        * new immediate request instead of replacing it with the follow-up retry

@@ -498,14 +498,6 @@ static int outbox_delete_outbox_once(void *context, lc_error *error) {
   return rc;
 }
 
-static void outbox_delete_outbox_after_reconcile(void *context) {
-  lc_error error;
-
-  lc_error_init(&error);
-  (void)outbox_delete_outbox_once(context, &error);
-  lc_error_cleanup(&error);
-}
-
 static void outbox_hold_dead_letter_for_export(void *context) {
   outbox_hold_dead_letter_hook *hook = (outbox_hold_dead_letter_hook *)context;
   lc_acquire_req acquire;
@@ -1208,6 +1200,7 @@ typedef struct outbox_recovery_overflow_drain_hook {
   pthread_cond_t condition;
   int calls;
   int query_gate_calls;
+  int fill_on_query;
   int query_started;
   int allow_query;
   int overflowed;
@@ -1819,7 +1812,8 @@ static void outbox_gate_first_recovery_query(void *context) {
     assert_int_equal(pthread_cond_broadcast(&hook->condition), 0);
     while (!hook->allow_query)
       assert_int_equal(pthread_cond_wait(&hook->condition, &hook->mutex), 0);
-  } else if (hook->query_gate_calls == 2) {
+  }
+  if (hook->query_gate_calls == hook->fill_on_query) {
     lc_error error;
 
     assert_non_null(hook->dispatcher);
@@ -5904,8 +5898,7 @@ test_pouch_expired_commit_reports_rollback_without_signal(void **state) {
   lc_test_tmp_cleanup_path(root, OUTBOX_TMP_PREFIX);
 }
 
-static void
-test_pouch_recovery_overflow_resumes_after_capacity_frees(void **state) {
+static void outbox_recovery_overflow_resumes_after_capacity_frees(int claimed) {
   char root[256];
   char template_path[256];
   char endpoint[320];
@@ -5919,14 +5912,13 @@ test_pouch_recovery_overflow_resumes_after_capacity_frees(void **state) {
   lc_outbox_job *job;
   lc_error error;
 
-  (void)state;
   assert_true(snprintf(template_path, sizeof(template_path),
                        OUTBOX_TMP_PREFIX
                        "recovery-overflow-resume-XXXXXX") > 0);
   assert_true(lc_test_tmp_mkdtemp(template_path, root, sizeof(root),
                                   OUTBOX_TMP_PREFIX));
-  assert_true(snprintf(endpoint, sizeof(endpoint),
-                       "pouch://%s?query_indexing=false", root) > 0);
+  assert_true(snprintf(endpoint, sizeof(endpoint), "pouch://%s%s", root,
+                       claimed ? "" : "?query_indexing=false") > 0);
   endpoints[0] = endpoint;
   client = NULL;
   outbox = NULL;
@@ -5949,19 +5941,18 @@ test_pouch_recovery_overflow_resumes_after_capacity_frees(void **state) {
       lc_client_new_outbox(client, &outbox_config, &outbox, &error), LC_OK);
   dispatcher = outbox_test_dispatcher(outbox, &error);
   assert_non_null(dispatcher);
-  seed_recovery_outbox(client, outbox_config.ns,
-                       "__lockdc_io/v1/outbox/recovery-overflow-pending",
-                       &error);
+  seed_outbox_with_counters(client, outbox_config.ns,
+                            "__lockdc_io/v1/outbox/recovery-overflow-candidate",
+                            claimed ? "claimed" : "pending", "0", "0", &error);
   seed_terminal_outbox(client, outbox_config.ns,
                        "__lockdc_io/v1/outbox/recovery-overflow-terminal",
                        &error);
-  /* The first gated recovery turn checks claimed records. On its subsequent
-   * pending turn, the gate injects this stale direct key after the available
-   * budget is calculated but before the query delivers the durable pending
-   * key. The overflow hook consumes that stale key before completion. */
+  /* Inject a stale direct key after the scan has measured candidate space.
+   * The overflow hook consumes that stale key before the scan completes. */
   hook.outbox = outbox;
   hook.dispatcher = dispatcher;
   hook.terminal_key = "__lockdc_io/v1/outbox/recovery-overflow-terminal";
+  hook.fill_on_query = claimed ? 1 : 2;
   lc_outbox_test_before_recovery_query_context = &hook;
   lc_outbox_test_before_recovery_query_hook = outbox_gate_first_recovery_query;
   lc_outbox_test_after_recovery_overflow_context = &hook;
@@ -5981,6 +5972,8 @@ test_pouch_recovery_overflow_resumes_after_capacity_frees(void **state) {
   assert_int_equal(lc_outbox_dispatcher_next(dispatcher, 3000L, &job, &error),
                    LC_OK);
   assert_non_null(job);
+  assert_string_equal(job->outbox_key,
+                      "__lockdc_io/v1/outbox/recovery-overflow-candidate");
   assert_int_equal(lc_outbox_job_complete(job, NULL, &error), LC_OK);
   job = NULL;
   assert_int_equal(hook.calls, 1);
@@ -5993,6 +5986,17 @@ test_pouch_recovery_overflow_resumes_after_capacity_frees(void **state) {
   assert_int_equal(pthread_mutex_destroy(&hook.mutex), 0);
   lc_error_cleanup(&error);
   lc_test_tmp_cleanup_path(root, OUTBOX_TMP_PREFIX);
+}
+
+static void
+test_pouch_recovery_overflow_resumes_after_capacity_frees(void **state) {
+  (void)state;
+  outbox_recovery_overflow_resumes_after_capacity_frees(0);
+}
+
+static void test_pouch_claim_recovery_overflow_resumes(void **state) {
+  (void)state;
+  outbox_recovery_overflow_resumes_after_capacity_frees(1);
 }
 
 static void
@@ -6439,9 +6443,10 @@ static void test_pouch_reconciliation_skips_disappeared_outbox(void **state) {
   seed_recovery_outbox(client, ns, outbox_key, &error);
   seed_recovery_outbox(client, ns, "__lockdc_io/v1/outbox/zz-sentinel", &error);
   outbox_delete_outbox_hook_init(&hook, client, ns, outbox_key);
-  lc_outbox_test_after_reconcile_query_hook =
-      outbox_delete_outbox_after_reconcile;
-  lc_outbox_test_after_reconcile_query_context = &hook;
+  /* Delete the key after the query queues it and before the consumer acquires
+   * its lease. A dispatcher callback after the query races the consumer. */
+  lc_outbox_test_before_claim_outbox_hook = outbox_delete_outbox_once;
+  lc_outbox_test_before_claim_outbox_context = &hook;
   assert_int_equal(lc_outbox_reconcile(outbox, &error), LC_OK);
   assert_int_equal(
       lc_outbox_next(outbox, outbox_claim_next_timeout_ms(), &job, &error),
@@ -6450,8 +6455,8 @@ static void test_pouch_reconciliation_skips_disappeared_outbox(void **state) {
   assert_string_equal(job->outbox_key, "__lockdc_io/v1/outbox/zz-sentinel");
   assert_int_equal(lc_outbox_job_complete(job, NULL, &error), LC_OK);
   job = NULL;
-  lc_outbox_test_after_reconcile_query_hook = NULL;
-  lc_outbox_test_after_reconcile_query_context = NULL;
+  lc_outbox_test_before_claim_outbox_hook = NULL;
+  lc_outbox_test_before_claim_outbox_context = NULL;
   outbox_delete_outbox_hook_assert(&hook);
 
   assert_int_equal(lc_outbox_get_stats(outbox, &stats, &error), LC_OK);
@@ -7565,6 +7570,8 @@ static void test_pouch_reconciliation_pages_large_outbox(void **state) {
   struct timespec started;
   struct timespec finished;
   long elapsed_ms;
+  unsigned char seen[OUTBOX_RECONCILIATION_RECORDS];
+  unsigned long delivered_index;
   size_t index;
   int rc;
 
@@ -7581,12 +7588,16 @@ static void test_pouch_reconciliation_pages_large_outbox(void **state) {
   client_config.endpoint_count = 1U;
   client = NULL;
   assert_int_equal(lc_client_open(&client_config, &client, &error), LC_OK);
+  memset(seen, 0, sizeof(seen));
   for (index = 0U; index < OUTBOX_RECONCILIATION_RECORDS; ++index) {
     char key[128];
 
     assert_true(snprintf(key, sizeof(key), "__lockdc_io/v1/outbox/load-%03lu",
                          (unsigned long)index) > 0);
-    seed_recovery_outbox(client, "outbox-reconcile-large", key, &error);
+    /* Interleave abandoned claims with pending work across cursor pages. */
+    seed_outbox_with_counters(client, "outbox-reconcile-large", key,
+                              index % 16U == 0U ? "claimed" : "pending", "0",
+                              "0", &error);
   }
   lc_outbox_config_init(&outbox_config);
   outbox_config.ns = "outbox-reconcile-large";
@@ -7600,6 +7611,13 @@ static void test_pouch_reconciliation_pages_large_outbox(void **state) {
     job = NULL;
     assert_int_equal(lc_outbox_next(outbox, 30000L, &job, &error), LC_OK);
     assert_non_null(job);
+    assert_non_null(job->outbox_key);
+    assert_int_equal(sscanf(job->outbox_key, "__lockdc_io/v1/outbox/load-%lu",
+                            &delivered_index),
+                     1);
+    assert_true(delivered_index < OUTBOX_RECONCILIATION_RECORDS);
+    assert_false(seen[delivered_index]);
+    seen[delivered_index] = 1;
     rc = lc_outbox_job_complete(job, NULL, &error);
     if (rc != LC_OK) {
       fail_msg("reconciled outbox completion failed: index=%lu key=%s rc=%d "
@@ -12215,6 +12233,7 @@ int main(int argc, char **argv) {
           outbox_pouch_test_clock_teardown),
       cmocka_unit_test(
           test_pouch_recovery_overflow_resumes_after_capacity_frees),
+      cmocka_unit_test(test_pouch_claim_recovery_overflow_resumes),
       cmocka_unit_test(
           test_pouch_delayed_wake_does_not_block_ready_reconciliation),
       cmocka_unit_test(test_pouch_evicted_claim_wake_recovers_at_expiry),

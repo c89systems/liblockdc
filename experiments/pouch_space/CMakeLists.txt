@@ -685,6 +685,7 @@ if(LOCKDC_BUILD_TESTS)
     if(surface STREQUAL "outbox")
       foreach(codec 0 3)
         foreach(case clean_reopen_reconciles_durable_index
+            claim_recovery_overflow_resumes
             reconciliation_pages_large_outbox
             reconciliation_retains_overflow_request
             reconciliation_skips_disappeared_outbox
