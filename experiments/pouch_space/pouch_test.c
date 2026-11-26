@@ -1288,6 +1288,68 @@ static void cold_append_crash(const char *path) {
   lc_error_cleanup(&e);
 }
 
+static void cold_append_crc_mismatch(const char *path) {
+  static const char marker[] = "cold recovery payload marker";
+  ps_pouch_state_options o = options(0, 0);
+  lc_pouch *p = NULL;
+  lc_error e = {0};
+  o.initial_capacity = o.maximum_capacity = PS_MIB;
+  o.logical.segment_target_bytes = PS_MIB;
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    lc_pouch_state_write_result w = {0};
+    lc_source *body = NULL;
+    unsigned char payload[2 * PS_CHUNK + PS_PAGE];
+    memset(payload, 0x5a, sizeof(payload));
+    /* Place the marker well into the third recovery read-ahead window. */
+    memcpy(payload + 2 * PS_CHUNK + 256, marker, sizeof(marker));
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+    scope_put(p, "metadata", 7, &e);
+    ok(ps_flush(ps_root_space(ps_pouch_state_root(p)), &e), &e);
+    uint64_t syncs = scope_syncs(p, &e);
+    ok(lc_source_from_memory(payload, sizeof(payload), &body, &e), &e);
+    ok(lc_pouch_state_write(p, "metadata", "key", body, NULL, &w, &e), &e);
+    REQUIRE(w.version == 2);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    lc_source_close(body);
+    input following = source(17, 8);
+    ok(put(p, "metadata", "following", &following, NULL, &w, &e), &e);
+    REQUIRE(w.version == 1 && scope_syncs(p, &e) == syncs);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    _exit(0);
+  }
+  int status;
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+          WEXITSTATUS(status) == 0);
+  int fd = open(path, O_RDWR | O_CLOEXEC);
+  REQUIRE(fd >= 0);
+  const unsigned char *map = mmap(NULL, PS_MIB, PROT_READ, MAP_SHARED, fd, 0);
+  REQUIRE(map != MAP_FAILED);
+  const unsigned char *at = memmem(map, PS_MIB, marker, sizeof(marker));
+  REQUIRE(
+      at && at >= map + PS_DATA &&
+      !memmem(at + 1, PS_MIB - (size_t)(at + 1 - map), marker, sizeof(marker)));
+  unsigned char damaged = *at ^ 1;
+  REQUIRE(pwrite(fd, &damaged, 1, (off_t)(at - map)) == 1);
+  REQUIRE(munmap((void *)map, PS_MIB) == 0 && close(fd) == 0);
+
+  for (int reopen = 0; reopen < 2; ++reopen) {
+    lc_pouch_state_read_result r = {0};
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+    read_value(p, "metadata", "key", 17, reopen ? 9 : 7, reopen ? 2 : 1, &e);
+    ok(lc_pouch_state_read_metadata(p, "metadata", "following", &r, &e), &e);
+    REQUIRE(!r.found);
+    lc_pouch_state_read_result_cleanup(&allocator, &r);
+    if (!reopen)
+      scope_put(p, "metadata", 9, &e);
+    lc_pouch_close(p);
+    REQUIRE(!live);
+  }
+  REQUIRE(!unlink(path));
+  lc_error_cleanup(&e);
+}
+
 static lc_client *open_durable_queue(const char *path, int create, int shared,
                                      const ps_io *io, lc_error *e) {
   char endpoint[1600];
@@ -6806,6 +6868,7 @@ static void staging_pending_reserve(const char *path) {
   ps_pouch_state_options o = options(0, 0);
   lc_pouch *p = NULL;
   lc_pouch_state_write_result w = {0};
+  lc_pouch_state_read_result held = {0};
   lc_error e = {0};
   uint64_t selected, durable;
   staged_open(path, 0, 1, &o, &p, &e);
@@ -6820,18 +6883,35 @@ static void staging_pending_reserve(const char *path) {
   size_t baseline = space->reserve_count;
   staged_put(p, "attempt", 31, 12, 2, 0, 0, 0, &e);
   REQUIRE(space->reserve_count == baseline + 1);
+  ok(lc_pouch_state_read(p, "staged", "key/.staging/attempt", &held, &e), &e);
+  REQUIRE(held.found && held.body && held.version == 2);
   ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, &e), &e);
   ok(ps_publication_prefix(space, &selected, &durable, &e), &e);
   REQUIRE(w.version == 2 && durable < selected &&
           space->reserve_count == baseline + 1);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  /* A new lifetime of the same staged key has its own deletion obligation. */
+  staged_put(p, "attempt", 31, 13, 3, 0, 0, 0, &e);
+  REQUIRE(space->reserve_count == baseline + 2);
+  ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, &e), &e);
+  ok(ps_publication_prefix(space, &selected, &durable, &e), &e);
+  REQUIRE(w.version == 3 && durable < selected &&
+          space->reserve_count == baseline + 2);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
   ok(ps_flush(space, &e), &e);
   ok(ps_namespace_checkpoint_flush(ns, &e), &e);
   ok(ps_publication_prefix(space, &selected, &durable, &e), &e);
   REQUIRE(durable == selected && space->reserve_count == baseline);
   staged_absent(p, "key/.staging/attempt", &e);
-  read_value(p, "staged", "key", 31, 12, 2, &e);
+  read_value(p, "staged", "key", 31, 13, 3, &e);
   ps_namespace_release(ns);
+  lc_pouch_close(p);
+  drain(held.body, 31, 12, &e);
+  lc_pouch_state_read_result_cleanup(&allocator, &held);
+  REQUIRE(!live);
+  staged_open(path, 0, 0, &o, &p, &e);
+  staged_absent(p, "key/.staging/attempt", &e);
+  read_value(p, "staged", "key", 31, 13, 3, &e);
   lc_pouch_close(p);
   REQUIRE(!live && unlink(path) == 0);
   lc_error_cleanup(&e);
@@ -7841,9 +7921,10 @@ int main(int argc, char **argv) {
     queue_enqueue_crash(r.path);
   else if (!strcmp(r.mode, "durable-scope-crash"))
     durable_scope_crash(r.path);
-  else if (!strcmp(r.mode, "cold-append-crash"))
+  else if (!strcmp(r.mode, "cold-append-crash")) {
     cold_append_crash(r.path);
-  else if (!strcmp(r.mode, "nosync-mutation-checkpoint"))
+    cold_append_crc_mismatch(r.path);
+  } else if (!strcmp(r.mode, "nosync-mutation-checkpoint"))
     nosync_mutation_checkpoint(r.path);
   else if (!strcmp(r.mode, "staging-crash")) {
     staging_crash(r.path);
