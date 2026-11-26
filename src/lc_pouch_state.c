@@ -4282,7 +4282,7 @@ static void lc_pouch_state_scan_body_snapshots_cleanup(
 
 static int lc_pouch_state_scan_body_snapshot_append(
     lc_pouch *pouch, lc_pouch_state_scan_body_snapshot **snapshots,
-    size_t *count, size_t *capacity, size_t limit,
+    size_t *count, size_t *capacity, size_t limit, int keys_only,
     lc_pouch_namespace_logstore *cache,
     const lc_pouch_namespace_manifest *manifest,
     const lc_pouch_state_cache_record *record, lc_error *error) {
@@ -4324,6 +4324,15 @@ static int lc_pouch_state_scan_body_snapshot_append(
   }
   snapshot = &(*snapshots)[*count];
   snapshot->key = lc_strdup_with_allocator(&pouch->allocator, record->key);
+  if (!snapshot->key)
+    return lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "failed to allocate pouch scan key", NULL, NULL, NULL);
+  if (keys_only) {
+    snapshot->has_query_hidden = record->has_query_hidden;
+    snapshot->query_hidden = record->query_hidden;
+    ++(*count);
+    return LC_OK;
+  }
   snapshot->content_type =
       record->content_type != NULL
           ? lc_strdup_with_allocator(&pouch->allocator, record->content_type)
@@ -4358,8 +4367,7 @@ static int lc_pouch_state_scan_body_snapshot_append(
       snapshot->metadata_length = record->metadata_length;
     }
   }
-  if (snapshot->key == NULL ||
-      (record->content_type != NULL && snapshot->content_type == NULL) ||
+  if ((record->content_type != NULL && snapshot->content_type == NULL) ||
       (record->etag != NULL && snapshot->etag == NULL) ||
       (pouch->storage.ops == NULL && snapshot->payload_span_path == NULL) ||
       !snapshot->payload_span.present ||
@@ -19433,7 +19441,7 @@ void lc_pouch_state_scan_summaries_result_cleanup(
 
 int lc_pouch_state_scan_summaries_prefix(
     lc_pouch *pouch, const char *ns, const char *prefix,
-    const char *start_after, size_t limit,
+    const char *start_after, size_t limit, int keys_only,
     lc_pouch_state_scan_summary_visit_fn visitor, void *context,
     lc_pouch_state_scan_summaries_result *out, lc_error *error) {
   lc_pouch_namespace_manifest manifest;
@@ -19482,8 +19490,8 @@ int lc_pouch_state_scan_summaries_prefix(
       continue;
     }
     rc = lc_pouch_state_scan_body_snapshot_append(
-        pouch, &snapshots, &snapshot_count, &snapshot_capacity, limit, cache,
-        &manifest, record, error);
+        pouch, &snapshots, &snapshot_count, &snapshot_capacity, limit,
+        keys_only, cache, &manifest, record, error);
   }
   if (rc == LC_OK && snapshot_count > 0U) {
     while (record && !record->found)
@@ -19516,7 +19524,7 @@ int lc_pouch_state_scan_summaries_prefix(
     entry.retention = snapshots[index].retention;
     entry.has_query_hidden = snapshots[index].has_query_hidden;
     entry.query_hidden = snapshots[index].query_hidden;
-    entry.opaque = &snapshots[index];
+    entry.opaque = keys_only ? NULL : &snapshots[index];
     rc = visitor(&entry, context, error);
     if (rc != LC_OK) {
       break;
@@ -19556,7 +19564,7 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
                                   lc_pouch_state_scan_summaries_result *out,
                                   lc_error *error) {
   return lc_pouch_state_scan_summaries_prefix(
-      pouch, ns, NULL, start_after, limit, visitor, context, out, error);
+      pouch, ns, NULL, start_after, limit, 0, visitor, context, out, error);
 }
 
 static int lc_pouch_state_visit_internal(lc_pouch *pouch, const char *ns,

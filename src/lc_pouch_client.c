@@ -4934,7 +4934,8 @@ static int lc_pouch_query_run_scan_predicate(lc_pouch_query_scan_context *scan,
     memset(&page, 0, sizeof(page));
     rc = lc_pouch_state_scan_summaries_prefix(
         scan->client->pouch, scan->ns, scan->key_prefix, start_after,
-        page_limit, lc_pouch_query_scan_summary_visit, scan, &page, error);
+        page_limit, !scan->selector && !scan->emit_documents,
+        lc_pouch_query_scan_summary_visit, scan, &page, error);
     if (rc == LC_POUCH_STATE_READ_MANY_STOP) {
       rc = LC_OK;
       scan->page_full = 1;

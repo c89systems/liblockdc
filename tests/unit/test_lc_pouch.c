@@ -30777,6 +30777,7 @@ static void test_query_keys_scan_uses_liblql_and_query_hidden(void **state) {
   pouch_query_key_capture first_page;
   pouch_query_key_capture second_page;
   pouch_query_key_capture lql_page;
+  pouch_query_key_capture keys_page;
   pouch_query_key_capture conflict_page;
   lc_pouch_state_write_options options;
   lc_pouch_state_write_result write_result;
@@ -30796,6 +30797,7 @@ static void test_query_keys_scan_uses_liblql_and_query_hidden(void **state) {
   memset(&first_page, 0, sizeof(first_page));
   memset(&second_page, 0, sizeof(second_page));
   memset(&lql_page, 0, sizeof(lql_page));
+  memset(&keys_page, 0, sizeof(keys_page));
   memset(&conflict_page, 0, sizeof(conflict_page));
   memset(&options, 0, sizeof(options));
   memset(&write_result, 0, sizeof(write_result));
@@ -30940,6 +30942,21 @@ static void test_query_keys_scan_uses_liblql_and_query_hidden(void **state) {
   assert_true(pouch_query_capture_has(&lql_page, "doc/b"));
   assert_false(pouch_query_capture_has(&lql_page, "doc/hidden"));
   assert_false(pouch_query_capture_has(&lql_page, "doc/staged"));
+  lc_query_res_cleanup(&query_res);
+
+  lc_query_req_init(&query_req);
+  query_req.ns = "docs/query";
+  query_req.engine = "scan";
+  query_req.limit = 10L;
+  rc = client->query_keys(client, &query_req, &handler, &keys_page, &query_res,
+                          &error);
+  assert_int_equal(rc, LC_OK);
+  assert_int_equal(keys_page.count, 4);
+  assert_true(pouch_query_capture_has(&keys_page, "doc/0"));
+  assert_true(pouch_query_capture_has(&keys_page, "doc/a"));
+  assert_true(pouch_query_capture_has(&keys_page, "doc/b"));
+  assert_true(pouch_query_capture_has(&keys_page, "doc/c"));
+  assert_null(query_res.cursor);
   lc_query_res_cleanup(&query_res);
 
   lc_query_req_init(&query_req);
