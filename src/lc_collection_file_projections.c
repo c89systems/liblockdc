@@ -15,9 +15,10 @@ static int failure(lc_error *e, int code, const char *message) {
   return lc_collection_failure(e, code, NULL, message);
 }
 static int order_refresh(void *context, lc_collection_order *order,
-                         lc_error *e) {
+                         int reconciling, lc_error *e) {
   lc_collection_handle *c = context;
   struct stat named, opened;
+  (void)reconciling;
   if (order->fd < 0)
     return lc_collection_order_open(c->order_path, 0, order, e);
   if (stat(c->order_path, &named) != 0 || fstat(order->fd, &opened) != 0)

@@ -1075,6 +1075,8 @@ static void shared_append(const char *directory, int codec, int sync) {
      &f.error);
   first = append(f.collection, "first", 512U, &f.error);
   REQUIRE(first.position == 1U);
+  duplicate = append(f.peer, "first", 512U, &f.error);
+  REQUIRE(duplicate.duplicate && duplicate.position == first.position);
   read_entry(f.peer, first.position, 512U, &f.error);
   REQUIRE(!pthread_mutex_init(&g.mutex, NULL));
   REQUIRE(!pthread_cond_init(&g.condition, NULL));

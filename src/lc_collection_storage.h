@@ -115,7 +115,9 @@ enum { LC_COLLECTION_PROJECTION_ORDER = 1, LC_COLLECTION_PROJECTION_IDS };
 /* Disposable metadata construction/publication. Canonical replay, validation,
  * cardinality and generation rules remain in the common collection engine. */
 typedef struct lc_collection_projections {
-  int (*order_refresh)(void *, lc_collection_order *, lc_error *);
+  /* The appender already holds APPEND and will replay when reconciling. */
+  int (*order_refresh)(void *, lc_collection_order *, int reconciling,
+                       lc_error *);
   int (*ids_refresh)(void *, lc_collection_ids *, lc_error *);
   int (*begin)(void *, lc_collection_projection_build *, lc_error *);
   int (*publish)(void *, lc_collection_projection_build *, lc_error *);

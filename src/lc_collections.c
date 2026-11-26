@@ -814,7 +814,7 @@ static int lc_cc_active(lc_collection_handle *collection, lc_error *error) {
 static int lc_cc_order_refresh(lc_collection_handle *collection,
                                lc_error *error) {
   return collection->projections.order_refresh(collection->projections.context,
-                                               &collection->order, error);
+                                               &collection->order, 0, error);
 }
 
 int lc_collection_project_record(lc_collection_order *order,
@@ -1200,7 +1200,8 @@ static int lc_collection_reconcile(lc_collection_handle *collection,
     rc = lc_cc_active(collection, error);
   if (rc != LC_OK)
     return rc;
-  rc = lc_cc_order_refresh(collection, error);
+  rc = collection->projections.order_refresh(collection->projections.context,
+                                             &collection->order, 1, error);
   if (rc == LC_OK)
     rc = collection->projections.ids_refresh(collection->projections.context,
                                              &collection->ids, error);

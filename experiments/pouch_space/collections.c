@@ -571,7 +571,7 @@ static void read_close(void *context, void *pin) {
   ps_collection_segment_close(pin);
 }
 static int order_refresh(void *context, lc_collection_order *order,
-                         lc_error *e) {
+                         int reconciling, lc_error *e) {
   collection_receiver *binding = context;
   ps_collection_owner *owner = binding->owner;
   lc_collection_handle *c = binding->receiver;
@@ -581,6 +581,8 @@ static int order_refresh(void *context, lc_collection_order *order,
   int rc = lc_collection_order_is_open(order)
                ? lc_collection_order_refresh(order, e)
                : lc_collection_order_scratch_open(&owner->allocator, order, e);
+  if (shared && reconciling && !binding->maintenance)
+    return rc;
   /* A peer compactor may publish after prepare, or while a live upload makes
    * prepare return the previous view. Receiver-local scratch does not follow
    * the native projection's rename. Rebuild only disposable metadata under the
@@ -620,9 +622,10 @@ static int order_refresh(void *context, lc_collection_order *order,
    * canonical ready tail must be visible before validating a late index
    * publication against this receiver's disposable order. Private allocation
    * alone does not advance this watermark or require a replay. */
-  if (rc == LC_OK && (order->snapshot != c->head.snapshot ||
-                      order->replay_segment != c->head.active ||
-                      order->replay_offset < active.tail || stale_projection))
+  if (rc == LC_OK && !(shared && reconciling) &&
+      (order->snapshot != c->head.snapshot ||
+       order->replay_segment != c->head.active ||
+       order->replay_offset < active.tail || stale_projection))
     rc = shared ? lc_collection_projection_catchup(c, e)
                 : lc_collection_projection_capture(c, e);
   if (rc == LC_OK && binding->maintenance)
