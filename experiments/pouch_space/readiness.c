@@ -347,10 +347,20 @@ static void signal_change(uint32_t *word) {
 uint32_t ps_readiness_sync_observe(ps_space *s) {
   return __atomic_load_n(sync_word(s), __ATOMIC_ACQUIRE);
 }
-int ps_readiness_sync_wait(ps_space *s, uint32_t observed) {
+int ps_readiness_sync_wait(ps_space *s, uint32_t observed, unsigned *retry_ms) {
+  const unsigned max_ms = 64;
+  const unsigned delay_ms = *retry_ms ? *retry_ms : 4;
+  int rc = wait_for_change(sync_word(s), observed, delay_ms * 1000000U);
   /* Owner death releases the OFD lock without changing the wake word. */
-  int rc = wait_for_change(sync_word(s), observed, 4000000U);
-  return rc >= 0 || errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT;
+  if (rc >= 0 || errno == EAGAIN) {
+    *retry_ms = 0;
+    return 1;
+  }
+  if (errno == ETIMEDOUT) {
+    *retry_ms = delay_ms < max_ms ? delay_ms * 2 : max_ms;
+    return 1;
+  }
+  return errno == EINTR;
 }
 void ps_readiness_sync_wake(ps_space *s) { signal_change(sync_word(s)); }
 uint32_t ps_readiness_queue_observe(ps_space *s) {

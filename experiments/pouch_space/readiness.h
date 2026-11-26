@@ -85,7 +85,9 @@ int ps_readiness_stabilize(ps_space *, uint64_t wire, uint64_t root,
  * Notifications carry no proof or authority. */
 int ps_readiness_durability_covers(ps_space *, uint64_t wire, uint64_t ticket);
 uint32_t ps_readiness_sync_observe(ps_space *);
-int ps_readiness_sync_wait(ps_space *, uint32_t observed);
+/* Start with a zero retry interval. Quiet timeouts back off and a wake resets
+ * the interval. A false return leaves coordination to the kernel lock. */
+int ps_readiness_sync_wait(ps_space *, uint32_t observed, unsigned *retry_ms);
 void ps_readiness_sync_wake(ps_space *);
 /* A shared root change prompts a queue rescan. The observed sequence must
  * precede the scan so a publication between scan and wait cannot be missed. */

@@ -2385,14 +2385,20 @@ static double projection_milliseconds(void) {
 static void readiness_sync_timeout(void) {
   lc_error e = {0};
   ps_space *s = NULL;
+  const unsigned next_delay_ms[] = {8, 16, 32, 64, 64};
+  unsigned retry_ms = 0;
   ok(ps_open(path, 1, NULL, &s, &e), &e);
   uint32_t observed = ps_readiness_sync_observe(s);
   double started = projection_milliseconds();
-  for (unsigned i = 0; i < 4; ++i)
-    REQUIRE(ps_readiness_sync_wait(s, observed));
-  /* Four 4 ms waits should take at least 12 ms. A timeout decoded as zero
-   * returns immediately on each call. */
-  REQUIRE(projection_milliseconds() - started >= 12.0);
+  for (size_t i = 0; i < sizeof(next_delay_ms) / sizeof(next_delay_ms[0]);
+       ++i) {
+    REQUIRE(ps_readiness_sync_wait(s, observed, &retry_ms));
+    REQUIRE(retry_ms == next_delay_ms[i]);
+  }
+  REQUIRE(projection_milliseconds() - started >= 120.0);
+  ps_readiness_sync_wake(s);
+  REQUIRE(ps_readiness_sync_observe(s) != observed &&
+          ps_readiness_sync_wait(s, observed, &retry_ms) && !retry_ms);
   ok(ps_close(s, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
   lc_error_cleanup(&e);
@@ -6680,7 +6686,7 @@ static int observe_sync_conflict(void *context, int fd, int command,
   if (rc < 0 && (reason == EAGAIN || reason == EACCES) &&
       command == F_OFD_SETLK && lock->l_start == 5 && lock->l_type == F_WRLCK) {
     pthread_mutex_lock(&gate->mutex);
-    gate->attempted = 1;
+    ++gate->attempted;
     pthread_cond_broadcast(&gate->cond);
     pthread_mutex_unlock(&gate->mutex);
   }
@@ -6795,7 +6801,8 @@ static void shared_preparation_wait(int owner_dies) {
   gate.attempted = 0;
   REQUIRE(!pthread_create(&thread, NULL, prepare_grant, &grant));
   pthread_mutex_lock(&gate.mutex);
-  while (!gate.attempted)
+  /* Reach the longest quiet wait before testing both recovery paths. */
+  while (gate.attempted < 5)
     pthread_cond_wait(&gate.cond, &gate.mutex);
   pthread_mutex_unlock(&gate.mutex);
   uint64_t ticket = ps_readiness_issued_tickets(writer);

@@ -363,12 +363,13 @@ int main(int argc, char **argv) {
   ps_space *space = open_shared(path, 1);
   check_capacity(path, PS_DEFAULT_CAPACITY);
   uint32_t observed = ps_readiness_sync_observe(space);
+  unsigned retry_ms = 0;
   uint64_t before = monotonic_ns();
-  REQUIRE(ps_readiness_sync_wait(space, observed) &&
-          monotonic_ns() - before >= 2000000U);
+  REQUIRE(ps_readiness_sync_wait(space, observed, &retry_ms) &&
+          monotonic_ns() - before >= 2000000U && retry_ms == 8);
   ps_readiness_sync_wake(space);
   REQUIRE(ps_readiness_sync_observe(space) != observed &&
-          ps_readiness_sync_wait(space, observed));
+          ps_readiness_sync_wait(space, observed, &retry_ms) && !retry_ms);
   produce(space, "checkpointed predecessor");
   OK(ps_checkpoint(space, &error));
   ps_reader *held = NULL;

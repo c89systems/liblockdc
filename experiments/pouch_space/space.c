@@ -364,10 +364,11 @@ static void mark_durable(ps_space *s, uint64_t sequence) {
  */
 static int durability_acquire(ps_space *s, uint64_t wire, uint64_t ticket,
                               ps_coordination_guard **leader, lc_error *error) {
-  uint32_t observed;
+  uint32_t observed = ps_readiness_sync_observe(s);
+  unsigned retry_ms = 0;
   int rc;
   for (;;) {
-    observed = ps_readiness_sync_observe(s);
+    uint32_t next;
     if (ps_readiness_durability_covers(s, wire, ticket))
       return healthy(s, error);
     rc = ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 0,
@@ -375,8 +376,12 @@ static int durability_acquire(ps_space *s, uint64_t wire, uint64_t ticket,
     if (rc != LC_ERR_PENDING)
       return rc;
     lc_error_cleanup(error);
-    if (!ps_readiness_sync_wait(s, observed))
+    if (!ps_readiness_sync_wait(s, observed, &retry_ms))
       break;
+    next = ps_readiness_sync_observe(s);
+    if (next != observed)
+      retry_ms = 0;
+    observed = next;
   }
   return ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 1,
                               leader, error);
