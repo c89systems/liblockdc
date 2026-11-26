@@ -13296,6 +13296,8 @@ static int lc_pouch_query_index_generation_cache_parse(
         value_hex = entry->terms[index].value_hex_inline;
       }
     }
+    /* V2 fields already passed dictionary validation. Binary trigrams were
+     * rendered locally as six hexadecimal digits. */
     if (term_id == 0UL ||
         (value_encoding == LC_POUCH_INDEX_TERM_VALUE_TRIGRAM &&
          value_type != (unsigned char)'s') ||
@@ -13304,8 +13306,10 @@ static int lc_pouch_query_index_generation_cache_parse(
          value_type != (unsigned char)LC_POUCH_QUERY_INDEX_EXACT_HASH_TYPE &&
          value_type != (unsigned char)LC_POUCH_QUERY_INDEX_TEXT_PREFIX_TYPE &&
          value_type != (unsigned char)LC_POUCH_QUERY_INDEX_TEXT_TOKEN_TYPE) ||
-        !lc_pouch_query_index_hex_token_valid(field_hex) ||
-        !lc_pouch_query_index_hex_token_valid(value_hex)) {
+        (version == LC_POUCH_INDEX_TERM_GENERATION_VERSION_V1 &&
+         !lc_pouch_query_index_hex_token_valid(field_hex)) ||
+        (value_encoding == LC_POUCH_INDEX_TERM_VALUE_STRING &&
+         !lc_pouch_query_index_hex_token_valid(value_hex))) {
       rc = LC_ERR_INVALID;
       goto cleanup;
     }
