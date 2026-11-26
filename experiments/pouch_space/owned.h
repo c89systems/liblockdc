@@ -11,6 +11,7 @@
 #define PS_OWNED_RUN 4U
 #define PS_RUN_IDENTITY_BYTES 64U
 #define PS_RUN_HEADER 96U
+#define PS_RUN_FOOTER_BYTES (PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES)
 /* Required root layout covers coordination, grant slots and journal framing.
  * An opener must recognize the layout before replaying or clearing records. */
 #define PS_ROOT_LAYOUT_FIXED_GRANTS UINT32_C(0x20000)
@@ -208,6 +209,14 @@ int ps_owned_piece_extend(ps_owned_run *, uint64_t prior_bytes,
 int ps_owned_piece_extend_buffer(ps_owned_run *, uint64_t prior_bytes,
                                  const ps_piece_checksum *prior, uint64_t bytes,
                                  const void *suffix, ps_piece_checksum *,
+                                 lc_error *);
+/* Try a single write for new bytes and their adjacent footer. The caller
+ * supplies PS_RUN_FOOTER_BYTES of spare buffer after the suffix. attempted
+ * is set before the write so failure can discard the private suffix. */
+int ps_owned_piece_append_buffer(ps_owned_run *, uint64_t prior_bytes,
+                                 const ps_piece_checksum *prior,
+                                 unsigned char *suffix, size_t length,
+                                 ps_piece_checksum *, int *attempted,
                                  lc_error *);
 /* Checksum state output is optional. */
 int ps_owned_piece_inspect(ps_owned_run *, uint64_t bytes, ps_piece_checksum *,

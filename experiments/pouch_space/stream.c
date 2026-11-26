@@ -38,7 +38,7 @@ struct ps_stream_writer {
   ps_piece_checksum prior_checksum;
   size_t used;
   int failed, published, wrote;
-  unsigned char buffer[PS_CHUNK];
+  unsigned char buffer[PS_CHUNK + PS_RUN_FOOTER_BYTES];
 };
 struct ps_stream_window {
   ps_stream *stream;
@@ -1078,6 +1078,32 @@ int ps_stream_writer_crc(ps_stream_writer *w, uint64_t offset, uint64_t length,
     *out = crc;
   return rc;
 }
+static int stream_flush_with_footer(ps_stream_writer *w, lc_error *error) {
+  ps_stream *s = w->stream;
+  ps_owned_mapping run;
+  ps_piece_checksum checksum;
+  int rc, attempted = 0;
+  /* The ordinary flush still admits a grant if the caller has not reserved
+   * enough space. Preserve separate completion for a split or fixed footer. */
+  if (!w->used || w->start + w->used > s->capacity)
+    return LC_OK;
+  rc = stream_mapping(s, w->start, &run, error);
+  if (rc != LC_OK)
+    return rc;
+  rc = ps_owned_piece_append_buffer(run.handle, w->start - run.base,
+                                    &s->checksum, w->buffer, w->used, &checksum,
+                                    &attempted, error);
+  ps_owned_run_close(run.handle);
+  if (attempted)
+    w->wrote = 1;
+  if (rc == LC_OK && attempted) {
+    w->flushed = w->used;
+    w->used = 0;
+    s->checked = w->start + w->flushed;
+    s->checksum = checksum;
+  }
+  return rc;
+}
 int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,
                      ps_commit_publish_fn publish, void *context,
                      lc_error *error) {
@@ -1089,7 +1115,9 @@ int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,
   /* All fixups to a short append still live in the writer's existing buffer.
    * A partially flushed append can have disk-only fixups. */
   buffered = !w->flushed && w->stream->checked == w->start;
-  rc = stream_flush(w, error);
+  rc = buffered && !w->edit ? stream_flush_with_footer(w, error) : LC_OK;
+  if (rc == LC_OK)
+    rc = stream_flush(w, error);
   if (rc == LC_OK)
     rc = stream_pieces(w->stream, w->start + w->bytes, 0, 1, NULL, w->buffer,
                        buffered, NULL, error);

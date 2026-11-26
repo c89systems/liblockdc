@@ -310,6 +310,8 @@ typedef struct model {
   size_t stable_capacity;
   size_t stable_bytes, operations, fail_at, short_limit, reads;
   size_t writes, syncs, grants, fail_sync_at;
+  size_t last_write_size;
+  off_t last_write_offset;
   uint64_t write_bytes;
   size_t fail_read;
   size_t zero_calls;
@@ -343,6 +345,8 @@ static ssize_t model_write(void *v, int fd, const void *p, size_t n,
                            off_t offset) {
   model *m = v;
   ++m->writes;
+  m->last_write_size = n;
+  m->last_write_offset = offset;
   m->write_bytes += n;
   if (m->interrupt_write) {
     m->interrupt_write = 0;
@@ -7750,7 +7754,8 @@ static void piece_tail_footer(int fixed_footer) {
   CHECK(info.tail == tail);
   stream_expect(stream, first, body, sizeof(body), 1);
   OK(canonical_append(stream, body, 64, 7, 3, &next, &error));
-  CHECK(next == tail);
+  CHECK(next == tail && m.last_write_offset == (off_t)physical &&
+        m.last_write_size == 64 + 43 + sizeof(footer));
   OK(ps_status(space, &stats, &error));
   if (fixed_footer) {
     /* With the adjacent footer missing, stabilize the fixed copy before

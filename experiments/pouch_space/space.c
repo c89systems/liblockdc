@@ -11450,6 +11450,29 @@ int ps_owned_piece_extend_buffer(ps_owned_run *run, uint64_t prior,
   return owned_piece(run, bytes, NULL, 2, prior, prefix, out, NULL, suffix,
                      error);
 }
+int ps_owned_piece_append_buffer(ps_owned_run *run, uint64_t prior,
+                                 const ps_piece_checksum *prefix,
+                                 unsigned char *suffix, size_t length,
+                                 ps_piece_checksum *out, int *attempted,
+                                 lc_error *error) {
+  uint64_t capacity = ps_owned_run_capacity(run);
+  uint64_t offset, bytes;
+  *attempted = 0;
+  if (ps_owned_run_mapped(run) || !length || prior > capacity ||
+      length > capacity - prior)
+    return LC_OK;
+  offset = run->entry->extents[0].offset;
+  bytes = prior + length;
+  if (!piece_tail_footer(offset, capacity, bytes))
+    return LC_OK;
+  out->crc = (uint32_t)ps_crc32(prior ? prefix->crc : 0, suffix, (uInt)length);
+  out->reconstructed = prior && prefix->reconstructed;
+  piece_footer_encode(suffix + length, bytes, run->entry->token, out->crc,
+                      out->reconstructed);
+  *attempted = 1;
+  return ps_owned_write(run, prior, suffix, length + PS_RUN_FOOTER_BYTES,
+                        error);
+}
 int ps_owned_piece_inspect(ps_owned_run *run, uint64_t bytes,
                            ps_piece_checksum *out, lc_error *error) {
   return owned_piece(run, bytes, NULL, 0, 0, NULL, out, NULL, NULL, error);
