@@ -21,7 +21,8 @@ enum ps_namespace_append_mode {
   PS_APPEND_COMPLETE,
   PS_APPEND_MAINTENANCE,
   PS_APPEND_MAINTENANCE_PREFIX,
-  PS_APPEND_FRAMED_PREFIX
+  PS_APPEND_FRAMED_PREFIX,
+  PS_APPEND_METADATA
 };
 typedef struct ps_namespace_status {
   uint64_t active_segment, segments, tail, runs;

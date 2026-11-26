@@ -253,17 +253,19 @@ static int append_begin(void *context, void *ns, uint64_t target,
   case LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX:
     physical = PS_APPEND_FRAMED_PREFIX;
     break;
+  case LC_POUCH_STORAGE_APPEND_METADATA:
+    physical = PS_APPEND_METADATA;
+    break;
   default:
     return lc_error_set(e, LC_ERR_INVALID, 0, "invalid container append mode",
                         NULL, NULL, "pouch");
   }
-  if ((mode == LC_POUCH_STORAGE_APPEND_COMPLETE ||
-       mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE ||
-       mode == LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX) &&
+  if ((physical == PS_APPEND_COMPLETE || physical == PS_APPEND_MAINTENANCE ||
+       physical == PS_APPEND_FRAMED_PREFIX || physical == PS_APPEND_METADATA) &&
       target)
     target = target > PS_FRAME_BYTES ? target - PS_FRAME_BYTES : 1;
-  maintenance = mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE ||
-                mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX;
+  maintenance = physical == PS_APPEND_MAINTENANCE ||
+                physical == PS_APPEND_MAINTENANCE_PREFIX;
   rc = ps_namespace_work_stage_ordinary(owner, maintenance, &work_pending, e);
   if (rc != LC_OK)
     return rc;

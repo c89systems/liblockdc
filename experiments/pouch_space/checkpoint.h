@@ -67,7 +67,7 @@ int ps_checkpoint_delta_replay_commit(ps_checkpoint_delta *, uint64_t segment,
  * Preserve all prior key changes and watermarks while covering that zero-byte
  * source, so sealed empty predecessors can retire without invented records. */
 int ps_key_checkpoint_cover_empty(ps_key_checkpoint *, uint64_t, lc_error *);
-int ps_key_checkpoint_due(ps_key_checkpoint *);
+int ps_key_checkpoint_due(ps_key_checkpoint *, int limit_to_one_batch);
 int ps_key_checkpoint_flush(ps_key_checkpoint *, lc_error *);
 /* Complete funded stream debt before a native metadata batch without forcing
  * an extra barrier. Its replacement obligations remain until prefix durability.

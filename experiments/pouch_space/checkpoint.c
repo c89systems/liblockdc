@@ -2142,10 +2142,10 @@ int ps_key_checkpoint_cover_empty(ps_key_checkpoint *c, uint64_t segment,
   pthread_mutex_unlock(&c->mutex);
   return rc;
 }
-int ps_key_checkpoint_due(ps_key_checkpoint *c) {
+int ps_key_checkpoint_due(ps_key_checkpoint *c, int limit_to_one_batch) {
   int due;
   pthread_mutex_lock(&c->mutex);
-  due = c->dirty_count >= CHECKPOINT_BATCH ||
+  due = (limit_to_one_batch && c->dirty_count >= CHECKPOINT_BATCH) ||
         c->dirty_bytes >= CHECKPOINT_TARGET_BYTES ||
         c->uncovered_bytes >= CHECKPOINT_HISTORY_BYTES;
   pthread_mutex_unlock(&c->mutex);

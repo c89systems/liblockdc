@@ -1135,6 +1135,88 @@ static void durable_scope_crash(const char *path) {
   lc_error_cleanup(&e);
 }
 
+static void nosync_mutation_checkpoint(const char *path) {
+  const char *names[] = {"one", "two"};
+  const unsigned char updated[] = "updated";
+  const int rows = 96;
+  char image_path[1400], key[32];
+  lc_error e = {0};
+  REQUIRE(snprintf(image_path, sizeof(image_path), "%s-image", path) <
+          (int)sizeof(image_path));
+  for (int acknowledge = 0; acknowledge < 2; ++acknowledge) {
+    scope_image image = {0};
+    ps_io io = {&image, io_read, io_write, scope_image_sync, io_reserve, NULL};
+    ps_pouch_state_options o = options(0, 0);
+    lc_pouch *p = NULL;
+    int status;
+    image.scratch = lc_alloc_with_allocator(&allocator, PS_PAGE);
+    image.fd = open(image_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    REQUIRE(image.scratch && image.fd >= 0);
+    o.initial_capacity = o.maximum_capacity = PS_DEFAULT_CAPACITY;
+    o.logical.segment_target_bytes = PS_MIB;
+    o.io = &io;
+    pid_t child = fork();
+    REQUIRE(child >= 0);
+    if (!child) {
+      lc_pouch_state_write_options metadata = {0};
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      ps_space *space = ps_root_space(ps_pouch_state_root(p));
+      for (int ns = 0; ns < 2; ++ns)
+        for (int row = 0; row < rows; ++row) {
+          lc_pouch_state_write_result w = {0};
+          input in = source(4096, (unsigned char)row);
+          snprintf(key, sizeof(key), "key-%d", row);
+          ok(put(p, names[ns], key, &in, NULL, &w, &e), &e);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+        }
+      ok(ps_flush(space, &e), &e);
+      uint64_t syncs = scope_syncs(p, &e);
+      metadata.has_metadata = 1;
+      metadata.metadata = updated;
+      metadata.metadata_length = sizeof(updated) - 1;
+      for (int row = 0; row < rows; ++row) {
+        lc_pouch_state_write_result w = {0};
+        snprintf(key, sizeof(key), "key-%d", row);
+        ok(lc_pouch_state_update_metadata(p, names[0], key, &metadata, &w, &e),
+           &e);
+        REQUIRE(w.version == 1 && w.index_seq == (unsigned)(rows + row + 1));
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        ok(lc_pouch_state_delete(p, names[1], key, NULL, &w, &e), &e);
+        REQUIRE(w.version == 2 && w.index_seq == (unsigned)(rows + row + 1));
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+      }
+      REQUIRE(scope_syncs(p, &e) == syncs);
+      if (acknowledge)
+        ok(ps_flush(space, &e), &e);
+      _exit(0);
+    }
+    REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0);
+    REQUIRE(close(image.fd) == 0);
+    lc_free_with_allocator(&allocator, image.scratch);
+    o.io = NULL;
+    ok(ps_pouch_state_open(image_path, 0, &allocator, &o, &p, &e), &e);
+    for (int row = 0; row < rows; ++row) {
+      lc_pouch_state_read_result r = {0};
+      snprintf(key, sizeof(key), "key-%d", row);
+      ok(lc_pouch_state_read(p, names[0], key, &r, &e), &e);
+      REQUIRE(r.found && r.version == 1 &&
+              r.index_seq == (unsigned)(row + 1 + (acknowledge ? rows : 0)));
+      REQUIRE(r.metadata_length == (acknowledge ? sizeof(updated) - 1 : 0));
+      if (acknowledge)
+        REQUIRE(!memcmp(r.metadata, updated, r.metadata_length));
+      drain(r.body, 4096, (unsigned char)row, &e);
+      lc_pouch_state_read_result_cleanup(&allocator, &r);
+      ok(lc_pouch_state_read_metadata(p, names[1], key, &r, &e), &e);
+      REQUIRE(r.found == !acknowledge);
+      lc_pouch_state_read_result_cleanup(&allocator, &r);
+    }
+    lc_pouch_close(p);
+    REQUIRE(live == 0 && unlink(image_path) == 0 && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+
 static void cold_append_crash(const char *path) {
   char image_path[1400];
   lc_error e = {0};
@@ -1814,9 +1896,13 @@ static void mutations(const char *path, const char *directory) {
   lc_error_cleanup(&e);
 }
 
+static lc_pouch_storage_namespace_info storage_info(lc_pouch *, const char *,
+                                                    lc_error *);
+
 static unsigned char mutation_metadata[20001];
 static size_t mutation_fault_case(const char *path, size_t nth, int operation,
-                                  int transform, int sync, int use_io) {
+                                  int transform, int sync, int use_io,
+                                  uint64_t segment_target) {
   io_fault f = {0};
   ps_io io = {&f, io_read, io_write, io_sync, io_reserve, NULL};
   ps_pouch_state_options o = options(transform, sync);
@@ -1828,9 +1914,10 @@ static size_t mutation_fault_case(const char *path, size_t nth, int operation,
   input in = source(1009, 31);
   size_t count;
   int rc, applied = 0, health;
+  lc_pouch_storage_namespace_info stream_before = {0};
   const char *key = operation == 2 ? "empty" : "key";
   lc_error_init(&e);
-  o.logical.segment_target_bytes = 4096;
+  o.logical.segment_target_bytes = segment_target;
   if (use_io)
     o.io = &io;
   ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
@@ -1842,6 +1929,8 @@ static size_t mutation_fault_case(const char *path, size_t nth, int operation,
   write.metadata_length = 6;
   ok(put(p, "mutation/ns", "key", &in, &write, &w, &e), &e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
+  if (nth == SIZE_MAX && segment_target == PS_MIB)
+    stream_before = storage_info(p, "mutation/ns", &e);
   change.has_metadata = 1;
   change.metadata = mutation_metadata;
   change.metadata_length = sizeof(mutation_metadata);
@@ -1870,9 +1959,15 @@ static size_t mutation_fault_case(const char *path, size_t nth, int operation,
             "mutation failure %lu op %d transform %d sync %d IO %d rc %d: %s\n",
             (unsigned long)nth, operation, transform, sync, use_io, rc,
             e.message ? e.message : "?");
-  if (nth == SIZE_MAX)
+  if (nth == SIZE_MAX) {
     ok(rc, &e);
-  else
+    if (segment_target == PS_MIB) {
+      lc_pouch_storage_namespace_info after =
+          storage_info(p, "mutation/ns", &e);
+      REQUIRE(after.active_segment == stream_before.active_segment &&
+              after.tail > stream_before.tail);
+    }
+  } else
     REQUIRE(rc == LC_OK || rc == LC_ERR_NOMEM ||
             (use_io && rc == LC_ERR_TRANSPORT));
   lc_pouch_state_write_result_cleanup(&allocator, &w);
@@ -1943,15 +2038,33 @@ static void mutation_faults(const char *path, int use_io) {
     for (int sync = 0; sync < 2; ++sync)
       for (int operation = 0; operation < 3; ++operation) {
         size_t total = mutation_fault_case(path, SIZE_MAX, operation, transform,
-                                           sync, use_io);
+                                           sync, use_io, 4096);
         for (size_t n = 1; n <= total; ++n)
-          (void)mutation_fault_case(path, n, operation, transform, sync,
-                                    use_io);
+          (void)mutation_fault_case(path, n, operation, transform, sync, use_io,
+                                    4096);
         count += total;
       }
   fixture_barriers_model(0);
   printf("metadata/delete %s failure sites: %lu\n",
          use_io ? "I/O" : "allocation", (unsigned long)count);
+}
+
+static void mutation_stream_faults(const char *path) {
+  size_t count = 0;
+  fixture_barriers_model(1);
+  for (int transform = 0; transform <= 3; transform += 3)
+    for (int operation = 0; operation < 2; ++operation)
+      for (int use_io = 0; use_io < 2; ++use_io) {
+        size_t total = mutation_fault_case(path, SIZE_MAX, operation, transform,
+                                           0, use_io, PS_MIB);
+        for (size_t n = 1; n <= total; ++n)
+          (void)mutation_fault_case(path, n, operation, transform, 0, use_io,
+                                    PS_MIB);
+        count += total;
+      }
+  fixture_barriers_model(0);
+  printf("canonical metadata/delete failure sites: %lu\n",
+         (unsigned long)count);
 }
 
 static void hint_checksum(unsigned char bytes[32]) {
@@ -7537,6 +7650,8 @@ static void *worker(void *context) {
     mutation_faults(r->path, 0);
   else if (!strcmp(r->mode, "mutation-io-faults"))
     mutation_faults(r->path, 1);
+  else if (!strcmp(r->mode, "mutation-stream-faults"))
+    mutation_stream_faults(r->path);
   else if (!strcmp(r->mode, "retention-hint"))
     retention_hint(r->path, r->directory);
   else if (!strcmp(r->mode, "mutation-concurrency"))
@@ -7663,12 +7778,19 @@ int main(int argc, char **argv) {
     mutation_metadata[i] = byte_at(i, 37);
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&crypto_key, &e), &e);
+  /* These cases recover a separate image captured at successful barriers. */
+  fixture_barriers_model(!strcmp(r.mode, "queue-enqueue-crash") ||
+                         !strcmp(r.mode, "durable-scope-crash") ||
+                         !strcmp(r.mode, "cold-append-crash") ||
+                         !strcmp(r.mode, "nosync-mutation-checkpoint"));
   if (!strcmp(r.mode, "queue-enqueue-crash"))
     queue_enqueue_crash(r.path);
   else if (!strcmp(r.mode, "durable-scope-crash"))
     durable_scope_crash(r.path);
   else if (!strcmp(r.mode, "cold-append-crash"))
     cold_append_crash(r.path);
+  else if (!strcmp(r.mode, "nosync-mutation-checkpoint"))
+    nosync_mutation_checkpoint(r.path);
   else if (!strcmp(r.mode, "staging-crash"))
     staging_crash(r.path);
   else if (!strcmp(r.mode, "staging-crash-matrix")) {
@@ -7683,6 +7805,7 @@ int main(int argc, char **argv) {
     REQUIRE(pthread_join(thread, NULL) == 0);
   }
   lc_pouch_crypto_key_string_free(crypto_key);
+  fixture_barriers_model(0);
   lc_error_cleanup(&e);
   lc_test_tmp_cleanup_path(directory, prefix);
   REQUIRE(access(directory, F_OK) != 0);

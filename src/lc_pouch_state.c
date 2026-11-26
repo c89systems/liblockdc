@@ -7048,6 +7048,7 @@ static int lc_pouch_state_append_binary_records_locked(
   int query_index_changed;
   enum lc_pouch_storage_append_mode storage_mode;
   lc_pouch_storage_batch storage_batch;
+  lc_pouch_storage_append storage_append = {0};
   void *metadata_plan;
   lc_pouch_record_io record_io;
 
@@ -7141,11 +7142,31 @@ static int lc_pouch_state_append_binary_records_locked(
                         NULL, "pouch");
     if (rc == LC_OK) {
       cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
-      rc = pouch->storage.ops->metadata->begin(
-          pouch->storage.context, cache->storage_namespace, storage_mode,
-          &storage_batch, record_size, &metadata_plan, error);
+      /* Keep ordinary NoSync changes with their canonical history. Leave
+       * staged decisions and protected lease completion in typed metadata. */
+      if (!pouch->durable_sync && !pouch->storage.coordinated_namespaces &&
+          cache->active_segment_id && item_count == 1 && items[0].key != NULL &&
+          !items[0].maintenance_completion &&
+          !lc_pouch_state_key_is_staged(items[0].key) &&
+          (items[0].record_type == LC_POUCH_STATE_RECORD_STATE_META ||
+           items[0].record_type == LC_POUCH_STATE_RECORD_STATE_DELETE ||
+           items[0].record_type == LC_POUCH_STATE_RECORD_OBJECT_DELETE)) {
+        rc = lc_pouch_state_storage_append_open(
+            pouch, cache, record_size, LC_POUCH_STORAGE_APPEND_METADATA,
+            &storage_batch, manifest, &storage_append, &segment_size, error);
+        /* The typed transaction can still discharge work without rotating or
+         * granting stream space. The append has published no record. */
+        if (rc == LC_ERR_PENDING || rc == LC_ERR_INVALID) {
+          lc_error_cleanup(error);
+          rc = LC_OK;
+        }
+      }
+      if (rc == LC_OK && !storage_append.handle)
+        rc = pouch->storage.ops->metadata->begin(
+            pouch->storage.context, cache->storage_namespace, storage_mode,
+            &storage_batch, record_size, &metadata_plan, error);
     }
-    if (rc == LC_OK) {
+    if (rc == LC_OK && metadata_plan) {
       lc_pouch_namespace_manifest_cleanup(&pouch->allocator, manifest);
       rc = lc_pouch_state_cache_manifest_borrow(pouch, cache, manifest, error);
     }
@@ -7287,9 +7308,12 @@ static int lc_pouch_state_append_binary_records_locked(
 binary_append_ready:
   if (rc == LC_OK) {
     append_started = 1;
-    if (pouch->storage.ops == NULL)
+    if (pouch->storage.ops == NULL || storage_append.handle) {
+      if (storage_append.handle)
+        record_io = storage_append.io;
       rc = lc_pouch_state_record_write_prefix_batch(record_io, items,
                                                     item_count, error);
+    }
   }
 #ifdef LOCKDC_TEST_BUILD
   if (rc == LC_OK && lc_pouch_test_after_metadata_batch_append_hook != NULL) {
@@ -7298,7 +7322,16 @@ binary_append_ready:
   }
 #endif
   if (rc == LC_OK) {
-    if (pouch->storage.ops != NULL) {
+    if (storage_append.handle) {
+      rc = lc_pouch_record_io_tail(storage_append.io, &appended_end, error);
+      if (rc == LC_OK)
+        rc = pouch->storage.ops->append_commit(
+            pouch->storage.context, &storage_append,
+            lc_pouch_state_storage_commit_mode(pouch), error);
+      if (rc == LC_OK)
+        lc_pouch_state_storage_append_publish(pouch, cache, manifest,
+                                              &storage_append, appended_end);
+    } else if (pouch->storage.ops != NULL) {
       lc_pouch_storage_metadata_result result = {0};
       if (item_count > 1U) {
         result.retired = lc_pouch_state_batch_retired;
@@ -7342,6 +7375,8 @@ binary_append_ready:
   }
   if (metadata_plan)
     pouch->storage.ops->metadata->close(pouch->storage.context, metadata_plan);
+  if (storage_append.handle)
+    pouch->storage.ops->append_close(pouch->storage.context, &storage_append);
   lc_free_with_allocator(&pouch->allocator, segment_path);
   return rc;
 }

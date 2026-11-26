@@ -3547,11 +3547,13 @@ typedef struct run {
 } run;
 static void *worker(void *p) {
   run *r = p;
-  /* These sweeps observe failed I/O and recovery after a same-host reopen. */
+  /* These sweeps restore their modeled durable bytes or reopen on this host. */
   fixture_barriers_model(!strcmp(r->mode, "recode-faults") ||
                          !strcmp(r->mode, "body-select-faults") ||
                          !strcmp(r->mode, "compound-recode-faults") ||
-                         !strcmp(r->mode, "conversion-faults"));
+                         !strcmp(r->mode, "conversion-faults") ||
+                         !strcmp(r->mode, "append-budget-faults") ||
+                         !strcmp(r->mode, "batch-faults"));
   if (!strcmp(r->mode, "lifecycle"))
     lifecycle(r->path, r->key);
   else if (!strcmp(r->mode, "faults"))

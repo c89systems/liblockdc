@@ -128,7 +128,9 @@ enum lc_pouch_storage_append_mode {
   /* A bounded pending record with a funded key prefix and codec ceiling. */
   LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX,
   /* Unknown remaining payload in one indivisible canonical frame. */
-  LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX
+  LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX,
+  /* A complete metadata record using ordinary space in the active segment. */
+  LC_POUCH_STORAGE_APPEND_METADATA
 };
 /* Known canonical prefixes, borrowed only during append admission. No producer
  * or payload I/O runs in this callback. Query/index values may change later;

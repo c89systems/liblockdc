@@ -1365,7 +1365,10 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   uint64_t span;
   ps_budget_plan checkpoint = {0};
   int rc, exact = 0, pressured, early = 0;
-  int complete = mode == PS_APPEND_COMPLETE || mode == PS_APPEND_MAINTENANCE;
+  int nosync;
+  int metadata = mode == PS_APPEND_METADATA;
+  int complete =
+      mode == PS_APPEND_COMPLETE || mode == PS_APPEND_MAINTENANCE || metadata;
   int framed = complete || mode == PS_APPEND_FRAMED_PREFIX;
   int maintenance =
       mode == PS_APPEND_MAINTENANCE || mode == PS_APPEND_MAINTENANCE_PREFIX;
@@ -1373,11 +1376,11 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     *out = NULL;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace append requires output");
-  if (mode < PS_APPEND_PREFIX || mode > PS_APPEND_FRAMED_PREFIX ||
+  if (mode < PS_APPEND_PREFIX || mode > PS_APPEND_METADATA ||
       (mode != PS_APPEND_PREFIX && !minimum) ||
       (batch &&
        (mode == PS_APPEND_PREFIX || mode == PS_APPEND_FRAMED_PREFIX)) ||
-      (mode == PS_APPEND_MAINTENANCE_PREFIX && !batch))
+      ((mode == PS_APPEND_MAINTENANCE_PREFIX || metadata) && !batch))
     return failure(
         e, LC_ERR_INVALID,
         "namespace complete append requires a positive span and valid mode");
@@ -1402,11 +1405,22 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     rc = ps_ns_finish_seal(d, e);
   pressured =
       !maintenance && ps_maintenance_pressure_requested(ns->root->space);
+  if (rc == LC_OK && metadata &&
+      (pressured || !d->active || (target && d->tail >= target)))
+    rc = failure(
+        e, LC_ERR_PENDING,
+        "canonical metadata needs ordinary space in the active segment");
   if (rc == LC_OK && pressured)
     rc = ps_ns_reclaim_before_append(d, e);
-  if (rc == LC_OK && ps_key_checkpoint_due(d->checkpoint)) {
+  nosync = ps_internal_exclusive_nosync(ns->root->space);
+  /* NoSync can retain funded changes until the existing byte limits.
+   * Repeated edits then replace the pending snapshot for the same key. */
+  if (rc == LC_OK && ps_key_checkpoint_due(d->checkpoint, !nosync)) {
     pthread_mutex_lock(&d->mutex);
-    rc = ps_key_checkpoint_flush(d->checkpoint, e);
+    if (nosync)
+      rc = ps_key_checkpoint_flush_deferred(d->checkpoint, e);
+    else
+      rc = ps_key_checkpoint_flush(d->checkpoint, e);
     pthread_mutex_unlock(&d->mutex);
   }
   selected = d->active;

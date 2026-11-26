@@ -868,7 +868,7 @@ static void checkpoint_owner(int durable) {
   ps_checkpoint_delta_close(replay);
   ps_key_checkpoint_info(checkpoint, &info);
   CHECK(info.slots == 130 && info.pending == 130 && !info.epoch);
-  CHECK(ps_key_checkpoint_due(checkpoint));
+  CHECK(ps_key_checkpoint_due(checkpoint, 1));
   observation.reject = 2;
   CHECK(ps_key_checkpoint_flush(checkpoint, &error) == LC_ERR_NOMEM);
   lc_error_cleanup(&error);

@@ -1055,10 +1055,16 @@ if(LOCKDC_BUILD_TESTS)
   set_tests_properties(pouch_space_pouch_read-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_pouch_lifetime-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_pouch_staging-faults PROPERTIES TIMEOUT 600)
-  add_test(NAME pouch_space_pouch_cold-append-crash
-    COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} cold-append-crash)
-  set_tests_properties(pouch_space_pouch_cold-append-crash PROPERTIES
-    TIMEOUT 60 LABELS "unit;local;pouch-space")
+  foreach(mode cold-append-crash nosync-mutation-checkpoint)
+    add_test(NAME pouch_space_pouch_${mode}
+      COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_pouch_${mode} PROPERTIES
+      TIMEOUT 60 LABELS "unit;local;pouch-space")
+  endforeach()
+  add_test(NAME pouch_space_pouch_mutation-stream-faults
+    COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} mutation-stream-faults)
+  set_tests_properties(pouch_space_pouch_mutation-stream-faults PROPERTIES
+    TIMEOUT 180 LABELS "unit;local;pouch-space")
   foreach(mode staging-active-faults staging-active-recovery-faults shared-admission shared-state-crash shared-state-delta append-hint metadata-hint)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space")
