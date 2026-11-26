@@ -85,6 +85,11 @@ typedef struct ps_stream_state {
   uint64_t catalog_refs, catalog_release, catalog_release_wire;
   size_t catalog_pins;
 } ps_stream_state;
+enum ps_run_identity_proof {
+  PS_RUN_IDENTITY_UNCHECKED,
+  PS_RUN_IDENTITY_VERIFIED,
+  PS_RUN_IDENTITY_INVALIDATED
+};
 typedef struct ps_owned_run_state {
   uint64_t capacity, mapped_end;
   struct ps_entry *owned_prev, *owned_next;
@@ -93,7 +98,7 @@ typedef struct ps_owned_run_state {
   uint16_t *range_rank;
   size_t range_count;
   int mapped, owned_linked;
-  int identity_checked; /* Resident dense identity proof, never serialized. */
+  enum ps_run_identity_proof identity_proof; /* Resident only. */
 } ps_owned_run_state;
 typedef struct ps_entry {
   ps_key key;

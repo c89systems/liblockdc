@@ -2925,7 +2925,8 @@ static int validate_owned_identity(ps_space *s, ps_entry *p,
       ps_wire_get64(header + 32) != p->extents[0].offset ||
       ps_wire_get64(header + 40) != p->bytes ||
       memcmp(header + 48, s->identity, 16)) {
-    __atomic_store_n(&p->stream.run->identity_checked, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&p->stream.run->identity_proof,
+                     PS_RUN_IDENTITY_INVALIDATED, __ATOMIC_RELEASE);
     return err(error, LC_ERR_PROTOCOL, "owned run identity header mismatch");
   }
   return LC_OK;
@@ -11029,8 +11030,8 @@ static int verify_run_mappings(const ps_owned_mapping *items, size_t count,
     /* An admitted writer has pinned these exact resident incarnations. The
      * dense identity header stays fixed while tail footers and data change.
      * Recovery and unadmitted captures still verify their physical headers. */
-    if (memo &&
-        __atomic_load_n(&p->stream.run->identity_checked, __ATOMIC_ACQUIRE))
+    if (memo && __atomic_load_n(&p->stream.run->identity_proof,
+                                __ATOMIC_ACQUIRE) == PS_RUN_IDENTITY_VERIFIED)
       continue;
     if (footers && !p->stream.run->mapped) {
       rc = transfer(s, header, sizeof(header), p->extents[0].offset, 0, error);
@@ -11041,8 +11042,14 @@ static int verify_run_mappings(const ps_owned_mapping *items, size_t count,
                sizeof(footers[i].bytes));
     } else
       rc = verify_owned(s, p, header, error);
-    if (memo && rc == LC_OK)
-      __atomic_store_n(&p->stream.run->identity_checked, 1, __ATOMIC_RELEASE);
+    if (memo && rc == LC_OK) {
+      enum ps_run_identity_proof prior = PS_RUN_IDENTITY_UNCHECKED;
+      /* A strict capture can detect damage after this capture read the
+       * header. Once invalidated, this incarnation always reads physically. */
+      (void)__atomic_compare_exchange_n(&p->stream.run->identity_proof, &prior,
+                                        PS_RUN_IDENTITY_VERIFIED, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
   }
   return rc;
 }

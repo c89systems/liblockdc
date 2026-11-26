@@ -7375,15 +7375,44 @@ static int tail_publish(void *context, uint64_t tail, lc_error *e) {
   return ps_flush(state->owner, e);
 }
 typedef struct owned_identity_reads {
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
   off_t offset;
   size_t count;
+  int pause, paused;
 } owned_identity_reads;
 static ssize_t read_owned_identity(void *context, int fd, void *bytes, size_t n,
                                    off_t offset) {
   owned_identity_reads *reads = context;
-  if (offset == reads->offset && n == PS_RUN_IDENTITY_BYTES)
+  ssize_t got = pread(fd, bytes, n, offset);
+  if (offset == reads->offset && n == PS_RUN_IDENTITY_BYTES) {
+    pthread_mutex_lock(&reads->mutex);
     ++reads->count;
-  return pread(fd, bytes, n, offset);
+    if (reads->pause && !reads->paused) {
+      reads->paused = 1;
+      pthread_cond_broadcast(&reads->changed);
+      while (reads->pause)
+        pthread_cond_wait(&reads->changed, &reads->mutex);
+    }
+    pthread_mutex_unlock(&reads->mutex);
+  }
+  return got;
+}
+typedef struct owned_identity_capture {
+  ps_space *space;
+  ps_ref ref;
+  ps_owned_head *view;
+  ps_owned_status info;
+  ps_owned_initial mappings;
+  lc_error error;
+  int rc;
+} owned_identity_capture;
+static void *capture_owned_identity(void *context) {
+  owned_identity_capture *capture = context;
+  capture->rc = ps_owned_open_guarded(
+      capture->space, NULL, tail_stream(), 0, &capture->ref, &capture->view,
+      &capture->info, &capture->mappings, &capture->error);
+  return NULL;
 }
 static void owned_stream_identity_cache(void) {
   lc_error e = {0};
@@ -7395,7 +7424,10 @@ static void owned_stream_identity_cache(void) {
   ps_owned_run *run = NULL;
   ps_owned_status info;
   ps_owned_initial captured;
+  pthread_t thread;
   int found;
+  REQUIRE(!pthread_mutex_init(&reads.mutex, NULL));
+  REQUIRE(!pthread_cond_init(&reads.changed, NULL));
   io.context = &reads;
   io.read = read_owned_identity;
   ok(ps_open(path, 1, &options, &a, &e), &e);
@@ -7415,19 +7447,50 @@ static void owned_stream_identity_cache(void) {
   ok(ps_flush(a, &e), &e);
   ok(ps_open(path, 0, &options, &b, &e), &e);
   reads.count = 0;
-  for (int pass = 0; pass < 3; ++pass) {
-    ok(ps_owned_open_guarded(pass == 2 ? b : a, NULL, tail_stream(), 0, &ref,
-                             &view, &info, &captured, &e),
+  for (int pass = 0; pass < 2; ++pass) {
+    ok(ps_owned_open_guarded(a, NULL, tail_stream(), 0, &ref, &view, &info,
+                             &captured, &e),
        &e);
     REQUIRE(info.admitted && info.tail == 3 && captured.count == 1 &&
-            reads.count == (pass == 2 ? 2U : 1U));
+            reads.count == 1);
     ps_owned_runs_close(captured.runs, captured.count);
     ps_owned_close(view);
   }
   unsigned char saved, invalid;
   REQUIRE(pread(a->fd, &saved, 1, reads.offset) == 1);
   invalid = (unsigned char)(saved ^ 1U);
+  /* A separate owner must read the header. Hold that valid read until a
+   * strict capture on the same owner has observed the damaged header. */
+  owned_identity_capture peer = {.space = b, .ref = ref};
+  reads.pause = 1;
+  REQUIRE(!pthread_create(&thread, NULL, capture_owned_identity, &peer));
+  pthread_mutex_lock(&reads.mutex);
+  while (!reads.paused)
+    pthread_cond_wait(&reads.changed, &reads.mutex);
+  REQUIRE(reads.count == 2);
+  pthread_mutex_unlock(&reads.mutex);
   REQUIRE(pwrite(a->fd, &invalid, 1, reads.offset) == 1);
+  REQUIRE(ps_owned_runs_key_status(b, tail_stream(), &ref, &info,
+                                   &captured.runs, &captured.count,
+                                   &e) == LC_ERR_PROTOCOL);
+  REQUIRE(!captured.runs && !captured.count);
+  lc_error_cleanup(&e);
+  pthread_mutex_lock(&reads.mutex);
+  reads.pause = 0;
+  pthread_cond_broadcast(&reads.changed);
+  pthread_mutex_unlock(&reads.mutex);
+  REQUIRE(!pthread_join(thread, NULL));
+  ok(peer.rc, &peer.error);
+  REQUIRE(peer.info.admitted && peer.info.tail == 3 &&
+          peer.mappings.count == 1);
+  ps_owned_runs_close(peer.mappings.runs, peer.mappings.count);
+  ps_owned_close(peer.view);
+  lc_error_cleanup(&peer.error);
+  REQUIRE(ps_owned_open_guarded(b, NULL, tail_stream(), 0, &ref, &view, &info,
+                                &captured, &e) == LC_ERR_PROTOCOL);
+  REQUIRE(!view && !captured.runs && !captured.count);
+  lc_error_cleanup(&e);
+
   REQUIRE(ps_owned_runs_capture(owner, &captured.runs, &captured.count, &e) ==
           LC_ERR_PROTOCOL);
   REQUIRE(!captured.runs && !captured.count);
@@ -7437,10 +7500,21 @@ static void owned_stream_identity_cache(void) {
   REQUIRE(!view && !captured.runs && !captured.count);
   lc_error_cleanup(&e);
   REQUIRE(pwrite(a->fd, &saved, 1, reads.offset) == 1);
+  size_t restored_reads = reads.count;
+  for (size_t pass = 1; pass <= 2; ++pass) {
+    ok(ps_owned_open_guarded(b, NULL, tail_stream(), 0, &ref, &view, &info,
+                             &captured, &e),
+       &e);
+    REQUIRE(captured.count == 1 && reads.count == restored_reads + pass);
+    ps_owned_runs_close(captured.runs, captured.count);
+    ps_owned_close(view);
+  }
   ps_owned_run_close(run);
   ps_owned_close(owner);
   ok(ps_close(b, &e), &e);
   ok(ps_close(a, &e), &e);
+  REQUIRE(!pthread_cond_destroy(&reads.changed));
+  REQUIRE(!pthread_mutex_destroy(&reads.mutex));
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 static void owned_stream_readiness(void) {
