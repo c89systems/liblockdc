@@ -1417,10 +1417,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
    * Repeated edits then replace the pending snapshot for the same key. */
   if (rc == LC_OK && ps_key_checkpoint_due(d->checkpoint, !nosync)) {
     pthread_mutex_lock(&d->mutex);
-    if (nosync)
-      rc = ps_key_checkpoint_flush_deferred(d->checkpoint, e);
-    else
-      rc = ps_key_checkpoint_flush(d->checkpoint, e);
+    rc = ps_key_checkpoint_flush(d->checkpoint, e);
     pthread_mutex_unlock(&d->mutex);
   }
   selected = d->active;

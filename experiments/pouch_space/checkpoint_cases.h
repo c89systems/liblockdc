@@ -1150,7 +1150,7 @@ static void checkpoint_namespace(int durable, int shared) {
   char name[32];
   char leaf[40];
   unsigned char metadata[PS_PAGE - 512];
-  size_t i;
+  size_t i, pending = durable || shared ? 6 : 70;
   int current;
   clean();
   options.storage.initial_capacity = PS_DEFAULT_CAPACITY;
@@ -1163,14 +1163,15 @@ static void checkpoint_namespace(int durable, int shared) {
     checkpoint_put(root, ns, name, i + 1, 1, i + 1, 1, 0);
   }
   OK(ps_namespace_status_get(ns, &status, &error));
-  CHECK(status.checkpoint_epoch && status.checkpoint_keys == 70 &&
-        status.pending_keys == 6 && status.covered_offset < status.tail);
+  CHECK((status.checkpoint_epoch != 0) == (durable || shared) &&
+        status.checkpoint_keys == 70 && status.pending_keys == pending &&
+        status.covered_offset < status.tail);
   OK(ps_namespace_view_open(ns, &view, &error));
   OK(ps_namespace_view_visit(view, 1, checkpoint_visit, &seen, &error));
   CHECK(seen.count == 70 && seen.maximum == 70 && seen.first_version == 1);
   checkpoint_put(root, ns, "aborted", 71, 1, 71, 0, 0);
   OK(ps_namespace_status_get(ns, &status, &error));
-  CHECK(status.checkpoint_keys == 70 && status.pending_keys == 6);
+  CHECK(status.checkpoint_keys == 70 && status.pending_keys == pending);
   memset(metadata, 0x7c, sizeof(metadata));
   checkpoint_put_with_metadata(root, ns, "lease/0", 71, 2, 1, 1, 1,
                                shared ? metadata : NULL,
@@ -1618,6 +1619,7 @@ static void checkpoint_history(int durable) {
   lc_allocator allocator = {0};
   lc_pouch_state_entry request = {0}, result = {0};
   checkpoint_history_input input = {0};
+  uint64_t selected, persisted;
   clean();
   options.storage.initial_capacity = PS_DEFAULT_CAPACITY;
   options.storage.durable_sync = durable;
@@ -1652,6 +1654,8 @@ static void checkpoint_history(int durable) {
   OK(ps_namespace_status_get(ns, &after, &error));
   CHECK(after.checkpoint_epoch && !after.pending_keys &&
         after.checkpoint_keys == 1 && after.covered_offset == before.tail);
+  OK(ps_publication_prefix(ps_root_space(root), &selected, &persisted, &error));
+  CHECK(selected == persisted);
   ps_namespace_append_close(append);
   ps_namespace_release(ns);
   OK(ps_root_close(root, &error));

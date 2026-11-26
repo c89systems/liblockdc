@@ -2810,7 +2810,7 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
   ps_ref control_ref, slot_ref;
   uint64_t prefix;
   size_t count, ordinary, i, outputs;
-  int rc = LC_OK, final;
+  int rc = LC_OK, final, stabilize_history;
   if (!c)
     return failure(e, LC_ERR_INVALID,
                    "checkpoint flush requires namespace owner");
@@ -2825,8 +2825,13 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
     return LC_OK;
   }
   observer = c->observer;
+  stabilize_history = force_durable && c->uncovered_bytes != 0;
   rc = fund(c, &c->claim, e);
   pthread_mutex_unlock(&c->mutex);
+  /* A standalone checkpoint revision can survive a failed write. Persist
+   * its covered history and referenced bodies before it replaces any slots. */
+  if (rc == LC_OK && stabilize_history)
+    rc = ps_flush(c->ns->root->space, e);
   if (rc == LC_OK)
     rc = ps_catalog_allocate_id(c->ns->root->space, &epoch, e);
   while (rc == LC_OK && c->changed) {

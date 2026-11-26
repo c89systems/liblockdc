@@ -116,6 +116,9 @@ Cleanup-only and forced maintenance reclaim them after retiring that
 checkpoint and releasing any readers. A cleanup with no payload retirement
 can leave durable inline records and tombstones in the journal. Capacity
 admission and journal rollover can checkpoint the prefix earlier.
+Standalone namespace checkpoints persist their canonical history before
+publishing replacement key snapshots. This also applies when an exclusive
+NoSync namespace reaches its pending metadata or replay byte limit.
 
 A selected namespace key checkpoint makes metadata-only work discoverable by
 maintenance. The first namespace index publication can include a maintenance
