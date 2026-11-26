@@ -491,6 +491,69 @@ static size_t failing_source(lc_source *source, void *bytes, size_t capacity,
   return size;
 }
 
+typedef struct plain_source {
+  fixture *output;
+  size_t offset;
+} plain_source;
+
+static size_t read_plain(lc_source *source, void *bytes, size_t capacity,
+                         lc_error *error) {
+  plain_source *input = source->impl;
+  fixture *f = input->output;
+  size_t size = BODY - input->offset;
+  (void)error;
+  assert_int_equal(f->sink_calls, f->source_calls);
+  ++f->source_calls;
+  if (size > sizeof(f->chunk))
+    size = sizeof(f->chunk);
+  if (size > capacity)
+    size = capacity;
+  memcpy(bytes, f->body + input->offset, size);
+  input->offset += size;
+  return size;
+}
+
+static void test_plain_pull_writes_before_reading_again(void **state) {
+  fixture *f = *state;
+  lc_pouch_crypto_open_options opts = {0};
+  plain_source input = {f, 0};
+  lc_source source = {0};
+  size_t base;
+  lc_pouch_crypto_close(f->crypto);
+  opts.compression_enabled = 1;
+  assert_int_equal(
+      lc_pouch_crypto_open(&f->allocator, &opts, &f->crypto, NULL, &f->error),
+      LC_OK);
+  base = f->live;
+  source.read = read_plain;
+  source.impl = &input;
+  assert_int_equal(lc_pouch_crypto_stream_to_sink(
+                       f->crypto, CONTEXT, &f->sink, &source, &f->plain,
+                       &f->stored, &f->crc, &f->descriptor, 0, &f->error),
+                   LC_OK);
+  assert_int_equal(f->plain, BODY);
+  assert_int_equal(f->stored, BODY);
+  assert_int_equal(f->crc, crc32(0UL, f->body, BODY));
+  assert_null(f->descriptor);
+  assert_int_equal(f->live, base);
+  assert_true(f->peak - base < FRAME);
+  assert_int_equal(verify_body(f, BODY), LC_OK);
+
+  reset_output(f);
+  input.offset = f->source_calls = 0;
+  f->reject_call = 2;
+  f->partial = 7;
+  assert_int_equal(lc_pouch_crypto_stream_to_sink(
+                       f->crypto, CONTEXT, &f->sink, &source, &f->plain,
+                       &f->stored, &f->crc, &f->descriptor, 0, &f->error),
+                   LC_ERR_TRANSPORT);
+  assert_int_equal(f->source_calls, 2);
+  assert_int_equal(f->sink_calls, 2);
+  assert_int_equal(f->plain | f->stored | f->crc, 0);
+  assert_null(f->descriptor);
+  assert_int_equal(f->live, base);
+}
+
 static void test_source_and_fd_failures_release_scratch(void **state) {
   fixture *f = *state;
   lc_source source;
@@ -783,6 +846,8 @@ int main(void) {
           test_open_failures_wipe_and_release_scratch, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_source_and_fd_failures_release_scratch, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_plain_pull_writes_before_reading_again, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_restartable_units_are_independent_without_allocations, setup,
           teardown),

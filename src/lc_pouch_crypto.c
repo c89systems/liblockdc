@@ -2053,26 +2053,22 @@ static int lc_pouch_crypto_encrypt_frame(
   return rc;
 }
 
-static int lc_pouch_crypto_stream_plain_to_fd(const lc_allocator *allocator,
-                                              int fd, lc_source *body,
-                                              uint64_t *plain_bytes,
-                                              uint64_t *cipher_bytes,
-                                              unsigned long *stored_crc,
-                                              lc_error *error) {
+static int lc_pouch_crypto_stream_plain(const lc_allocator *allocator, int fd,
+                                        lc_sink *sink, lc_source *body,
+                                        uint64_t *plain_bytes,
+                                        uint64_t *cipher_bytes,
+                                        unsigned long *stored_crc,
+                                        lc_error *error) {
+  /* A borrowed sink consumes each chunk before returning. It needs no codec
+   * frame buffer and can coalesce its own writes. Keep the fd cadence. */
+  const size_t capacity = sink ? 16384U : LC_POUCH_FRAME_PLAINTEXT_BYTES;
   unsigned char *buffer;
   uint64_t total;
   int rc;
 
-  if (fd < 0 || body == NULL || plain_bytes == NULL || cipher_bytes == NULL) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch plaintext stream write requires fd, body, and "
-                        "byte outputs",
-                        NULL, NULL, "pouch");
-  }
   /* Source callbacks may run on small pthread stacks. Keep this bounded
    * streaming scratch outside that stack while preserving direct flow. */
-  buffer = (unsigned char *)lc_alloc_with_allocator(
-      allocator, LC_POUCH_FRAME_PLAINTEXT_BYTES);
+  buffer = lc_alloc_with_allocator(allocator, capacity);
   if (buffer == NULL) {
     return lc_error_set(error, LC_ERR_NOMEM, 0L,
                         "failed to allocate pouch streaming buffer", NULL, NULL,
@@ -2083,11 +2079,17 @@ static int lc_pouch_crypto_stream_plain_to_fd(const lc_allocator *allocator,
   for (;;) {
     size_t got;
 
-    got = body->read(body, buffer, LC_POUCH_FRAME_PLAINTEXT_BYTES, error);
-    if (got == 0U) {
-      if (error != NULL && error->code != LC_OK) {
-        rc = error->code;
-      }
+    got = body->read(body, buffer, capacity, error);
+    if (error != NULL && error->code != LC_OK) {
+      rc = error->code;
+      break;
+    }
+    if (got == 0U)
+      break;
+    if (got > capacity) {
+      rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch source exceeded requested chunk size", NULL,
+                        NULL, "pouch");
       break;
     }
     rc = lc_pouch_crypto_check_byte_counter(
@@ -2095,7 +2097,10 @@ static int lc_pouch_crypto_stream_plain_to_fd(const lc_allocator *allocator,
     if (rc != LC_OK) {
       break;
     }
-    rc = lc_pouch_crypto_write_all_fd(fd, buffer, got, error);
+    rc = sink == NULL ? lc_pouch_crypto_write_all_fd(fd, buffer, got, error)
+         : sink->write(sink, buffer, got, error) ? LC_OK
+         : error != NULL && error->code != LC_OK ? error->code
+                                                 : LC_ERR_TRANSPORT;
     if (rc != LC_OK) {
       break;
     }
@@ -2104,7 +2109,7 @@ static int lc_pouch_crypto_stream_plain_to_fd(const lc_allocator *allocator,
     }
     total += (uint64_t)got;
   }
-  OPENSSL_cleanse(buffer, LC_POUCH_FRAME_PLAINTEXT_BYTES);
+  OPENSSL_cleanse(buffer, capacity);
   lc_free_with_allocator(allocator, buffer);
   if (rc == LC_OK) {
     *plain_bytes = total;
@@ -2964,8 +2969,8 @@ static int lc_pouch_crypto_stream_to_fd_crc_impl(
   if (crypto == NULL ||
       (!crypto->encryption_enabled &&
        (!allow_compression || !crypto->compression_enabled))) {
-    return lc_pouch_crypto_stream_plain_to_fd(
-        crypto != NULL ? &crypto->allocator : NULL, fd, body, plain_bytes,
+    return lc_pouch_crypto_stream_plain(
+        crypto != NULL ? &crypto->allocator : NULL, fd, NULL, body, plain_bytes,
         cipher_bytes, stored_crc, error);
   }
   producer.source = body;
@@ -3005,6 +3010,17 @@ int lc_pouch_crypto_stream_to_sink(lc_pouch_crypto *crypto, const char *context,
                         NULL, NULL, "pouch");
   *plain_bytes = *stored_bytes = 0U;
   *stored_crc = 0UL;
+  if (crypto == NULL ||
+      (!crypto->encryption_enabled &&
+       (!allow_compression || !crypto->compression_enabled))) {
+    unsigned long crc = 0UL;
+    rc = lc_pouch_crypto_stream_plain(
+        crypto != NULL ? &crypto->allocator : NULL, -1, sink, body, plain_bytes,
+        stored_bytes, &crc, error);
+    if (rc == LC_OK)
+      *stored_crc = crc;
+    return rc;
+  }
   producer.source = body;
   producer.allocator = crypto != NULL ? &crypto->allocator : NULL;
   rc = lc_pouch_crypto_writer_open_output(crypto, context, -1, sink,
