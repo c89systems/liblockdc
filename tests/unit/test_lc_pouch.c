@@ -30947,15 +30947,26 @@ static void test_query_keys_scan_uses_liblql_and_query_hidden(void **state) {
   lc_query_req_init(&query_req);
   query_req.ns = "docs/query";
   query_req.engine = "scan";
-  query_req.limit = 10L;
+  query_req.limit = 2L;
   rc = client->query_keys(client, &query_req, &handler, &keys_page, &query_res,
                           &error);
   assert_int_equal(rc, LC_OK);
-  assert_int_equal(keys_page.count, 4);
-  assert_true(pouch_query_capture_has(&keys_page, "doc/0"));
-  assert_true(pouch_query_capture_has(&keys_page, "doc/a"));
-  assert_true(pouch_query_capture_has(&keys_page, "doc/b"));
-  assert_true(pouch_query_capture_has(&keys_page, "doc/c"));
+  assert_int_equal(keys_page.count, 2U);
+  assert_string_equal(keys_page.keys[0], "doc/0");
+  assert_string_equal(keys_page.keys[1], "doc/a");
+  assert_non_null(query_res.cursor);
+  assert_string_equal(query_res.cursor, "doc/a");
+  snprintf(cursor, sizeof(cursor), "%s", query_res.cursor);
+  lc_query_res_cleanup(&query_res);
+
+  memset(&keys_page, 0, sizeof(keys_page));
+  query_req.cursor = cursor;
+  rc = client->query_keys(client, &query_req, &handler, &keys_page, &query_res,
+                          &error);
+  assert_int_equal(rc, LC_OK);
+  assert_int_equal(keys_page.count, 2U);
+  assert_string_equal(keys_page.keys[0], "doc/b");
+  assert_string_equal(keys_page.keys[1], "doc/c");
   assert_null(query_res.cursor);
   lc_query_res_cleanup(&query_res);
 
