@@ -1289,6 +1289,21 @@ int ps_namespace_projection(ps_namespace *ns,
   }
   return rc;
 }
+int ps_namespace_query_sequence(ps_namespace *ns, lc_pouch_generation *out) {
+  ps_space *space = ns->root->space;
+  struct ps_namespace_data *d = __atomic_load_n(&ns->data, __ATOMIC_ACQUIRE);
+  int current = 0;
+  if (!d || space->readiness)
+    return 0;
+  pthread_mutex_lock(&d->mutex);
+  /* Startup already replayed this exact tail with exclusive authority. A
+   * newer logical mutation requires the ordinary projection path. */
+  if (d->checkpoint_ready)
+    current = ps_key_checkpoint_query_sequence(d->checkpoint, d->active,
+                                               d->tail, out);
+  pthread_mutex_unlock(&d->mutex);
+  return current;
+}
 int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
                             lc_error *e) {
   struct ps_namespace_data *d;
@@ -2250,6 +2265,8 @@ int ps_namespace_recover_on_open(ps_namespace *ns, lc_error *e) {
     rc = ps_internal_certify_tail(ns->root->space, s->binding.stream,
                                   &s->binding.target, d->tail, e);
   }
+  if (rc == LC_OK && !ns->root->space->readiness)
+    ps_key_checkpoint_note_recovered(d->checkpoint);
   ps_ns_leave(d);
   if (rc == LC_OK && !d->active && !d->count && !coverage.epoch &&
       !ps_namespace_data_budgets(d)) {

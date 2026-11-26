@@ -82,6 +82,7 @@ struct ps_key_checkpoint {
   uint64_t latest_segment, latest_offset, state_index, query_index;
   uint64_t body_epoch;
   uint64_t logical_epoch;
+  uint64_t recovered_logical_epoch; /* Observed epoch plus one, or zero. */
   ps_checkpoint_info selected;
   ps_budget *budget;
   ps_budget_plan claim;
@@ -1297,6 +1298,24 @@ void ps_key_checkpoint_info(ps_key_checkpoint *c, ps_checkpoint_info *out) {
   out->pending = c->dirty_count;
   out->pending_bytes = c->dirty_bytes;
   pthread_mutex_unlock(&c->mutex);
+}
+void ps_key_checkpoint_note_recovered(ps_key_checkpoint *c) {
+  pthread_mutex_lock(&c->mutex);
+  if (c->logical_epoch < LC_U64_MAX)
+    c->recovered_logical_epoch = c->logical_epoch + 1;
+  pthread_mutex_unlock(&c->mutex);
+}
+int ps_key_checkpoint_query_sequence(ps_key_checkpoint *c, uint64_t segment,
+                                     uint64_t tail, lc_pouch_generation *out) {
+  int current;
+  pthread_mutex_lock(&c->mutex);
+  current = c->logical_epoch < LC_U64_MAX &&
+            c->recovered_logical_epoch == c->logical_epoch + 1 &&
+            c->latest_segment == segment && c->latest_offset == tail;
+  if (current)
+    *out = c->query_index;
+  pthread_mutex_unlock(&c->mutex);
+  return current;
 }
 uint64_t ps_key_checkpoint_source_refs(ps_key_checkpoint *c, unsigned int kind,
                                        uint64_t id) {

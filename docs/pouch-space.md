@@ -115,6 +115,9 @@ A selected namespace key checkpoint makes metadata-only work discoverable by
 maintenance. The first namespace index publication can include a maintenance
 hint in the same durability barrier as its generation, manifest, and
 completed canonical prefix.
+An exclusive namespace can answer an index freshness check from the
+watermark recovered at open while its logical epoch and tail match. Queries
+that need canonical keys still populate the state projection.
 Exclusive NoSync foreground appends frame a successor binding and maintenance
 hint before the route can select that segment. The route makes the hint
 discoverable to live maintenance. The next canonical durability barrier

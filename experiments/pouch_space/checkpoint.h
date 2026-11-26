@@ -33,6 +33,11 @@ size_t ps_key_checkpoint_budgets(const ps_key_checkpoint *);
 int ps_key_checkpoint_observe(ps_key_checkpoint *,
                               const ps_checkpoint_observer *, lc_error *);
 void ps_key_checkpoint_info(ps_key_checkpoint *, ps_checkpoint_info *);
+/* Opening replay owns the selected canonical view. The first logical
+ * mutation invalidates this observation independently of physical work. */
+void ps_key_checkpoint_note_recovered(ps_key_checkpoint *);
+int ps_key_checkpoint_query_sequence(ps_key_checkpoint *, uint64_t segment,
+                                     uint64_t tail, lc_pouch_generation *);
 int ps_key_checkpoint_present(ps_space *, uint64_t owner, int *, lc_error *);
 /* Installs checkpoint and future-deletion admission before the producer.
  * maintenance permits mandatory completion while the standing floor is in use;

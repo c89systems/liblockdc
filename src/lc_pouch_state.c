@@ -10703,8 +10703,9 @@ int lc_pouch_state_snapshot_visit(const lc_pouch_state_snapshot *snapshot,
 /* Called under the existing namespace projection authority. Failed replay is
  * never admitted as a partially initialized projection. No filesystem path is
  * manufactured for a typed storage namespace. */
-static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
-                                          lc_error *error) {
+static int lc_pouch_state_storage_prepare_query(lc_pouch *pouch, const char *ns,
+                                                lc_pouch_generation *query,
+                                                lc_error *error) {
   lc_pouch_state_namespace_lock *scope = NULL;
   lc_pouch_namespace_logstore *cache;
   lc_pouch_storage_namespace_info info;
@@ -10725,13 +10726,18 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
   if (cache == NULL)
     return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
   if (cache->initialized && (scope == NULL || scope->projection_current))
-    return LC_OK;
+    goto ready;
   if (cache->storage_namespace == NULL) {
     rc = pouch->storage.ops->namespace_open(pouch->storage.context, ns, 1,
                                             &cache->storage_namespace, error);
     if (rc != LC_OK)
       return rc;
   }
+  if (query && !pouch->storage.coordinated_namespaces &&
+      pouch->storage.ops->namespace_query_sequence &&
+      pouch->storage.ops->namespace_query_sequence(cache->storage_namespace,
+                                                   query))
+    return LC_OK;
   if (scope != NULL) {
     /* Native metadata can select a new checkpoint without advancing the
      * append tail. Its epoch and the physical route jointly certify reuse. */
@@ -10744,7 +10750,7 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
         cache->storage_checkpoint_epoch == info.checkpoint_epoch) {
       if (cache->active_segment_offset == info.tail) {
         scope->projection_current = 1;
-        return LC_OK;
+        goto ready;
       }
       extend = info.active_incarnation &&
                cache->active_segment_offset < info.tail &&
@@ -10805,7 +10811,15 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
   /* A borrowed record remains valid until its logical scope ends. */
   if (scope != NULL)
     scope->projection_current = 1;
+ready:
+  if (query)
+    *query = cache->max_query_index_seq;
   return LC_OK;
+}
+
+static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
+                                          lc_error *error) {
+  return lc_pouch_state_storage_prepare_query(pouch, ns, NULL, error);
 }
 
 /* The caller holds namespace projection authority. The resident fields remain
@@ -19800,11 +19814,11 @@ static int lc_pouch_state_storage_sequences(lc_pouch *pouch, const char *ns,
   int rc = lc_pouch_state_cache_guard_lock(pouch, ns, &guard, error);
   if (rc != LC_OK)
     return rc;
-  rc = lc_pouch_state_storage_prepare(pouch, ns, error);
-  if (rc == LC_OK) {
+  rc = lc_pouch_state_storage_prepare_query(pouch, ns, index ? NULL : query,
+                                            error);
+  if (rc == LC_OK && index) {
     cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
-    if (index)
-      *index = cache->max_version;
+    *index = cache->max_version;
     if (query)
       *query = cache->max_query_index_seq;
   }

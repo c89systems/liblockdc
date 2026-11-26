@@ -52,6 +52,7 @@ int ps_namespace_status_get(ps_namespace *, ps_namespace_status *, lc_error *);
 int ps_namespace_projection(ps_namespace *,
                             struct lc_pouch_storage_namespace_info *,
                             lc_error *);
+int ps_namespace_query_sequence(ps_namespace *, lc_pouch_generation *);
 struct ps_checkpoint_observer;
 int ps_namespace_checkpoint_observe(ps_namespace *,
                                     const struct ps_checkpoint_observer *,

@@ -318,6 +318,11 @@ typedef struct lc_pouch_storage_ops {
                               enum lc_pouch_namespace_lock_policy, void **,
                               lc_error *);
   void (*namespace_state_unlock)(void *, void *);
+  /* Optional in-memory query watermark for an exclusive namespace whose
+   * admitted recovery projection still covers the current canonical tail.
+   * Return nonzero only when the sequence is known, under the caller's
+   * namespace projection authority. */
+  int (*namespace_query_sequence)(void *, lc_pouch_generation *);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
   const lc_pouch_storage_ops *ops;

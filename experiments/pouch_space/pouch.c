@@ -133,6 +133,9 @@ static int namespace_info(void *context, void *ns,
   (void)context;
   return ps_namespace_projection(ns, out, e);
 }
+static int namespace_query_sequence(void *ns, lc_pouch_generation *out) {
+  return ps_namespace_query_sequence(ns, out);
+}
 static int namespace_state_lock(void *context, const char *name,
                                 enum lc_pouch_namespace_lock_policy policy,
                                 void **out, lc_error *e) {
@@ -905,7 +908,8 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  query_indexes,
                                                  &metadata_ops,
                                                  namespace_state_lock,
-                                                 namespace_state_unlock};
+                                                 namespace_state_unlock,
+                                                 namespace_query_sequence};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;

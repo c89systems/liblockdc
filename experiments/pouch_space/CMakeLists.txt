@@ -1008,7 +1008,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_pouch_test)
-  foreach(mode lifecycle body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash queue-enqueue-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-close maintenance-capacity-schedule maintenance-checksums maintenance-append-pressure maintenance-checkpoint-batch shared-state)
+  foreach(mode lifecycle body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash queue-enqueue-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-close maintenance-capacity-schedule maintenance-checksums maintenance-append-pressure maintenance-checkpoint-batch shared-state)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space")
@@ -1019,6 +1019,13 @@ if(LOCKDC_BUILD_TESTS)
         COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} lifetimes ${codec} ${multifile})
       set_tests_properties(pouch_space_pouch_lifetimes_${codec}_${multifile} PROPERTIES
         TIMEOUT 180 COST 20 LABELS "unit;local;pouch-space")
+      foreach(sync RANGE 0 1)
+        set(name pouch_space_pouch_sequence-recovery_${codec}_${multifile}_${sync})
+        add_test(NAME ${name}
+          COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} sequence-recovery ${codec} ${multifile} ${sync})
+        set_tests_properties(${name} PROPERTIES
+          TIMEOUT 180 COST 10 LABELS "unit;local;pouch-space")
+      endforeach()
     endforeach()
   endforeach()
   foreach(codec 0 3)

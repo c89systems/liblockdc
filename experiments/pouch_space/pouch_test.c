@@ -3671,20 +3671,28 @@ static void sequence_recovery_compact(lc_pouch *p, const char *ns,
     REQUIRE(r.snapshot && !r.skipped);
   }
 }
-static void sequence_recovery(const char *path, const char *directory) {
+static void sequence_recovery(const char *path, const char *directory,
+                              int backend, int codec, int durable) {
   lc_error e;
   lc_error_init(&e);
-  for (int multifile = 0; multifile < 2; ++multifile)
-    for (int crypto = 0; crypto < 4; ++crypto)
-      for (int sync = 0; sync < 2; ++sync)
+  for (int multifile = backend < 0 ? 0 : backend;
+       multifile <= (backend < 0 ? 1 : backend); ++multifile)
+    for (int crypto = codec < 0 ? 0 : codec; crypto <= (codec < 0 ? 3 : codec);
+         ++crypto)
+      for (int sync = durable < 0 ? 0 : durable;
+           sync <= (durable < 0 ? 1 : durable); ++sync)
         for (int object = 0; object < 2; ++object)
           for (int compact = 0; compact < 3; ++compact) {
             ps_pouch_state_options o = options(crypto, sync);
+            io_fault trace = {0};
+            ps_io io = {&trace, io_read, io_write, io_sync, io_reserve, NULL};
             lc_pouch *p = NULL;
             char native[1400];
             o.logical.background_compaction_enabled_set = 1;
             o.logical.background_compaction_enabled = 0;
             o.logical.segment_target_bytes = 1;
+            if (!multifile && !crypto && !sync && !object && !compact)
+              o.io = &io;
             REQUIRE(snprintf(native, sizeof(native), "%s/native-%d-%d-%d-%d",
                              directory, crypto, sync, object,
                              compact) < (int)sizeof(native));
@@ -3725,9 +3733,12 @@ static void sequence_recovery(const char *path, const char *directory) {
               if (reopened) {
                 /* Independently exercise query as the first cold operation;
                  * the first reopening above starts with index instead. */
+                size_t read_bytes = trace.read_bytes;
                 seq = 99;
                 ok(lc_pouch_state_query_index_seq(p, "sequence", &seq, &e), &e);
                 REQUIRE(seq == (object ? 0 : 1));
+                if (o.io)
+                  REQUIRE(trace.read_bytes == read_bytes);
               }
               sequence_recovery_check(p, object, &e);
               if (compact == 2 && !reopened) {
@@ -3744,6 +3755,8 @@ static void sequence_recovery(const char *path, const char *directory) {
             ok(put(p, "sequence", "next", &in, NULL, &r, &e), &e);
             REQUIRE(r.version == 1 && r.index_seq == 3);
             lc_pouch_state_write_result_cleanup(&allocator, &r);
+            ok(lc_pouch_state_query_index_seq(p, "sequence", &seq, &e), &e);
+            REQUIRE(seq == 3);
             read_value(p, "sequence", "key", 31, 61, 3, &e);
             read_value(p, "sequence", "next", 17, 63, 1, &e);
             lc_pouch_close(p);
@@ -7480,7 +7493,7 @@ static void shared_state_crash(const char *path) {
 }
 typedef struct run {
   const char *path, *directory, *mode;
-  int codec, profile;
+  int codec, profile, durable;
 } run;
 static void *worker(void *context) {
   run *r = context;
@@ -7552,7 +7565,7 @@ static void *worker(void *context) {
   else if (!strcmp(r->mode, "projection-concurrency"))
     projection_concurrency(r->path, r->directory);
   else if (!strcmp(r->mode, "sequence-recovery"))
-    sequence_recovery(r->path, r->directory);
+    sequence_recovery(r->path, r->directory, r->profile, r->codec, r->durable);
   else if (!strcmp(r->mode, "lifetimes"))
     lifetimes(r->path, r->directory, r->profile, r->codec);
   else if (!strcmp(r->mode, "lifetime-faults"))
@@ -7627,12 +7640,21 @@ int main(int argc, char **argv) {
   r.path = path;
   r.directory = directory;
   r.mode = argv[2];
-  if (!strcmp(r.mode, "lifetimes") || !strcmp(r.mode, "maintenance-tail")) {
-    REQUIRE(argc == 5 && strlen(argv[3]) == 1 && argv[3][0] >= '0' &&
-            argv[3][0] <= '3' && strlen(argv[4]) == 1 && argv[4][0] >= '0' &&
-            argv[4][0] <= '1');
+  if (!strcmp(r.mode, "sequence-recovery") && argc == 3)
+    r.codec = r.profile = r.durable = -1;
+  else if (!strcmp(r.mode, "lifetimes") ||
+           !strcmp(r.mode, "maintenance-tail") ||
+           !strcmp(r.mode, "sequence-recovery")) {
+    int sequence = !strcmp(r.mode, "sequence-recovery");
+    REQUIRE(argc == (sequence ? 6 : 5) && strlen(argv[3]) == 1 &&
+            argv[3][0] >= '0' && argv[3][0] <= '3' && strlen(argv[4]) == 1 &&
+            argv[4][0] >= '0' && argv[4][0] <= '1');
     r.codec = argv[3][0] - '0';
     r.profile = argv[4][0] - '0';
+    if (sequence) {
+      REQUIRE(strlen(argv[5]) == 1 && argv[5][0] >= '0' && argv[5][0] <= '1');
+      r.durable = argv[5][0] - '0';
+    }
     if (!strcmp(r.mode, "maintenance-tail"))
       REQUIRE(r.codec == 0 || r.codec == 3);
   } else if (strcmp(r.mode, "staging-crash-matrix"))
