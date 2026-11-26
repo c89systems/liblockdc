@@ -2924,8 +2924,10 @@ static int validate_owned_identity(ps_space *s, ps_entry *p,
       ps_wire_get64(header + 24) != p->key.key ||
       ps_wire_get64(header + 32) != p->extents[0].offset ||
       ps_wire_get64(header + 40) != p->bytes ||
-      memcmp(header + 48, s->identity, 16))
+      memcmp(header + 48, s->identity, 16)) {
+    __atomic_store_n(&p->stream.run->identity_checked, 0, __ATOMIC_RELEASE);
     return err(error, LC_ERR_PROTOCOL, "owned run identity header mismatch");
+  }
   return LC_OK;
 }
 static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
@@ -10148,6 +10150,8 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   return owned_open(s, budget, key, create, ref, 0, 0, 0, out, status, NULL,
                     error);
 }
+static int verify_run_mappings(const ps_owned_mapping *, size_t,
+                               ps_owned_footer *, int, lc_error *);
 int ps_owned_open_guarded(ps_space *s, ps_budget *budget, ps_key key,
                           int create, const ps_ref *ref, ps_owned_head **out,
                           ps_owned_status *status, ps_owned_initial *capture,
@@ -10158,7 +10162,8 @@ int ps_owned_open_guarded(ps_space *s, ps_budget *budget, ps_key key,
   rc = owned_open(s, budget, key, create, ref, 1, 0, 0, out, status, capture,
                   error);
   if (capture && rc == LC_OK)
-    rc = ps_owned_runs_verify(capture->runs, capture->count, NULL, error);
+    rc = verify_run_mappings(capture->runs, capture->count, NULL,
+                             !create && status && status->admitted, error);
   if (capture && rc != LC_OK) {
     ps_owned_runs_close(capture->runs, capture->count);
     memset(capture, 0, sizeof(*capture));
@@ -11010,8 +11015,9 @@ int ps_owned_runs_pin_range(ps_space *s, ps_key key, const ps_ref *ref,
   return pin_runs_locked(s, NULL, key, ref, start, end, provisional, NULL, out,
                          count, e);
 }
-int ps_owned_runs_verify(const ps_owned_mapping *items, size_t count,
-                         ps_owned_footer *footers, lc_error *error) {
+static int verify_run_mappings(const ps_owned_mapping *items, size_t count,
+                               ps_owned_footer *footers, int reuse_identity,
+                               lc_error *error) {
   size_t i;
   int rc = LC_OK;
   for (i = 0; rc == LC_OK && i < count; ++i) {
@@ -11019,6 +11025,13 @@ int ps_owned_runs_verify(const ps_owned_mapping *items, size_t count,
     ps_owned_run *run = items[i].handle;
     ps_entry *p = run->entry;
     ps_space *s = run->space;
+    int memo = reuse_identity && !footers && !p->stream.run->mapped;
+    /* An admitted writer has pinned these exact resident incarnations. The
+     * dense identity header stays fixed while tail footers and data change.
+     * Recovery and unadmitted captures still verify their physical headers. */
+    if (memo &&
+        __atomic_load_n(&p->stream.run->identity_checked, __ATOMIC_ACQUIRE))
+      continue;
     if (footers && !p->stream.run->mapped) {
       rc = transfer(s, header, sizeof(header), p->extents[0].offset, 0, error);
       if (rc == LC_OK)
@@ -11028,8 +11041,14 @@ int ps_owned_runs_verify(const ps_owned_mapping *items, size_t count,
                sizeof(footers[i].bytes));
     } else
       rc = verify_owned(s, p, header, error);
+    if (memo && rc == LC_OK)
+      __atomic_store_n(&p->stream.run->identity_checked, 1, __ATOMIC_RELEASE);
   }
   return rc;
+}
+int ps_owned_runs_verify(const ps_owned_mapping *items, size_t count,
+                         ps_owned_footer *footers, lc_error *error) {
+  return verify_run_mappings(items, count, footers, 0, error);
 }
 static int verify_captured_runs(ps_owned_mapping *items, size_t count,
                                 ps_owned_footer **footers, lc_error *error) {

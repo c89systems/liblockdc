@@ -93,6 +93,7 @@ typedef struct ps_owned_run_state {
   uint16_t *range_rank;
   size_t range_count;
   int mapped, owned_linked;
+  int identity_checked; /* Resident dense identity proof, never serialized. */
 } ps_owned_run_state;
 typedef struct ps_entry {
   ps_key key;

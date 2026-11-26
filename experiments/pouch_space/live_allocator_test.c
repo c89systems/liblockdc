@@ -7374,6 +7374,75 @@ static int tail_publish(void *context, uint64_t tail, lc_error *e) {
   capture_put(state->peer, 11, 65);
   return ps_flush(state->owner, e);
 }
+typedef struct owned_identity_reads {
+  off_t offset;
+  size_t count;
+} owned_identity_reads;
+static ssize_t read_owned_identity(void *context, int fd, void *bytes, size_t n,
+                                   off_t offset) {
+  owned_identity_reads *reads = context;
+  if (offset == reads->offset && n == PS_RUN_IDENTITY_BYTES)
+    ++reads->count;
+  return pread(fd, bytes, n, offset);
+}
+static void owned_stream_identity_cache(void) {
+  lc_error e = {0};
+  owned_identity_reads reads = {.offset = -1};
+  ps_io io = ps_native_io;
+  ps_options options = {.io = &io};
+  ps_space *a = NULL, *b = NULL;
+  ps_owned_head *owner = NULL, *view = NULL;
+  ps_owned_run *run = NULL;
+  ps_owned_status info;
+  ps_owned_initial captured;
+  int found;
+  io.context = &reads;
+  io.read = read_owned_identity;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_owned_open_guarded(a, NULL, tail_stream(), 1, NULL, &owner, &info, NULL,
+                           &e),
+     &e);
+  ps_ref ref = info.ref;
+  ok(ps_owned_grant(owner, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+  REQUIRE(found);
+  ps_key key = {ref.incarnation, 0, PS_OWNED_RUN};
+  const ps_entry *entry = ps_internal_lookup(a, key);
+  REQUIRE(entry && entry->count == 1);
+  reads.offset = (off_t)entry->extents[0].offset;
+  ok(ps_owned_write(run, 0, "abc", 3, &e), &e);
+  ok(ps_owned_commit_canonical(owner, 3, PS_COMMIT_DEFAULT, NULL, NULL, &e),
+     &e);
+  ok(ps_flush(a, &e), &e);
+  ok(ps_open(path, 0, &options, &b, &e), &e);
+  reads.count = 0;
+  for (int pass = 0; pass < 3; ++pass) {
+    ok(ps_owned_open_guarded(pass == 2 ? b : a, NULL, tail_stream(), 0, &ref,
+                             &view, &info, &captured, &e),
+       &e);
+    REQUIRE(info.admitted && info.tail == 3 && captured.count == 1 &&
+            reads.count == (pass == 2 ? 2U : 1U));
+    ps_owned_runs_close(captured.runs, captured.count);
+    ps_owned_close(view);
+  }
+  unsigned char saved, invalid;
+  REQUIRE(pread(a->fd, &saved, 1, reads.offset) == 1);
+  invalid = (unsigned char)(saved ^ 1U);
+  REQUIRE(pwrite(a->fd, &invalid, 1, reads.offset) == 1);
+  REQUIRE(ps_owned_runs_capture(owner, &captured.runs, &captured.count, &e) ==
+          LC_ERR_PROTOCOL);
+  REQUIRE(!captured.runs && !captured.count);
+  lc_error_cleanup(&e);
+  REQUIRE(ps_owned_open_guarded(a, NULL, tail_stream(), 0, &ref, &view, &info,
+                                &captured, &e) == LC_ERR_PROTOCOL);
+  REQUIRE(!view && !captured.runs && !captured.count);
+  lc_error_cleanup(&e);
+  REQUIRE(pwrite(a->fd, &saved, 1, reads.offset) == 1);
+  ps_owned_run_close(run);
+  ps_owned_close(owner);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void owned_stream_readiness(void) {
   for (int durable = 0; durable <= 1; ++durable) {
     lc_error e = {0};
@@ -7450,6 +7519,7 @@ static void owned_stream_readiness(void) {
     ok(ps_close(a, &e), &e);
     REQUIRE(!coverage(NULL, 0) && !unlink(path));
   }
+  owned_stream_identity_cache();
 }
 static void owned_stream_cold(void) {
   lc_error e = {0};
