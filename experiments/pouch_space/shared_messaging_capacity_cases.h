@@ -145,7 +145,7 @@ static void churn_queue(fixture *writer, fixture *peer, const char *ns,
 }
 
 static void churn_outbox(lc_outbox *writer, lc_outbox *peer, uint64_t seed,
-                         lc_error *e) {
+                         int retry_pending, lc_error *e) {
   lc_outbox_entry entry;
   lc_outbox_transaction *transaction = NULL;
   lc_outbox_commit_result committed = {0};
@@ -165,8 +165,20 @@ static void churn_outbox(lc_outbox *writer, lc_outbox *peer, uint64_t seed,
   entry.content_type = "application/octet-stream";
   entry.payload_digest = id;
   churn_stream_init(&body, seed);
-  ok(lc_outbox_append(writer, &entry, &body.source, &transaction, &receipt, e),
-     e);
+  double deadline = retry_pending ? real_clock(CLOCK_MONOTONIC) + 2 : 0;
+  int rc;
+  /* A concurrent owner can hold admission before this source starts.
+   * Keep failures after payload consumption or receipt publication visible. */
+  while ((rc = lc_outbox_append(writer, &entry, &body.source, &transaction,
+                                &receipt, e)) == LC_ERR_PENDING &&
+         retry_pending && !body.offset &&
+         real_clock(CLOCK_MONOTONIC) < deadline) {
+    const struct timespec pause = {0, 10000000};
+    REQUIRE(!transaction && !receipt.outbox_key && !receipt.duplicate);
+    clear(e);
+    (void)nanosleep(&pause, NULL);
+  }
+  ok(rc, e);
   REQUIRE(transaction && !receipt.duplicate && body.offset == CHURN_BYTES);
   ok(lc_outbox_transaction_commit(transaction, &committed, e), e);
   REQUIRE(committed.outbox_receipt_count == 1);
@@ -433,7 +445,7 @@ static void shared_messaging_capacity(const char *directory, int codec,
     strcpy(scenario + phase, " queue");
     churn_queue(&owners[writer], &owners[peer], "queues", cycle, 0, &e);
     strcpy(scenario + phase, " outbox");
-    churn_outbox(outbox[writer], outbox[peer], cycle, &e);
+    churn_outbox(outbox[writer], outbox[peer], cycle, 0, &e);
     if (cycle == 1) {
       strcpy(scenario + phase, " open idle peer");
       strcpy(idle->path, owners[0].path);
@@ -597,7 +609,7 @@ static void shared_autonomous_capacity(const char *directory, int codec,
     strcpy(scenario + phase, " queue");
     churn_queue(&owners[writer], &owners[peer], "queues", cycle, 1, &e);
     strcpy(scenario + phase, " outbox");
-    churn_outbox(outbox[writer], outbox[peer], cycle, &e);
+    churn_outbox(outbox[writer], outbox[peer], cycle, 1, &e);
     work_seconds += real_clock(CLOCK_MONOTONIC) - cycle_start;
     if (cycle == CYCLES) {
       ok(ps_status(space, &stats, &e), &e);
@@ -701,7 +713,7 @@ static void *churn_lane_run(void *context) {
     if (trace)
       fprintf(stderr, "%s cycle=%llu outbox\n", lane->ns,
               (unsigned long long)cycle);
-    churn_outbox(output, input, seed, &e);
+    churn_outbox(output, input, seed, 1, &e);
   }
   lc_outbox_close(input);
   lc_outbox_close(output);
