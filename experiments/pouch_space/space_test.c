@@ -8026,6 +8026,14 @@ static int run_portable_case(const char *mode) {
       checkpoint_idempotence(durable);
     return 1;
   }
+  if (!strcmp(mode, "checkpoint-covered-reopen")) {
+    for (int durable = 0; durable < 2; ++durable) {
+      checkpoint_covered_reopen(durable, COVERED_REOPEN_INTACT);
+      checkpoint_covered_reopen(durable, COVERED_REOPEN_SUFFIX);
+      checkpoint_covered_reopen(durable, COVERED_REOPEN_REPAIR);
+    }
+    return 1;
+  }
   if (!strcmp(mode, "checkpoint-initialization")) {
     checkpoint_initialization(0);
     checkpoint_initialization(1);

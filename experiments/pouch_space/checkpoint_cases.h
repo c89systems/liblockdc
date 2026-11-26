@@ -1048,6 +1048,94 @@ static void checkpoint_put(ps_root *root, ps_namespace *ns,
   checkpoint_put_with_metadata(root, ns, key_name, index, version, lifetime,
                                commit, target, NULL, 0);
 }
+enum covered_reopen_case {
+  COVERED_REOPEN_INTACT,
+  COVERED_REOPEN_SUFFIX,
+  COVERED_REOPEN_REPAIR
+};
+static void checkpoint_covered_reopen(int durable,
+                                      enum covered_reopen_case mode) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_namespace *ns = NULL;
+  ps_namespace_view *view = NULL;
+  ps_namespace_status status;
+  ps_namespace_info identity;
+  checkpoint_seen seen = {0};
+  unsigned char footer[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES] = {0};
+  uint64_t covered, tail, physical = 0;
+  size_t syncs;
+  int fd;
+  clean();
+  options.storage.initial_capacity = PS_MIB;
+  options.storage.shared = 1;
+  options.storage.durable_sync = durable;
+  options.storage.io = &io;
+  OK(ps_root_open(path, 1, &options, &root, &error));
+  OK(ps_root_namespace_acquire(root, "checkpoint", 1, &ns, &error));
+  checkpoint_put(root, ns, "lease/0", 1, 1, 1, 1, 0);
+  OK(ps_namespace_checkpoint_flush(ns, &error));
+  OK(ps_namespace_status_get(ns, &status, &error));
+  covered = status.covered_offset;
+  CHECK(covered && covered == status.tail && status.checkpoint_keys == 1);
+  if (mode == COVERED_REOPEN_SUFFIX) {
+    checkpoint_put(root, ns, "lease/1", 2, 1, 2, 1, 0);
+    OK(ps_flush(ps_root_space(root), &error));
+  }
+  OK(ps_namespace_status_get(ns, &status, &error));
+  tail = status.tail;
+  CHECK(status.covered_offset == covered &&
+        (tail > covered) == (mode == COVERED_REOPEN_SUFFIX));
+  if (mode == COVERED_REOPEN_REPAIR) {
+    OK(ps_namespace_identity(ns, &identity, &error));
+    const ps_entry *head =
+        ps_internal_lookup(ps_root_space(root), key(PS_STREAM, identity.owner,
+                                                    status.active_segment));
+    CHECK(head && status.runs == 1);
+    physical = piece_physical(head->token) + PS_RUN_IDENTITY_BYTES;
+  }
+  ps_namespace_release(ns);
+  OK(ps_root_close(root, &error));
+  root = NULL;
+  if (mode == COVERED_REOPEN_REPAIR) {
+    /* Persist a torn footer. The first repair writes a valid new footer to
+     * cache, then loses its sync. Retry sees the cached reconstruction. */
+    fd = open(path, O_RDWR);
+    CHECK(fd >= 0 && physical + sizeof(footer) <= m.stable_bytes);
+    CHECK(pwrite(fd, footer, sizeof(footer), (off_t)physical) ==
+          sizeof(footer));
+    CHECK(ps_native_io.sync(NULL, fd) == 0);
+    memcpy(m.stable + physical, footer, sizeof(footer));
+    m.fail_sync_at = m.syncs + 1;
+    CHECK(ps_root_open(path, 0, &options, &root, &error) == LC_ERR_TRANSPORT &&
+          !root && m.syncs == m.fail_sync_at);
+    lc_error_cleanup(&error);
+    m.fail_sync_at = 0;
+    CHECK(pread(fd, footer, sizeof(footer), (off_t)physical) == sizeof(footer));
+    CHECK(!memcmp(footer, "LCPSPIEC", 8) && (footer[15] & 0x80) &&
+          memcmp(m.stable + physical, footer, sizeof(footer)));
+    CHECK(close(fd) == 0);
+  }
+  syncs = m.syncs;
+  OK(ps_root_open(path, 0, &options, &root, &error));
+  CHECK(m.syncs == syncs + (mode != COVERED_REOPEN_INTACT));
+  if (mode == COVERED_REOPEN_REPAIR)
+    CHECK(!memcmp(m.stable + physical, footer, sizeof(footer)));
+  OK(ps_root_namespace_acquire(root, "checkpoint", 0, &ns, &error));
+  OK(ps_namespace_status_get(ns, &status, &error));
+  CHECK(status.covered_offset == covered && status.tail == tail);
+  OK(ps_namespace_view_open(ns, &view, &error));
+  OK(ps_namespace_view_visit(view, 1, checkpoint_visit, &seen, &error));
+  CHECK(seen.count == (mode == COVERED_REOPEN_SUFFIX ? 2U : 1U) &&
+        seen.maximum == seen.count && seen.first_version == 1);
+  ps_namespace_view_close(view);
+  ps_namespace_release(ns);
+  OK(ps_root_close(root, &error));
+  free(m.stable);
+  clean();
+}
 static void checkpoint_namespace(int durable, int shared) {
   ps_root_options options = {0};
   ps_root *root = NULL;

@@ -57,7 +57,10 @@ After validating the recovered prefix, the first owner can reuse proof from
 a previous durability barrier. A clean exclusive close can record that
 proof for the exact journal and a bounded set of stream tails. When reusing
 that durability proof, recovery syncs newly discovered records outside its
-coverage before exposing them.
+coverage before exposing them. Shared reopen can reuse a durable namespace
+checkpoint for a recovered tail within its coverage when the piece footers
+are intact. Reconstructed footers keep the recovery sync requirement, including
+on retry after an interrupted repair.
 Owners that reopen using a proof acquire an incarnation range on first use.
 On an exclusive root, the first namespace creation can share a barrier with
 its new incarnation range. Recovery admits the catalog entry only when the

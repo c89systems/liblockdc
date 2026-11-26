@@ -384,7 +384,7 @@ static int cs_recover(ps_collection_segment *s, const ps_owned_status *status,
   if (rc == LC_OK)
     rc = dirty ? ps_owned_recovered(s->head, accepted, e)
                : ps_owned_restore_tail(s->head, accepted,
-                                      accepted > status->tail, e);
+                                       accepted > status->tail, 0, e);
   if (rc == LC_OK && s->shared)
     rc = ps_owned_commit_canonical(s->head, accepted, PS_COMMIT_DEFER_SYNC,
                                    NULL, NULL, e);

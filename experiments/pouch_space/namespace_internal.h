@@ -12,7 +12,7 @@ typedef struct ps_ns_label {
   char value[PS_NS_LEAF_BYTES];
 } ps_ns_label;
 typedef struct ps_ns_resource {
-  uint64_t id, covered, reclaim_cursor;
+  uint64_t id, covered, covered_checkpoint, reclaim_cursor;
   unsigned int kind;
   const char *leaf;
   ps_ns_label *label;

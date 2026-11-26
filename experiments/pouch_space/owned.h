@@ -233,9 +233,11 @@ int ps_owned_commit_canonical(ps_owned_head *, uint64_t tail,
                               lc_error *);
 int ps_owned_barrier(ps_owned_head *, lc_error *);
 /* Restore a checked tail or footer after loading a stream. When physical open
- * reused an earlier barrier, a newly discovered suffix may need its own. */
+ * reused an earlier barrier, a newly discovered suffix may need its own.
+ * A nonzero checkpoint identifies a namespace control covering this tail
+ * and its unchanged footers. Validate its durability before reusing it. */
 int ps_owned_restore_tail(ps_owned_head *, uint64_t tail, int advanced,
-                          lc_error *);
+                          uint64_t checkpoint, lc_error *);
 /* Canonical recovery has validated [checkpoint tail, tail). Stabilize any
  * newly admitted bytes and completed repairs before publishing the tail
  * hint. Complete repairs can share a root durability barrier. */

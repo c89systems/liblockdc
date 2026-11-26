@@ -19,10 +19,11 @@ struct ps_stream {
   size_t count, allocated, readers;
   uint64_t tail, capacity, preferred_grant, checked, edit_wire;
   ps_piece_checksum checksum;
-  uint64_t recovery_floor;
+  uint64_t recovery_floor, recovery_checkpoint;
   unsigned char *recovery_buffer;
   uint64_t recovery_offset;
   size_t recovery_bytes;
+  int recovery_reconstructed;
   ps_stream_recover_fn recover;
   void *recovery_context;
   enum stream_mappings mappings;
@@ -203,17 +204,22 @@ static int stream_pieces(ps_stream *s, uint64_t tail, int inspect, int partial,
     ps_owned_run_close(run.handle);
     if (rc != LC_OK)
       return rc;
+    if (inspect && checksum.reconstructed)
+      s->recovery_reconstructed = 1;
     s->checked = run.base + bytes;
     s->checksum = checksum;
   }
   return LC_OK;
 }
-int ps_stream_recovery_cover(ps_stream *s, uint64_t covered, lc_error *error) {
+int ps_stream_recovery_cover(ps_stream *s, uint64_t covered,
+                             uint64_t checkpoint, lc_error *error) {
   if (!s || !s->recovering || covered > s->capacity)
     return stream_error(error, LC_ERR_INVALID,
                         "piece coverage requires canonical recovery");
-  if (s->recovery_floor < covered)
+  if (s->recovery_floor < covered) {
     s->recovery_floor = covered;
+    s->recovery_checkpoint = checkpoint;
+  }
   return stream_pieces(s, covered, 1, 0, NULL, NULL, 0, NULL, error);
 }
 static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *zero,
@@ -279,6 +285,8 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
   int rc = LC_OK, repaired = 0, recover_tail = 0;
   s->ref = status->ref;
   s->tail = s->recovery_floor = status->tail;
+  s->recovery_checkpoint = 0;
+  s->recovery_reconstructed = 0;
   s->sealed = status->sealed;
   s->edit_wire = status->edit_wire;
   if (initial) {
@@ -324,8 +332,16 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
     rc = stream_pieces(s, accepted, 2, 1, NULL, s->recovery_buffer, 0,
                        &repaired, error);
   /* Rejected suffix repair waits for the first write admission. */
-  if (rc == LC_OK && (accepted > s->tail || repaired))
-    rc = ps_owned_restore_tail(s->head, accepted, accepted > s->tail, error);
+  if (rc == LC_OK && (accepted > s->tail || repaired)) {
+    /* A valid reconstructed footer can be left in cache by an interrupted
+     * recovery. The checkpoint covers the original bytes, not that repair. */
+    uint64_t checkpoint =
+        !repaired && !s->recovery_reconstructed && accepted <= s->recovery_floor
+            ? s->recovery_checkpoint
+            : 0;
+    rc = ps_owned_restore_tail(s->head, accepted, accepted > s->tail,
+                               checkpoint, error);
+  }
   if (rc == LC_OK) {
     s->tail = accepted;
     s->repair_pending = 1;

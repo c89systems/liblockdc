@@ -244,7 +244,7 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
   if (cursor > capacity)
     return failure(e, LC_ERR_PROTOCOL,
                    "checkpoint coverage exceeds source capacity");
-  rc = ps_stream_recovery_cover(stream, cursor, e);
+  rc = ps_stream_recovery_cover(stream, cursor, s->covered_checkpoint, e);
   if (rc != LC_OK)
     return rc;
   while (cursor < capacity) {
@@ -399,6 +399,7 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
     s->covered = s->kind == PS_CATALOG_SEGMENT && s->id == coverage.segment
                      ? coverage.offset
                      : 0;
+    s->covered_checkpoint = s->covered ? coverage.control : 0;
     rc = ps_stream_open(ns->root->space, NULL, s->binding.stream, 0,
                         &s->binding.target, recover, s, &s->stream, e);
     if (rc == LC_OK)

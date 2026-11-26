@@ -11759,10 +11759,49 @@ int ps_owned_barrier(ps_owned_head *head, lc_error *error) {
   return head ? sync_file(head->space, error)
               : err(error, LC_ERR_INVALID, "owned barrier requires head");
 }
+static int restore_covered_tail(ps_owned_head *head, uint64_t tail,
+                                uint64_t checkpoint, int *restored,
+                                lc_error *error) {
+  ps_space *s = head->space;
+  ps_coordination_guard *guard;
+  ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
+  uint64_t sequence = 0;
+  int rc;
+  *restored = 0;
+  key.owner = head->entry->key.owner;
+  pthread_mutex_lock(&s->mutex);
+  rc = owned_capture_begin(head, &guard, error);
+  if (rc == LC_OK) {
+    ps_entry *control = lookup(s, key);
+    /* The namespace supplied the exact coverage boundary, and the stream
+     * validated its footers without rewriting them. A durable revision
+     * covering the tail already persisted the preceding append bytes. */
+    if (control && !control->deleted && control->token == checkpoint &&
+        (control->peer_sequence
+             ? control->peer_sequence <= s->peer_durable
+             : control->publication_sequence <=
+                   __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE))) {
+      *restored = 1;
+      if (owned_tail_allowed(head->entry, tail))
+        rc = owned_publish_tail(s, head->entry, tail, 0, &sequence, error);
+      else
+        rc = err(error, LC_ERR_PROTOCOL, "recovered tail outside owned range");
+    }
+  }
+  rc = allocation_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 int ps_owned_restore_tail(ps_owned_head *head, uint64_t tail, int advanced,
-                          lc_error *error) {
+                          uint64_t checkpoint, lc_error *error) {
   const unsigned char *proof = head->space->close_proof;
   size_t count, i;
+  if (advanced && checkpoint && head->space->readiness) {
+    int restored,
+        rc = restore_covered_tail(head, tail, checkpoint, &restored, error);
+    if (rc != LC_OK || restored)
+      return rc;
+  }
   if (advanced && !head->space->readiness && head->space->reused_open_barrier) {
     if (!exclusive_raw_covered(head->space))
       return ps_owned_recovered(head, tail, error);

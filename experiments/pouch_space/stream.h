@@ -84,8 +84,10 @@ int ps_stream_recovery_read(ps_stream *, uint64_t offset, void *, size_t,
 /* During canonical recovery only: require intact completion footers for every
  * full piece protected by the canonical checkpoint. Inspects only metadata,
  * without reading bodies. Uncovered accepted pieces are finalized separately.
+ * checkpoint identifies the namespace control that selected this boundary.
  */
-int ps_stream_recovery_cover(ps_stream *, uint64_t, lc_error *);
+int ps_stream_recovery_cover(ps_stream *, uint64_t covered, uint64_t checkpoint,
+                             lc_error *);
 /* At most one appender per logical stream; contention is an explicit error.
  * Other streams and readers remain independent. The producer never owns root
  * or allocator locks. Buffers are bounded at PS_CHUNK. A recovered owner
