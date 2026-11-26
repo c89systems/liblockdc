@@ -304,12 +304,18 @@ static void lifecycle(const char *path, const char *directory) {
       write.expected_version = 1;
       write.has_metadata = 0;
       write.has_query_hidden = 0;
-      in = source(70001, 3);
-      in.fail_after = 17000;
-      REQUIRE(put(p, "a/b", "key", &in, &write, &w, &e) == LC_ERR_TRANSPORT);
-      clear(&e);
-      lc_pouch_state_write_result_cleanup(&allocator, &w);
-      read_value(p, "a/b", "key", 1048601, 19, 1, &e);
+      for (int diagnostics = 0; diagnostics < 2; ++diagnostics) {
+        in = source(150001, 3);
+        in.fail_after = 100000;
+        REQUIRE(put(p, "a/b", "key", &in, &write, &w,
+                    diagnostics ? &e : NULL) == LC_ERR_TRANSPORT);
+        REQUIRE(in.offset >= in.fail_after && !w.version && !w.etag);
+        if (diagnostics)
+          REQUIRE(e.message && !strcmp(e.message, "injected producer failure"));
+        clear(&e);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        read_value(p, "a/b", "key", 1048601, 19, 1, &e);
+      }
       in = source(70001, 7);
       ok(put(p, "a/b", "key", &in, &write, &w, &e), &e);
       REQUIRE(w.version == 2 && w.has_query_hidden && w.query_hidden &&

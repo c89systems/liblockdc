@@ -2053,6 +2053,29 @@ static int lc_pouch_crypto_encrypt_frame(
   return rc;
 }
 
+static int lc_pouch_crypto_read_chunk(lc_source *source, void *buffer,
+                                      size_t capacity, size_t *got,
+                                      lc_error *error) {
+  lc_error local;
+  int rc;
+
+  /* Read callbacks distinguish failure from EOF through the error object. */
+  if (error == NULL) {
+    lc_error_init(&local);
+    error = &local;
+  }
+  *got = source->read(source, buffer, capacity, error);
+  rc = error->code;
+  if (rc == LC_OK && *got > capacity) {
+    rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                      "pouch source exceeded requested chunk size", NULL, NULL,
+                      "pouch");
+  }
+  if (error == &local)
+    lc_error_cleanup(&local);
+  return rc;
+}
+
 static int lc_pouch_crypto_stream_plain(const lc_allocator *allocator, int fd,
                                         lc_sink *sink, lc_source *body,
                                         uint64_t *plain_bytes,
@@ -2079,19 +2102,9 @@ static int lc_pouch_crypto_stream_plain(const lc_allocator *allocator, int fd,
   for (;;) {
     size_t got;
 
-    got = body->read(body, buffer, capacity, error);
-    if (error != NULL && error->code != LC_OK) {
-      rc = error->code;
+    rc = lc_pouch_crypto_read_chunk(body, buffer, capacity, &got, error);
+    if (rc != LC_OK || got == 0U)
       break;
-    }
-    if (got == 0U)
-      break;
-    if (got > capacity) {
-      rc = lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch source exceeded requested chunk size", NULL,
-                        NULL, "pouch");
-      break;
-    }
     rc = lc_pouch_crypto_check_byte_counter(
         total, got, "pouch payload byte count exceeds platform limit", error);
     if (rc != LC_OK) {
@@ -2884,19 +2897,10 @@ static int lc_pouch_crypto_produce_source(void *context, lc_sink *sink,
       target = out->counter == 0UL ? LC_POUCH_FIRST_FRAME_PLAINTEXT_BYTES
                                    : LC_POUCH_FRAME_PLAINTEXT_BYTES;
       capacity = target - out->fill;
-      got = producer->source->read(producer->source, out->plain + out->fill,
-                                   capacity, error);
-      if (error != NULL && error->code != LC_OK) {
-        return error->code;
-      }
-      if (got > capacity) {
-        return lc_error_set(error, LC_ERR_INVALID, 0L,
-                            "pouch source exceeded requested chunk size", NULL,
-                            NULL, "pouch");
-      }
-      if (got == 0U) {
-        return LC_OK;
-      }
+      rc = lc_pouch_crypto_read_chunk(producer->source, out->plain + out->fill,
+                                      capacity, &got, error);
+      if (rc != LC_OK || got == 0U)
+        return rc;
       rc = lc_pouch_crypto_check_byte_counter(
           out->plain_total, got,
           "pouch plaintext byte count exceeds platform limit", error);
@@ -2922,21 +2926,10 @@ static int lc_pouch_crypto_produce_source(void *context, lc_sink *sink,
   }
   rc = LC_OK;
   for (;;) {
-    got = producer->source->read(producer->source, bytes,
-                                 LC_POUCH_FRAME_PLAINTEXT_BYTES, error);
-    if (error != NULL && error->code != LC_OK) {
-      rc = error->code;
+    rc = lc_pouch_crypto_read_chunk(
+        producer->source, bytes, LC_POUCH_FRAME_PLAINTEXT_BYTES, &got, error);
+    if (rc != LC_OK || got == 0U)
       break;
-    }
-    if (got > LC_POUCH_FRAME_PLAINTEXT_BYTES) {
-      rc = lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch source exceeded requested chunk size", NULL,
-                        NULL, "pouch");
-      break;
-    }
-    if (got == 0U) {
-      break;
-    }
     if (!sink->write(sink, bytes, got, error)) {
       rc = error != NULL && error->code != LC_OK ? error->code
                                                  : LC_ERR_TRANSPORT;

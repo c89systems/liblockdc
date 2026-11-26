@@ -16255,20 +16255,27 @@ test_state_stream_failure_keeps_published_projection_and_replay(void **state) {
   lc_source_close(body);
   body = NULL;
 
-  failing.bytes = (const unsigned char *)"unpublished";
-  failing.length = strlen((const char *)failing.bytes);
-  rc = lc_source_from_callbacks(pouch_failing_source_read, NULL, NULL, &failing,
-                                &body, &error);
-  assert_int_equal(rc, LC_OK);
-  rc = lc_pouch_state_write(pouch, "default", "state/current", body, NULL,
-                            &failed, &error);
-  assert_int_equal(rc, LC_ERR_TRANSPORT);
-  assert_true(failing.failed);
-  assert_string_equal(error.message, "pouch test source failed");
-  lc_source_close(body);
-  body = NULL;
-  lc_error_cleanup(&error);
-  lc_error_init(&error);
+  for (int diagnostics = 0; diagnostics < 2; ++diagnostics) {
+    failing.bytes = (const unsigned char *)"unpublished";
+    failing.length = strlen((const char *)failing.bytes);
+    failing.offset = 0;
+    failing.failed = 0;
+    rc = lc_source_from_callbacks(pouch_failing_source_read, NULL, NULL,
+                                  &failing, &body, &error);
+    assert_int_equal(rc, LC_OK);
+    rc = lc_pouch_state_write(pouch, "default", "state/current", body, NULL,
+                              &failed, diagnostics ? &error : NULL);
+    assert_int_equal(rc, LC_ERR_TRANSPORT);
+    assert_true(failing.failed);
+    assert_int_equal(failed.version, 0);
+    assert_null(failed.etag);
+    if (diagnostics)
+      assert_string_equal(error.message, "pouch test source failed");
+    lc_source_close(body);
+    body = NULL;
+    lc_error_cleanup(&error);
+    lc_error_init(&error);
+  }
 
   rc = lc_pouch_state_read(pouch, "default", "state/current", &read_result,
                            &error);
