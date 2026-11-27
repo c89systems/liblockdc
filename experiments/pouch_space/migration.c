@@ -221,6 +221,8 @@ static int remove_legacy(const migration_path *paths, const char *old,
   if (rc == LC_OK && unlinkat(fd, PS_MIGRATION_RECEIPT, 0) != 0)
     rc = failure(e, LC_ERR_TRANSPORT, NULL,
                  "cannot retire legacy migration receipt", old);
+  if (rc == LC_OK)
+    boundary("legacy-receipt-removed");
   if (rc == LC_OK && fsync(fd) != 0)
     rc = failure(e, LC_ERR_TRANSPORT, NULL, "cannot sync legacy cleanup", old);
   if (rc == LC_OK && rmdir(old) != 0)

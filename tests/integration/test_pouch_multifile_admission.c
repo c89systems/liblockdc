@@ -18,6 +18,8 @@
   } while (0)
 
 static lc_error error;
+static const char fixture_key[] =
+    "lc-pouch-key-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 static void ok(int rc) {
   if (rc != LC_OK)
@@ -27,8 +29,9 @@ static void ok(int rc) {
   CHECK(rc == LC_OK);
 }
 
-static lc_client *open_receiver(const char *scheme, const char *root,
-                                const char *compression) {
+static lc_client *open_with_options(const char *scheme, const char *root,
+                                    const char *compression, const char *key,
+                                    int disable_migration) {
   char endpoint[1024];
   const char *endpoints[1];
   lc_client_config config;
@@ -42,8 +45,11 @@ static lc_client *open_receiver(const char *scheme, const char *root,
   settings.set_mask = LC_POUCH_SETTING_BACKGROUND_COMPACTION |
                       LC_POUCH_SETTING_QUERY_INDEXING |
                       LC_POUCH_SETTING_CRYPTO_KEY;
-  settings.crypto_key =
-      "lc-pouch-key-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  settings.crypto_key = key;
+  if (disable_migration) {
+    settings.set_mask |= LC_POUCH_SETTING_DISABLE_MIGRATION;
+    settings.disable_migration = 1;
+  }
   if (compression) {
     settings.set_mask |= LC_POUCH_SETTING_COMPRESSION;
     settings.compression = compression;
@@ -62,6 +68,11 @@ static lc_client *open_receiver(const char *scheme, const char *root,
     CHECK(client == NULL);
 #endif
   return client;
+}
+
+static lc_client *open_receiver(const char *scheme, const char *root,
+                                const char *compression) {
+  return open_with_options(scheme, root, compression, fixture_key, 0);
 }
 
 static void write_state(lc_client *client, const char *value) {
@@ -107,6 +118,27 @@ static void seed(lc_client *client) {
 }
 
 #ifndef LC_POUCH_MULTIFILE_FIXTURE
+static void check_migration_refusals(const char *root) {
+  char wrong_key[sizeof(fixture_key)];
+  struct stat before, after;
+  memcpy(wrong_key, fixture_key, sizeof(wrong_key));
+  strchr(wrong_key, ':')[1] = 'B';
+  CHECK(lstat(root, &before) == 0 && S_ISDIR(before.st_mode));
+
+  CHECK(!open_with_options("pouch", root, NULL, fixture_key, 1));
+  CHECK(error.code == LC_ERR_UNSUPPORTED && error.server_code &&
+        !strcmp(error.server_code, "pouch_migration_disabled"));
+  lc_error_cleanup(&error);
+  CHECK(lstat(root, &after) == 0 && S_ISDIR(after.st_mode) &&
+        before.st_ino == after.st_ino && before.st_dev == after.st_dev);
+
+  CHECK(!open_with_options("pouch", root, NULL, wrong_key, 0));
+  CHECK(error.code == LC_ERR_INVALID);
+  lc_error_cleanup(&error);
+  CHECK(lstat(root, &after) == 0 && S_ISDIR(after.st_mode) &&
+        before.st_ino == after.st_ino && before.st_dev == after.st_dev);
+}
+
 static void check_state(lc_client *client, const char *expected) {
   lc_get_opts opts;
   lc_get_res res = {0};
@@ -209,6 +241,7 @@ int main(int argc, char **argv) {
       CHECK(lstat(root, &info) == 0 && S_ISDIR(info.st_mode));
       lc_error_cleanup(&error);
     }
+    check_migration_refusals(root);
     client = open_receiver("pouch", root, "zlib");
     ok(error.code);
     CHECK(client && lstat(root, &info) == 0 && S_ISREG(info.st_mode));
