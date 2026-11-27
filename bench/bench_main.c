@@ -2229,7 +2229,7 @@ done:
 #ifndef LOCKDC_POUCH_SPACE_BENCH
 static int bench_pouch_open(long iterations) {
   lc_error error;
-  char root[512];
+  char root[512], path[sizeof(root) + sizeof("/store")];
   long i;
   int rc;
 
@@ -2240,11 +2240,12 @@ static int bench_pouch_open(long iterations) {
     rc = 1;
     goto done;
   }
+  snprintf(path, sizeof(path), "%s/store", root);
   for (i = 0; i < iterations; ++i) {
     lc_pouch *pouch;
 
     pouch = NULL;
-    if (lc_pouch_open(root, NULL, NULL, &pouch, &error) != LC_OK) {
+    if (lc_pouch_open_managed(path, NULL, NULL, &pouch, &error) != LC_OK) {
       rc = 1;
       goto done;
     }
@@ -2260,7 +2261,7 @@ done:
 static int bench_pouch_namespace(long iterations) {
   lc_error error;
   lc_pouch *pouch;
-  char root[512];
+  char root[512], path[sizeof(root) + sizeof("/store")];
   long i;
   int rc;
 
@@ -2272,7 +2273,8 @@ static int bench_pouch_namespace(long iterations) {
     rc = 1;
     goto done;
   }
-  if (lc_pouch_open(root, NULL, NULL, &pouch, &error) != LC_OK) {
+  snprintf(path, sizeof(path), "%s/store", root);
+  if (lc_pouch_open_managed(path, NULL, NULL, &pouch, &error) != LC_OK) {
     rc = 1;
     goto done;
   }

@@ -8,6 +8,13 @@
 #include <pthread.h>
 #include <time.h>
 
+struct lc_client_handle;
+uint64_t lc_pouch_elapsed_ns(const struct timespec *, const struct timespec *);
+int lc_pouch_multifile_queue_watch_wait(lc_pouch *, const char *, const char *,
+                                        uint64_t);
+void lc_pouch_multifile_queue_notify(struct lc_client_handle *, const char *,
+                                     const char *);
+
 typedef struct lc_pouch_namespace_logstore lc_pouch_namespace_logstore;
 typedef struct lc_pouch_source_cache_entry lc_pouch_source_cache_entry;
 typedef struct lc_pouch_query_index_generation_cache_entry

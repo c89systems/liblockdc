@@ -531,7 +531,7 @@ static int lc_pouch_outbox_import_kind(lc_pouch *source, lc_pouch *target,
                                        lc_error *error) {
   lc_pouch_outbox_store input = {0}, output = {0};
   const char *name = NULL;
-  int rc = lc_pouch_outbox_store_open(source, ns, kind, 0, &input, error);
+  int rc = lc_pouch_outbox_import_source(source, ns, kind, &input, error);
 
   while (rc == LC_OK &&
          (rc = input.ops->next(input.context, &name, error)) == LC_OK && name) {

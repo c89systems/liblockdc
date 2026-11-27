@@ -424,7 +424,8 @@ static int migrate(const migration_path *paths, ps_pouch_state_options *options,
   source_options.query_indexing_enabled = 0;
   source_options.crypto_generate_key_file = 0;
   if (rc == LC_OK && legacy)
-    rc = lc_pouch_open(paths->root, a, &source_options, &source, e);
+    rc = lc_pouch_prepare_multifile(paths->root, a, &source_options, 0, &source,
+                                    e);
   if (rc == LC_OK && source &&
       (source->root_inode != (uint64_t)original->st_ino ||
        source->root_device != (uint64_t)original->st_dev))

@@ -74,12 +74,24 @@ typedef struct lc_bundle_capture_source {
   size_t capacity;
 } lc_bundle_capture_source;
 
-static int lc_endpoint_is_pouch(const char *endpoint) {
-  return endpoint != NULL && strncmp(endpoint, "pouch://", 8U) == 0;
+static const char lc_multifile_scheme[] = "pouch+multifile://";
+
+static int lc_endpoint_is_multifile(const char *endpoint) {
+  return endpoint && !strncmp(endpoint, lc_multifile_scheme,
+                              sizeof(lc_multifile_scheme) - 1U);
 }
 
 static const char *lc_pouch_endpoint_path(const char *endpoint) {
-  return endpoint != NULL ? endpoint + 8 : NULL;
+  static const char scheme[] = "pouch://";
+  if (endpoint && !strncmp(endpoint, scheme, sizeof(scheme) - 1U))
+    return endpoint + sizeof(scheme) - 1U;
+  if (lc_endpoint_is_multifile(endpoint))
+    return endpoint + sizeof(lc_multifile_scheme) - 1U;
+  return NULL;
+}
+
+static int lc_endpoint_is_pouch(const char *endpoint) {
+  return lc_pouch_endpoint_path(endpoint) != NULL;
 }
 
 static void lc_pouch_endpoint_split(const char *endpoint, const char **path,
@@ -2392,6 +2404,7 @@ lc_pouch_open_options_apply_settings(lc_pouch_open_options *options,
 
 #undef LC_POUCH_SETTINGS_KNOWN_MASK
 
+#ifdef LC_POUCH_MULTIFILE_RUNTIME
 int lc_pouch_legacy_client_open(const lc_client_config *config, lc_client **out,
                                 lc_error *error) {
   lc_pouch_runtime_factory_fn factory = NULL;
@@ -2400,6 +2413,7 @@ int lc_pouch_legacy_client_open(const lc_client_config *config, lc_client **out,
     factory = lc_pouch_legacy_runtime_factory;
   return lc_client_open_with_pouch_factory(config, factory, NULL, out, error);
 }
+#endif
 
 int lc_client_open_with_pouch_factory(const lc_client_config *config,
                                       lc_pouch_runtime_factory_fn factory,
@@ -2459,6 +2473,17 @@ int lc_client_open_with_pouch_factory(const lc_client_config *config,
   rc = lc_pouch_settings_validate(config->pouch_settings, is_pouch, error);
   if (rc != LC_OK) {
     return rc;
+  }
+  if (is_pouch && !factory && lc_endpoint_is_multifile(config->endpoints[0])) {
+#ifdef LOCKDC_ENABLE_POUCH_MULTIFILE
+    factory = lc_pouch_legacy_runtime_factory;
+#else
+    *out = NULL;
+    return lc_error_set(
+        error, LC_ERR_UNSUPPORTED, 0L,
+        "multifile receiver requires LOCKDC_ENABLE_POUCH_MULTIFILE", NULL,
+        "pouch_multifile_disabled", "pouch");
+#endif
   }
   if (!config->disable_mtls && config->client_bundle_source != NULL) {
     bundle_capture.inner = config->client_bundle_source;

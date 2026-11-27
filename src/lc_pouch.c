@@ -35,8 +35,6 @@
 #include <unistd.h>
 
 #if defined(__linux__)
-#include <poll.h>
-#include <sys/inotify.h>
 #include <sys/vfs.h>
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) ||     \
     defined(__OpenBSD__) || defined(__DragonFly__)
@@ -187,8 +185,8 @@ static void lc_pouch_fsync_deadline(struct timespec *deadline, long delay_ns) {
 }
 #endif
 
-static uint64_t lc_pouch_elapsed_ns(const struct timespec *started,
-                                    const struct timespec *finished) {
+uint64_t lc_pouch_elapsed_ns(const struct timespec *started,
+                             const struct timespec *finished) {
   uint64_t seconds;
   uint64_t nanos;
 
@@ -2174,8 +2172,6 @@ int lc_pouch_fsync_commit(lc_pouch *pouch, int fd, lc_error *error) {
   return LC_OK;
 }
 
-static int lc_pouch_queue_file_watch_wait(lc_pouch *, const char *,
-                                          const char *, uint64_t);
 uint32_t lc_pouch_queue_watch_observe(lc_pouch *pouch) {
   if (pouch && pouch->queue_watch_enabled && pouch->storage.ops &&
       pouch->storage.ops->queue_observe)
@@ -2191,153 +2187,12 @@ int lc_pouch_queue_watch_wait(lc_pouch *pouch, const char *ns,
     return pouch->storage.ops->queue_wait(pouch->storage.context, ns, queue,
                                           observed, timeout_ms);
   }
-  return lc_pouch_queue_file_watch_wait(pouch, ns, queue, timeout_ms);
-}
-static int lc_pouch_queue_file_watch_wait(lc_pouch *pouch, const char *ns,
-                                          const char *queue,
-                                          uint64_t timeout_ms) {
-#if defined(__linux__)
-  char *namespace_path;
-  char *notify_dir;
-  char *escaped_queue;
-  char *notify_leaf;
-  struct pollfd pollfd;
-  union {
-    unsigned char bytes[4096];
-    struct inotify_event alignment;
-  } events;
-  size_t leaf_len;
-  size_t offset;
-  ssize_t bytes_read;
-  int fd;
-  int watch;
-  int timeout;
-  int ready;
-  int result;
-  uint64_t timeout_ns;
-  uint64_t elapsed_ns;
-  uint64_t remaining_ns;
-  struct timespec started;
-  struct timespec now;
-  int clock_started;
-
-  if (pouch == NULL || !pouch->queue_watch_enabled || pouch->aborted ||
-      ns == NULL || ns[0] == '\0' || queue == NULL || queue[0] == '\0') {
-    return -1;
-  }
-  namespace_path =
-      lc_pouch_namespace_path(&pouch->allocator, pouch->root_path, ns);
-  notify_dir = namespace_path != NULL
-                   ? lc_pouch_path_join(&pouch->allocator, namespace_path,
-                                        "queue-notify")
-                   : NULL;
-  escaped_queue = lc_pouch_path_escape_name(&pouch->allocator, queue);
-  notify_leaf = NULL;
-  result = -1;
-  if (notify_dir == NULL || escaped_queue == NULL ||
-      strlen(escaped_queue) > SIZE_MAX - strlen(".notify") - 1U) {
-    goto cleanup;
-  }
-  leaf_len = strlen(escaped_queue) + strlen(".notify") + 1U;
-  notify_leaf = (char *)lc_alloc_with_allocator(&pouch->allocator, leaf_len);
-  if (notify_leaf == NULL) {
-    goto cleanup;
-  }
-  snprintf(notify_leaf, leaf_len, "%s.notify", escaped_queue);
-  fd = inotify_init();
-  if (fd < 0) {
-    goto cleanup;
-  }
-  watch = inotify_add_watch(fd, notify_dir,
-                            IN_MOVED_TO | IN_CREATE | IN_CLOSE_WRITE |
-                                IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
-  if (watch < 0) {
-    (void)close(fd);
-    goto cleanup;
-  }
-  result = 0;
-  timeout_ns = timeout_ms > LC_U64_MAX / (uint64_t)1000000UL
-                   ? LC_U64_MAX
-                   : timeout_ms * (uint64_t)1000000UL;
-  clock_started = clock_gettime(CLOCK_MONOTONIC, &started) == 0;
-  memset(&pollfd, 0, sizeof(pollfd));
-  pollfd.fd = fd;
-  pollfd.events = POLLIN;
-  for (;;) {
-    if (clock_started && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
-      elapsed_ns = lc_pouch_elapsed_ns(&started, &now);
-      if (elapsed_ns >= timeout_ns) {
-        break;
-      }
-      remaining_ns = timeout_ns - elapsed_ns;
-      timeout = remaining_ns / (uint64_t)1000000UL >= (uint64_t)INT_MAX
-                    ? INT_MAX
-                    : (int)((remaining_ns + (uint64_t)999999UL) /
-                            (uint64_t)1000000UL);
-    } else {
-      timeout = timeout_ms > (uint64_t)INT_MAX ? INT_MAX : (int)timeout_ms;
-    }
-    pollfd.revents = 0;
-    ready = poll(&pollfd, 1U, timeout);
-    if (ready == 0) {
-      break;
-    }
-    if (ready < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      break;
-    }
-    if ((pollfd.revents & POLLIN) == 0) {
-      break;
-    }
-    bytes_read = read(fd, events.bytes, sizeof(events.bytes));
-    if (bytes_read < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      break;
-    }
-    offset = 0U;
-    while (offset + sizeof(struct inotify_event) <= (size_t)bytes_read) {
-      const struct inotify_event *event;
-      size_t event_size;
-
-      event = (const struct inotify_event *)(events.bytes + offset);
-      event_size = sizeof(*event) + event->len;
-      if (event_size > (size_t)bytes_read - offset) {
-        break;
-      }
-      if ((event->mask & (IN_Q_OVERFLOW | IN_DELETE_SELF | IN_MOVE_SELF)) !=
-              0U ||
-          (event->len > 0U && strcmp(event->name, notify_leaf) == 0)) {
-        result = 1;
-        break;
-      }
-      offset += event_size;
-    }
-    if (result != 0) {
-      break;
-    }
-  }
-  (void)inotify_rm_watch(fd, watch);
-  (void)close(fd);
-
-cleanup:
-  lc_free_with_allocator(&pouch->allocator, notify_leaf);
-  lc_free_with_allocator(&pouch->allocator, escaped_queue);
-  lc_free_with_allocator(&pouch->allocator, notify_dir);
-  lc_free_with_allocator(&pouch->allocator, namespace_path);
-  return result;
+#ifdef LC_POUCH_MULTIFILE_RUNTIME
+  return lc_pouch_multifile_queue_watch_wait(pouch, ns, queue, timeout_ms);
 #else
-  (void)pouch;
-  (void)ns;
-  (void)queue;
-  (void)timeout_ms;
   return -1;
 #endif
 }
-
 static const char *lc_pouch_option_string(const char *value,
                                           const char *fallback) {
   if (value != NULL && value[0] != '\0') {
@@ -2455,7 +2310,7 @@ static void lc_pouch_detect_filesystem_capabilities(lc_pouch *pouch) {
 }
 
 static int lc_pouch_queue_watch_supported(const lc_pouch *pouch) {
-#if defined(__linux__)
+#if defined(__linux__) && defined(LC_POUCH_MULTIFILE_RUNTIME)
   return pouch != NULL && pouch->filesystem_capabilities_known &&
          !pouch->filesystem_is_nfs;
 #else
@@ -2809,134 +2664,6 @@ static int lc_pouch_root_has_namespace_entries(lc_pouch *pouch, int *out,
                         strerror(saved_errno), NULL, "pouch");
   }
   return LC_OK;
-}
-
-/*
- * Exclusive Pouch pays this bounded, read-only cache construction at open so
- * its first query does not decode immutable segment readers. Plain shared
- * roots remain lazy to keep their optional multi-writer resident footprint
- * bounded. Transformed roots retain their existing eager warming in either
- * writer mode.
- */
-static int lc_pouch_warm_open_namespaces(lc_pouch *pouch, lc_error *error) {
-  char *namespaces_path;
-  DIR *dir;
-  struct dirent *entry;
-  unsigned long namespace_count;
-  int saved_errno;
-  int rc;
-
-  if (pouch == NULL || (!lc_pouch_single_writer_enabled(pouch) &&
-                        !lc_pouch_crypto_enabled(pouch->crypto) &&
-                        !lc_pouch_crypto_compression_enabled(pouch->crypto))) {
-    return LC_OK;
-  }
-  namespaces_path =
-      lc_pouch_path_join(&pouch->allocator, pouch->root_path, "namespaces");
-  if (namespaces_path == NULL) {
-    return lc_error_set(error, LC_ERR_NOMEM, 0L,
-                        "failed to allocate pouch namespaces path", NULL, NULL,
-                        NULL);
-  }
-  dir = opendir(namespaces_path);
-  if (dir == NULL) {
-    saved_errno = errno;
-    lc_free_with_allocator(&pouch->allocator, namespaces_path);
-    if (saved_errno == ENOENT) {
-      pslog_field fields[1];
-
-      fields[0] = lc_log_str_field("reason", "namespaces-missing");
-      lc_log_debug(pouch->logger, "cache.load.skip", fields, 1U);
-      return LC_OK;
-    }
-    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                        "failed to scan pouch namespaces",
-                        strerror(saved_errno), NULL, "pouch");
-  }
-  rc = LC_OK;
-  saved_errno = 0;
-  namespace_count = 0UL;
-  {
-    pslog_field fields[2];
-
-    fields[0] =
-        lc_log_bool_field("crypto", lc_pouch_crypto_enabled(pouch->crypto));
-    fields[1] = lc_log_bool_field(
-        "compression", lc_pouch_crypto_compression_enabled(pouch->crypto));
-    lc_log_debug(pouch->logger, "cache.load.start", fields, 2U);
-  }
-  while (rc == LC_OK) {
-    char *ns;
-    lc_error warm_error;
-    int index_rc;
-    int state_rc;
-
-    errno = 0;
-    entry = readdir(dir);
-    if (entry == NULL) {
-      saved_errno = errno;
-      break;
-    }
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-      continue;
-    }
-    ns = lc_pouch_path_unescape_name(&pouch->allocator, entry->d_name);
-    if (ns == NULL) {
-      continue;
-    }
-    lc_error_init(&warm_error);
-    state_rc = lc_pouch_state_warm_namespace(pouch, ns, &warm_error);
-    if (state_rc != LC_OK) {
-      pslog_field fields[3];
-
-      fields[0] = lc_log_str_field("ns", ns);
-      fields[1] = lc_log_error_field("error", &warm_error);
-      fields[2] = lc_log_code_field(&warm_error);
-      lc_log_warn(pouch->logger, "cache.load.state.error", fields, 3U);
-    }
-    lc_error_cleanup(&warm_error);
-    lc_error_init(&warm_error);
-    index_rc = LC_OK;
-    if (pouch->query_indexing_enabled) {
-      index_rc = lc_pouch_query_index_warm_namespace(pouch, ns, &warm_error);
-    }
-    if (index_rc != LC_OK) {
-      pslog_field fields[3];
-
-      fields[0] = lc_log_str_field("ns", ns);
-      fields[1] = lc_log_error_field("error", &warm_error);
-      fields[2] = lc_log_code_field(&warm_error);
-      lc_log_warn(pouch->logger, "cache.load.index.error", fields, 3U);
-    }
-    lc_error_cleanup(&warm_error);
-    {
-      pslog_field fields[3];
-
-      fields[0] = lc_log_str_field("ns", ns);
-      fields[1] = lc_log_bool_field("state_ok", state_rc == LC_OK);
-      fields[2] = lc_log_bool_field("index_ok", index_rc == LC_OK);
-      lc_log_debug(pouch->logger, "cache.load.namespace", fields, 3U);
-    }
-    namespace_count++;
-    lc_free_with_allocator(&pouch->allocator, ns);
-  }
-  if (closedir(dir) != 0 && rc == LC_OK) {
-    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                      "failed to scan pouch namespaces",
-                      strerror(errno != 0 ? errno : EIO), NULL, "pouch");
-  } else if (rc == LC_OK && saved_errno != 0) {
-    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                      "failed to scan pouch namespaces", strerror(saved_errno),
-                      NULL, "pouch");
-  }
-  lc_free_with_allocator(&pouch->allocator, namespaces_path);
-  if (rc == LC_OK) {
-    pslog_field fields[1];
-
-    fields[0] = lc_log_u64_field("count", namespace_count);
-    lc_log_debug(pouch->logger, "cache.load.complete", fields, 1U);
-  }
-  return rc;
 }
 
 static int lc_pouch_validate_root_crypto_mode(lc_pouch *pouch,
@@ -3925,9 +3652,10 @@ int lc_pouch_runtime_open(const char *root_path, const lc_allocator *allocator,
   return LC_OK;
 }
 
-int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
-                  const lc_pouch_open_options *options, lc_pouch **out,
-                  lc_error *error) {
+int lc_pouch_prepare_multifile(const char *root_path,
+                               const lc_allocator *allocator,
+                               const lc_pouch_open_options *options, int create,
+                               lc_pouch **out, lc_error *error) {
   lc_pouch *pouch = NULL;
   lc_pouch_crypto_open_options crypto_options;
   struct stat root_stat;
@@ -3962,8 +3690,14 @@ int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
     lc_pouch_close(pouch);
     return rc;
   }
-  rc = lc_pouch_path_ensure_directory(
-      pouch->root_path, "failed to create pouch root directory", error);
+  if (create)
+    rc = lc_pouch_path_ensure_directory(
+        pouch->root_path, "failed to create pouch root directory", error);
+  else if (stat(pouch->root_path, &root_stat) != 0 ||
+           !S_ISDIR(root_stat.st_mode))
+    rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                      "migration requires a legacy pouch directory", NULL, NULL,
+                      "pouch");
   if (rc != LC_OK) {
     lc_pouch_close(pouch);
     return rc;
@@ -4005,56 +3739,8 @@ int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
     lc_pouch_close(pouch);
     return rc;
   }
-  rc = lc_pouch_warm_open_namespaces(pouch, error);
-  if (rc != LC_OK) {
-    lc_pouch_close(pouch);
-    return rc;
-  }
-  rc = lc_pouch_compaction_worker_init(pouch, error);
-  if (rc != LC_OK) {
-    lc_pouch_close(pouch);
-    return rc;
-  }
-  rc = lc_pouch_runtime_start_indexing(pouch, error);
-  if (rc != LC_OK) {
-    lc_pouch_close(pouch);
-    return rc;
-  }
   *out = pouch;
-  {
-    pslog_field fields[12];
-
-    fields[0] = lc_log_str_field("path", pouch->root_path);
-    fields[1] = lc_log_str_field("query_engine", pouch->query_engine);
-    fields[2] =
-        lc_log_str_field("query_fallback_engine", pouch->query_fallback_engine);
-    fields[3] = lc_log_str_field("compression", pouch->compression);
-    fields[4] =
-        lc_log_bool_field("crypto", lc_pouch_crypto_enabled(pouch->crypto));
-    fields[5] =
-        lc_log_u64_field("segment_target_bytes", pouch->segment_target_bytes);
-    fields[6] = lc_log_bool_field("single_writer",
-                                  lc_pouch_single_writer_enabled(pouch));
-    fields[7] = lc_log_bool_field("background_compaction",
-                                  pouch->background_compaction_enabled);
-    fields[8] = lc_log_bool_field("durable_sync", pouch->durable_sync);
-    fields[9] =
-        lc_log_u64_field("indexer_flush_docs", pouch->indexer_flush_docs);
-    fields[10] = lc_log_u64_field("indexer_flush_interval_seconds",
-                                  pouch->indexer_flush_interval_seconds);
-    fields[11] =
-        lc_log_bool_field("query_indexing", pouch->query_indexing_enabled);
-    lc_log_info(pouch->logger, "open", fields, 12U);
-  }
   return LC_OK;
-}
-
-int lc_pouch_legacy_runtime_factory(void *context, const char *path,
-                                    const lc_allocator *allocator,
-                                    const lc_pouch_open_options *options,
-                                    lc_pouch **out, lc_error *error) {
-  (void)context;
-  return lc_pouch_open(path, allocator, options, out, error);
 }
 
 int lc_pouch_open_managed(const char *path, const lc_allocator *allocator,
@@ -4065,7 +3751,13 @@ int lc_pouch_open_managed(const char *path, const lc_allocator *allocator,
                                options && options->disable_migration, out,
                                error);
 #else
-  return lc_pouch_open(path, allocator, options, out, error);
+  (void)allocator;
+  (void)options;
+  if (out)
+    *out = NULL;
+  return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
+                      "single-file Pouch is unavailable on this platform", path,
+                      "pouch_container_unavailable", "pouch");
 #endif
 }
 

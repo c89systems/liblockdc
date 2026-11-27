@@ -356,6 +356,11 @@ typedef int (*lc_pouch_runtime_factory_fn)(void *, const char *,
 int lc_client_open_with_pouch_factory(const lc_client_config *,
                                       lc_pouch_runtime_factory_fn, void *,
                                       lc_client **, lc_error *);
+/* Prepare, lock and recover the legacy layout before a migration or opt-in
+ * receiver activates it. The create flag is exclusive to the receiver. */
+int lc_pouch_prepare_multifile(const char *, const lc_allocator *,
+                               const lc_pouch_open_options *, int create,
+                               lc_pouch **, lc_error *);
 int lc_pouch_legacy_runtime_factory(void *, const char *, const lc_allocator *,
                                     const lc_pouch_open_options *, lc_pouch **,
                                     lc_error *);

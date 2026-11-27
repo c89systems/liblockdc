@@ -9869,17 +9869,6 @@ static void lc_pouch_queue_dequeue_poll_delay(void) {
 static void lc_pouch_queue_touch_notification(lc_client_handle *client,
                                               const char *ns,
                                               const char *queue) {
-  lc_error ignored;
-  char text[256];
-  char sequence_text[32];
-  char *namespace_path;
-  char *notify_dir;
-  char *escaped_queue;
-  char *notify_leaf;
-  char *notify_path;
-  size_t leaf_len;
-  uint64_t sequence;
-
   if (client == NULL || client->pouch == NULL || ns == NULL || ns[0] == '\0' ||
       queue == NULL || queue[0] == '\0') {
     return;
@@ -9893,53 +9882,9 @@ static void lc_pouch_queue_touch_notification(lc_client_handle *client,
                                                ns, queue);
     return;
   }
-  lc_error_init(&ignored);
-  namespace_path = NULL;
-  notify_dir = NULL;
-  escaped_queue = NULL;
-  notify_leaf = NULL;
-  notify_path = NULL;
-  if (lc_pouch_namespace_ensure(&client->allocator, client->pouch->root_path,
-                                ns, &ignored) != LC_OK) {
-    goto cleanup;
-  }
-  namespace_path =
-      lc_pouch_namespace_path(&client->allocator, client->pouch->root_path, ns);
-  notify_dir = namespace_path != NULL
-                   ? lc_pouch_path_join(&client->allocator, namespace_path,
-                                        "queue-notify")
-                   : NULL;
-  escaped_queue = lc_pouch_path_escape_name(&client->allocator, queue);
-  if (notify_dir == NULL || escaped_queue == NULL) {
-    goto cleanup;
-  }
-  leaf_len = strlen(escaped_queue) + strlen(".notify") + 1U;
-  notify_leaf = (char *)lc_alloc_with_allocator(&client->allocator, leaf_len);
-  if (notify_leaf == NULL) {
-    goto cleanup;
-  }
-  snprintf(notify_leaf, leaf_len, "%s.notify", escaped_queue);
-  notify_path = lc_pouch_path_join(&client->allocator, notify_dir, notify_leaf);
-  if (notify_path == NULL) {
-    goto cleanup;
-  }
-  sequence = ++client->pouch->marker_sequence;
-  if (lc_u64_format_base10_padded((lc_u64)sequence, 20U, sequence_text,
-                                  sizeof(sequence_text)) < 0) {
-    goto cleanup;
-  }
-  snprintf(text, sizeof(text), "queue=%s\nsequence=%s\n%s", escaped_queue,
-           sequence_text,
-           (sequence % (uint64_t)2U) == (uint64_t)0U ? "pad=x\n" : "");
-  (void)lc_pouch_path_write_text_file(notify_path, text, NULL);
-
-cleanup:
-  lc_free_with_allocator(&client->allocator, notify_path);
-  lc_free_with_allocator(&client->allocator, notify_leaf);
-  lc_free_with_allocator(&client->allocator, escaped_queue);
-  lc_free_with_allocator(&client->allocator, notify_dir);
-  lc_free_with_allocator(&client->allocator, namespace_path);
-  lc_error_cleanup(&ignored);
+#ifdef LC_POUCH_MULTIFILE_RUNTIME
+  lc_pouch_multifile_queue_notify(client, ns, queue);
+#endif
 }
 
 static int lc_pouch_queue_payload_source(lc_client_handle *client,
@@ -16859,7 +16804,8 @@ static void lc_pouch_queue_watch_poll_delay(lc_client_handle *client,
                                             uint32_t observed) {
   struct timespec delay;
 
-  if (lc_pouch_queue_watch_wait(client->pouch, ns, queue, observed, 100U) >= 0) {
+  if (lc_pouch_queue_watch_wait(client->pouch, ns, queue, observed, 100U) >=
+      0) {
     return;
   }
 

@@ -5,7 +5,13 @@
 Pouch stores a root in one persistent file on Linux x86_64, AArch64, and ARM
 hard-float with GNU libc and musl, and on Apple Silicon with macOS 15.0 or
 later. New roots start at 10 MiB and grow in whole 1 MiB increments as needed.
-The implementation retains the multifile reader for migration and fixtures.
+The default library includes the multifile import and recovery code.
+
+Configure CMake with `-DLOCKDC_ENABLE_POUCH_MULTIFILE=ON` to include the
+writable multifile receiver. Open that receiver with an endpoint such as
+`pouch+multifile:///var/lib/my-service/legacy-root`. The ordinary `pouch://`
+endpoint selects the single-file receiver in either build. The option
+defaults to `OFF`.
 
 An eligible multifile directory migrates on open to a container at the same
 configured path. Migration requires exclusive ownership of the legacy root

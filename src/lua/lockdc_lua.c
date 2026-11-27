@@ -2453,7 +2453,9 @@ static int lcdc_open(lua_State *L) {
       for (i = 0U; i < endpoint_count; ++i) {
         lua_rawgeti(L, -1, (lua_Integer)(i + 1U));
         endpoints[i] = luaL_checkstring(L, -1);
-        if (strncmp(endpoints[i], "pouch://", 8U) == 0 &&
+        if ((strncmp(endpoints[i], "pouch://", 8U) == 0 ||
+             strncmp(endpoints[i], "pouch+multifile://",
+                     sizeof("pouch+multifile://") - 1U) == 0) &&
             strchr(endpoints[i], '?') != NULL) {
           lua_pop(L, 2);
           free(endpoints);

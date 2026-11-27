@@ -54,6 +54,7 @@ option(LOCKDC_BUILD_DEPENDENCIES "Provision vendored dependency artifacts needed
 option(LOCKDC_BUILD_EXAMPLES "Build example programs." ON)
 option(LOCKDC_BUILD_TESTS "Build unit tests." ON)
 option(LOCKDC_BUILD_LUA_BINDINGS "Build the optional Lua extension when Lua headers are available." ON)
+option(LOCKDC_ENABLE_POUCH_MULTIFILE "Enable writable pouch+multifile:// receivers." OFF)
 set(LOCKDC_POSTGRES_DEFAULT OFF)
 if(NOT DEFINED LOCKDC_BUILD_POSTGRES AND DEFINED ENV{LOCKDC_BUILD_POSTGRES}
    AND NOT "$ENV{LOCKDC_BUILD_POSTGRES}" STREQUAL "")
@@ -572,7 +573,6 @@ set(lc_sources
     src/lc_collection_index.c
     src/lc_collection_payload.c
     src/lc_collection_query_storage.c
-    src/lc_collection_query_file.c
     src/lc_collection_query_build.c
     src/lc_collection_query_plan.c
     src/lc_collection_query_maintenance.c
@@ -622,7 +622,6 @@ set(lc_sources
     src/lc_pouch_crypto.c
     src/lc_pouch_index.c
     src/lc_pouch_index_artifact.c
-    src/lc_pouch_index_file.c
     src/lc_pouch_index_doc.c
     src/lc_pouch_index_posting.c
     src/lc_pouch_index_result.c
@@ -732,6 +731,22 @@ function(lc_configure_library_target target)
         target_sources(${target} PRIVATE $<TARGET_OBJECTS:lc_objects>)
     else()
         target_sources(${target} PRIVATE ${lc_sources})
+        if(LOCKDC_ENABLE_POUCH_MULTIFILE OR target STREQUAL "lc_test_static")
+            target_sources(${target} PRIVATE
+                src/lc_pouch_multifile.c
+                src/lc_pouch_multifile_queue.c
+                src/lc_pouch_index_file.c
+                src/lc_collection_multifile_catalog.c
+                src/lc_collection_multifile_maintenance.c
+                src/lc_collection_multifile_storage.c
+                src/lc_collection_multifile_cleanup.c
+                src/lc_collection_query_file.c
+                src/lc_collection_multifile_query_cleanup.c)
+            target_compile_definitions(${target} PRIVATE LC_POUCH_MULTIFILE_RUNTIME=1)
+        endif()
+        if(LOCKDC_ENABLE_POUCH_MULTIFILE)
+            target_compile_definitions(${target} PRIVATE LOCKDC_ENABLE_POUCH_MULTIFILE=1)
+        endif()
         if(lc_pouch_container_dir)
             target_include_directories(${target} PRIVATE "${lc_pouch_container_dir}")
             target_compile_definitions(${target} PRIVATE LOCKDC_POUCH_CONTAINER=1)

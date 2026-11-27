@@ -1,6 +1,7 @@
 #include "bench_pouch.h"
 
 #ifdef LOCKDC_POUCH_SPACE_BENCH
+#include "lc_pouch_storage.h"
 #include "pouch.h"
 
 #include <limits.h>
@@ -47,7 +48,7 @@ int bench_open_pouch(const lc_client_config *config, int create,
   if (backend && strcmp(backend, "single-file") == 0)
     return ps_pouch_client_open(&selected, create, &options, out, error);
   if (!backend || strcmp(backend, "multifile") == 0)
-    return lc_client_open(&selected, out, error);
+    return lc_pouch_legacy_client_open(&selected, out, error);
   return lc_error_set(error, LC_ERR_INVALID, 0L,
                       "LOCKDC_BENCH_BACKEND must be single-file or multifile",
                       NULL, NULL, NULL);

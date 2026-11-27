@@ -22,8 +22,13 @@ static int failure(lc_error *e, int code, const char *message) {
 }
 static const lc_pouch_index_store_ops *store(lc_pouch *pouch, void **context) {
   *context = pouch->storage.ops ? pouch->storage.context : (void *)pouch;
-  if (!pouch->storage.ops)
+  if (!pouch->storage.ops) {
+#ifdef LC_POUCH_MULTIFILE_RUNTIME
     return &lc_pouch_index_file_ops;
+#else
+    return NULL;
+#endif
+  }
   return pouch->storage.ops->query_indexes
              ? pouch->storage.ops->query_indexes(pouch->storage.context,
                                                  context)

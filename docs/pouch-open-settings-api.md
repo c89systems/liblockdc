@@ -20,6 +20,12 @@ that need multiple active local writers by adding `?single_writer=false`; that
 mode preserves correctness and process fencing but is not the primary
 performance target.
 
+`pouch+multifile://` selects the writable directory receiver when the library
+was built with `-DLOCKDC_ENABLE_POUCH_MULTIFILE=ON`. It uses the same Pouch
+settings and absolute path syntax. With the default build, the scheme returns
+`pouch_multifile_disabled`. Automatic migration through `pouch://` works in
+both builds.
+
 See the [storage specification](pouch-storage.md) for on-disk representation,
 recovery and maintenance semantics.
 

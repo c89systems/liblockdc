@@ -30,6 +30,29 @@ function(lc_add_integration_test target_name)
   endif()
 endfunction()
 
+if(TARGET lc_static AND lc_pouch_container_dir)
+  add_executable(lc_pouch_multifile_fixture test_pouch_multifile_admission.c)
+  target_compile_definitions(lc_pouch_multifile_fixture PRIVATE
+    LC_POUCH_MULTIFILE_FIXTURE=1)
+  target_link_libraries(lc_pouch_multifile_fixture PRIVATE lc_test_static)
+  lc_configure_c_test_target(lc_pouch_multifile_fixture)
+
+  add_executable(lc_pouch_multifile_admission_test
+    test_pouch_multifile_admission.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_link_libraries(lc_pouch_multifile_admission_test PRIVATE lc_static)
+  lc_configure_c_test_target(lc_pouch_multifile_admission_test)
+  add_dependencies(lc_pouch_multifile_admission_test lc_pouch_multifile_fixture)
+  add_test(NAME pouch_multifile_admission
+    COMMAND lc_pouch_multifile_admission_test "${CMAKE_CURRENT_BINARY_DIR}"
+      $<TARGET_FILE:lc_pouch_multifile_fixture> $<BOOL:${LOCKDC_ENABLE_POUCH_MULTIFILE}>)
+  set_tests_properties(pouch_multifile_admission PROPERTIES
+    LABELS "integration;offline;pouch" TIMEOUT 30)
+  if(LOCKDC_C_TEST_ENVIRONMENT)
+    set_tests_properties(pouch_multifile_admission PROPERTIES
+      ENVIRONMENT "${LOCKDC_C_TEST_ENVIRONMENT}")
+  endif()
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(lc_openssl_key_failure_test test_openssl_key_failure.c)
   target_link_libraries(lc_openssl_key_failure_test PRIVATE
@@ -237,7 +260,7 @@ endif()
 if(TARGET lc_static AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(lc_pouch_compaction_stack_test test_pouch_compaction_stack.c
     ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
-  target_link_libraries(lc_pouch_compaction_stack_test PRIVATE lc_static)
+  target_link_libraries(lc_pouch_compaction_stack_test PRIVATE lc_test_static)
   target_include_directories(lc_pouch_compaction_stack_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   lc_configure_c_test_target(lc_pouch_compaction_stack_test)
   if(LOCKDC_TARGET_LIBC STREQUAL "musl")
