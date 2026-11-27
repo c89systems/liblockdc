@@ -350,6 +350,11 @@ static int sync_file_if(ps_space *s, int recovery_only, lc_error *error) {
 static int sync_file(ps_space *s, lc_error *error) {
   return sync_file_if(s, 0, error);
 }
+#ifdef __APPLE__
+int ps_internal_sync_published_root(ps_space *s, lc_error *error) {
+  return sync_file(s, error);
+}
+#endif
 static void mark_durable(ps_space *s, uint64_t sequence) {
   pthread_mutex_lock(&s->commit_mutex);
   if (sequence > __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED))
@@ -7697,7 +7702,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
 #ifdef __APPLE__
     /* Flush the directory entry to the device after syncing its parent. */
     if (rc == LC_OK)
-      rc = sync_file(s, error);
+      rc = ps_internal_sync_published_root(s, error);
 #endif
   } else if (rc == LC_OK)
     rc = recover(s, &opening, error);

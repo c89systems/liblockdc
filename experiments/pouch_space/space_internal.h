@@ -22,6 +22,9 @@ extern const ps_io ps_native_io;
  * committed. Ordinary physical opens release authority before returning. */
 int ps_internal_open(const char *, int create, const ps_options *,
                      int hold_initialization, ps_space **, lc_error *);
+#ifdef __APPLE__
+int ps_internal_sync_published_root(ps_space *, lc_error *);
+#endif
 typedef struct ps_catalog_index {
   struct ps_entry **buckets;
   size_t capacity, count;

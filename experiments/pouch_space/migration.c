@@ -17,6 +17,8 @@
 #ifdef __linux__
 #include <linux/fs.h>
 #include <sys/syscall.h>
+#elif defined(__APPLE__)
+#include "space_internal.h"
 #endif
 
 typedef struct migration_path {
@@ -558,6 +560,95 @@ static int existing_root(const char *path, const lc_allocator *allocator,
   return ps_pouch_state_open(path, 0, allocator, options, out, e);
 }
 
+static int publish_new_root(const char *stage, const char *root, int *competed,
+                            lc_error *error) {
+  int reason;
+#if defined(__linux__) && defined(SYS_renameat2)
+  if (syscall(SYS_renameat2, AT_FDCWD, stage, AT_FDCWD, root,
+              RENAME_NOREPLACE) == 0)
+    return LC_OK;
+#elif defined(__APPLE__)
+  if (renamex_np(stage, root, RENAME_EXCL) == 0)
+    return LC_OK;
+#else
+  (void)stage;
+  (void)root;
+  errno = ENOSYS;
+#endif
+  reason = errno;
+  *competed = reason == EEXIST;
+  return failure(error, LC_ERR_TRANSPORT, NULL, "cannot publish new pouch root",
+                 strerror(reason));
+}
+
+static int create_root(const migration_path *paths,
+                       const ps_pouch_state_options *options, int *competed,
+                       lc_pouch **out, lc_error *error) {
+  const lc_allocator *a = paths->allocator;
+  ps_pouch_state_options private_options = *options;
+  lc_pouch *pouch = NULL;
+  char *directory, *stage = NULL, *root = NULL;
+  int rc;
+  directory = lc_pouch_path_join(a, paths->parent, ".pouch-create-XXXXXX");
+  if (!directory)
+    return failure(error, LC_ERR_NOMEM, NULL,
+                   "cannot allocate new pouch staging directory", paths->root);
+  if (!mkdtemp(directory)) {
+    rc = failure(error, LC_ERR_TRANSPORT, NULL,
+                 "cannot create pouch staging directory", strerror(errno));
+    goto done;
+  }
+  stage = lc_pouch_path_join(a, directory, "store");
+  if (!stage) {
+    rc = failure(error, LC_ERR_NOMEM, NULL, "cannot allocate new pouch path",
+                 paths->root);
+    goto cleanup;
+  }
+  private_options.defer_workers = 1;
+  rc = ps_pouch_state_open(stage, 1, a, &private_options, &pouch, error);
+  if (rc == LC_OK) {
+    root = lc_strdup_with_allocator(&pouch->allocator, paths->root);
+    if (!root)
+      rc = failure(error, LC_ERR_NOMEM, NULL, "cannot retain new pouch path",
+                   paths->root);
+  }
+  /* Commit the physical store and its root control before exposing the inode.
+   * The creator holds lifetime ownership across publication. */
+  if (rc == LC_OK)
+    rc = ps_flush(ps_root_space(ps_pouch_state_root(pouch)), error);
+  if (rc == LC_OK)
+    rc = publish_new_root(stage, paths->root, competed, error);
+  if (rc == LC_OK) {
+    lc_free_with_allocator(&pouch->allocator, pouch->root_path);
+    pouch->root_path = root;
+    root = NULL;
+  } else {
+    if (root)
+      lc_free_with_allocator(&pouch->allocator, root);
+    lc_pouch_close(pouch);
+    pouch = NULL;
+    (void)unlink(stage);
+  }
+cleanup:
+  (void)rmdir(directory);
+  if (rc == LC_OK)
+    rc = lc_pouch_path_fsync_directory(paths->parent,
+                                       "cannot sync new pouch root", error);
+#ifdef __APPLE__
+  if (rc == LC_OK)
+    rc = ps_internal_sync_published_root(
+        ps_root_space(ps_pouch_state_root(pouch)), error);
+#endif
+  if (rc == LC_OK)
+    *out = pouch;
+  else
+    lc_pouch_close(pouch);
+done:
+  lc_free_with_allocator(a, stage);
+  lc_free_with_allocator(a, directory);
+  return rc;
+}
+
 int ps_pouch_open_managed(const char *path, const lc_allocator *allocator,
                           const lc_pouch_open_options *logical,
                           int disable_migration, lc_pouch **out,
@@ -567,7 +658,7 @@ int ps_pouch_open_managed(const char *path, const lc_allocator *allocator,
   struct stat info;
   lc_error local = {0};
   char *default_key_file = NULL;
-  int create = 0, directory = 0, rc;
+  int create = 0, directory = 0, competed = 0, rc;
   if (!out)
     return failure(error, LC_ERR_INVALID, NULL, "pouch open requires output",
                    path);
@@ -585,6 +676,21 @@ int ps_pouch_open_managed(const char *path, const lc_allocator *allocator,
       rc = failure(error, LC_ERR_TRANSPORT, NULL, "cannot inspect pouch root",
                    paths.root);
   }
+  if (rc == LC_OK && create)
+    rc = resolve_key(&options.logical, allocator, 1, &default_key_file, error);
+  if (rc == LC_OK && create)
+    rc = lc_pouch_path_ensure_directory(
+        paths.parent, "cannot create pouch parent directory", error);
+  if (rc == LC_OK && create)
+    rc = create_root(&paths, &options, &competed, out, error);
+  if (competed) {
+    lc_error_cleanup(error);
+    create = 0;
+    rc = lstat(paths.root, &info) == 0
+             ? LC_OK
+             : failure(error, LC_ERR_TRANSPORT, NULL,
+                       "cannot inspect competing pouch root", paths.root);
+  }
   directory = rc == LC_OK && !create && S_ISDIR(info.st_mode);
   if (directory) {
     rc = migrate(&paths, &options, disable_migration, &info, &default_key_file,
@@ -593,23 +699,18 @@ int ps_pouch_open_managed(const char *path, const lc_allocator *allocator,
     rc = failure(error, LC_ERR_INVALID, "pouch_migration_layout",
                  "pouch root must be a regular file or legacy directory",
                  paths.root);
-  if (rc == LC_OK && !directory)
-    rc = resolve_key(&options.logical, allocator, create, &default_key_file,
-                     error);
-  if (rc == LC_OK && create)
-    rc = lc_pouch_path_ensure_directory(
-        paths.parent, "cannot create pouch parent directory", error);
-  if (rc == LC_OK && !directory)
-    rc = create ? ps_pouch_state_open(paths.root, 1, allocator, &options, out,
-                                      error)
-                : existing_root(paths.root, allocator, &options, out, error);
-  if (rc == LC_OK && directory) {
+  if (rc == LC_OK && !create && !directory) {
+    rc = resolve_key(&options.logical, allocator, 0, &default_key_file, error);
+    if (rc == LC_OK)
+      rc = existing_root(paths.root, allocator, &options, out, error);
+    if (rc == LC_OK)
+      rc = finish_migration(&paths, *out, error);
+  }
+  if (rc == LC_OK && (create || directory)) {
     rc = lc_pouch_runtime_start_maintenance(*out, error);
     if (rc == LC_OK)
       rc = lc_pouch_runtime_start_indexing(*out, error);
   }
-  if (rc == LC_OK && !create && !directory)
-    rc = finish_migration(&paths, *out, error);
   if (rc != LC_OK && *out) {
     lc_pouch_close(*out);
     *out = NULL;
