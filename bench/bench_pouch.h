@@ -3,8 +3,8 @@
 
 #include "lc/lc.h"
 
-/* Experimental runs can put both stores at the same child path of a
- * benchmark-owned temporary directory. Standalone probes pass a fresh path. */
+/* A benchmark-owned temporary directory holds the store at a child path.
+ * Standalone probes pass the store path directly. */
 int bench_open_pouch(const lc_client_config *config, int create,
                      int owned_directory, lc_client **out, lc_error *error);
 

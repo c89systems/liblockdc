@@ -10368,7 +10368,7 @@ static int lc_pouch_legacy_history_file(lc_pouch_legacy_history *history,
                      "cannot open legacy history segment", path, NULL, "pouch");
   while (rc == LC_OK) {
     lc_pouch_state_cache_record *selected;
-    int found, truncated;
+    int found = 0, truncated = 0;
     rc = lc_pouch_state_read_next_record(file, &pouch->allocator, leaf, active,
                                          0, NULL, (uint64_t)info.st_size,
                                          &entry, &found, &truncated, error);

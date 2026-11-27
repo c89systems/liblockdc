@@ -8,6 +8,7 @@
 
 #include "../support/lc_test_tmp.h"
 #include "lc/lc.h"
+#include "lc_api_internal.h"
 #include "lc_pouch.h"
 
 #define FUZZ_POUCH_LQL_TMP_PREFIX "/tmp/liblockdc-pouch-lql-fuzz-"
@@ -65,13 +66,14 @@ static lc_source *fuzz_source_from_text(const char *text, lc_error *error) {
 static int fuzz_open_client(const char *root, int scan_mode,
                             const fuzz_storage_mode *mode, lc_client **out,
                             lc_error *error) {
+  const char *scheme =
+      LC_POUCH_INTEGRATION_MULTIFILE ? "pouch+multifile" : "pouch";
   char endpoint[512];
   const char *endpoints[1];
   lc_client_config config;
 
-  (void)snprintf(endpoint, sizeof(endpoint),
-                 scan_mode ? "pouch://%s?query_engine=scan" : "pouch://%s",
-                 root);
+  (void)snprintf(endpoint, sizeof(endpoint), "%s://%s%s", scheme, root,
+                 scan_mode ? "?query_engine=scan" : "");
   endpoints[0] = endpoint;
   lc_client_config_init(&config);
   config.endpoints = endpoints;
@@ -171,31 +173,23 @@ static int fuzz_seed_store(lc_client *client, lc_error *error) {
 static int fuzz_install_snapshot(const char *root,
                                  const fuzz_storage_mode *mode,
                                  lc_error *error) {
-  lc_pouch *pouch;
-  lc_pouch_open_options open_options;
+  lc_client *client = NULL;
   lc_pouch_maintenance_options maintenance_options;
   lc_pouch_maintenance_result maintenance_result;
   int rc;
 
-  pouch = NULL;
-  memset(&open_options, 0, sizeof(open_options));
   memset(&maintenance_options, 0, sizeof(maintenance_options));
   memset(&maintenance_result, 0, sizeof(maintenance_result));
-  if (mode != NULL) {
-    open_options.crypto_key = mode->crypto_key;
-    open_options.compression = mode->compression;
-  }
-  rc = lc_pouch_open(root, NULL, &open_options, &pouch, error);
+  rc = fuzz_open_client(root, 0, mode, &client, error);
   if (rc == LC_OK) {
     maintenance_options.ns = "fuzz";
     maintenance_options.force = 1;
-    rc = lc_pouch_maintenance_run(pouch, &maintenance_options,
-                                  &maintenance_result, error);
+    rc = lc_pouch_maintenance_run(((lc_client_handle *)client)->pouch,
+                                  &maintenance_options, &maintenance_result,
+                                  error);
   }
   lc_pouch_maintenance_result_cleanup(NULL, &maintenance_result);
-  if (pouch != NULL) {
-    lc_pouch_close(pouch);
-  }
+  lc_client_close(client);
   return rc;
 }
 
@@ -485,11 +479,20 @@ static char *fuzz_selector_from_input(const uint8_t *data, size_t size,
   return selector;
 }
 
+static void fuzz_require_open(int rc, const fuzz_storage_mode *mode,
+                              const lc_error *error) {
+  if (rc != LC_OK) {
+    fprintf(stderr, "pouch LQL fixture failed in %s mode: %d %s\n", mode->name,
+            rc, error->message ? error->message : "");
+    abort();
+  }
+}
+
 static void fuzz_run_mode(size_t size, const fuzz_storage_mode *mode,
                           const char *selector, int selector_is_lql) {
   char root_template[] = "/tmp/liblockdc-pouch-lql-fuzz-XXXXXX";
   char root_path[sizeof(root_template)];
-  const char *root;
+  char root[sizeof(root_path) + sizeof("/store")];
   lc_client *index_client;
   lc_client *scan_client;
   lc_error index_error;
@@ -498,13 +501,12 @@ static void fuzz_run_mode(size_t size, const fuzz_storage_mode *mode,
   size_t scan_rows;
   int index_rc;
   int scan_rc;
-  unsigned int damage;
 
   if (!lc_test_tmp_mkdtemp(root_template, root_path, sizeof(root_path),
                            FUZZ_POUCH_LQL_TMP_PREFIX)) {
     return;
   }
-  root = root_path;
+  (void)snprintf(root, sizeof(root), "%s/store", root_path);
 
   index_client = NULL;
   scan_client = NULL;
@@ -513,43 +515,44 @@ static void fuzz_run_mode(size_t size, const fuzz_storage_mode *mode,
   lc_error_init(&index_error);
   lc_error_init(&scan_error);
 
-  index_rc = fuzz_open_client(root, 0, mode, &index_client, &index_error);
-  if (index_rc == LC_OK) {
-    index_rc = fuzz_seed_store(index_client, &index_error);
-    if (index_rc == LC_OK) {
-      index_client->close(index_client);
-      index_client = NULL;
-      index_rc = fuzz_install_snapshot(root, mode, &index_error);
-    }
-    if (index_rc == LC_OK) {
-      damage = (unsigned int)size;
-      fuzz_damage_snapshot(root, (damage / 64U) % 4U);
-      fuzz_damage_namespace_manifest(root, (damage / 4U) % 4U);
-      fuzz_damage_marker(root, (damage / 16U) % 4U);
-      fuzz_damage_query_index(root, damage % 8U);
-      index_rc = fuzz_open_client(root, 0, mode, &index_client, &index_error);
-    }
+  fuzz_require_open(
+      fuzz_open_client(root, 0, mode, &index_client, &index_error), mode,
+      &index_error);
+  fuzz_require_open(fuzz_seed_store(index_client, &index_error), mode,
+                    &index_error);
+  lc_client_close(index_client);
+  index_client = NULL;
+  fuzz_require_open(fuzz_install_snapshot(root, mode, &index_error), mode,
+                    &index_error);
+  if (LC_POUCH_INTEGRATION_MULTIFILE) {
+    unsigned int damage = (unsigned int)size;
+    fuzz_damage_snapshot(root, (damage / 64U) % 4U);
+    fuzz_damage_namespace_manifest(root, (damage / 4U) % 4U);
+    fuzz_damage_marker(root, (damage / 16U) % 4U);
+    fuzz_damage_query_index(root, damage % 8U);
   }
-  scan_rc = fuzz_open_client(root, 1, mode, &scan_client, &scan_error);
-  if (index_rc == LC_OK && scan_rc == LC_OK) {
+  index_rc = fuzz_open_client(root, 0, mode, &index_client, &index_error);
+  if (!LC_POUCH_INTEGRATION_MULTIFILE)
+    fuzz_require_open(index_rc, mode, &index_error);
+  if (index_rc == LC_OK)
     index_rc = fuzz_query_keys(index_client, selector, selector_is_lql,
                                &index_rows, &index_error);
+  lc_client_close(index_client);
+
+  scan_rc = fuzz_open_client(root, 1, mode, &scan_client, &scan_error);
+  if (!LC_POUCH_INTEGRATION_MULTIFILE)
+    fuzz_require_open(scan_rc, mode, &scan_error);
+  if (scan_rc == LC_OK)
     scan_rc = fuzz_query_keys(scan_client, selector, selector_is_lql,
                               &scan_rows, &scan_error);
-    if (index_rc == LC_OK && scan_rc == LC_OK && index_rows != scan_rows) {
-      abort();
-    }
+  if (index_rc == LC_OK && scan_rc == LC_OK && index_rows != scan_rows) {
+    abort();
   }
 
-  if (scan_client != NULL) {
-    scan_client->close(scan_client);
-  }
-  if (index_client != NULL) {
-    index_client->close(index_client);
-  }
+  lc_client_close(scan_client);
   lc_error_cleanup(&scan_error);
   lc_error_cleanup(&index_error);
-  fuzz_cleanup_root(root);
+  fuzz_cleanup_root(root_path);
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {

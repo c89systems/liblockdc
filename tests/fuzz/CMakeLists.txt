@@ -20,6 +20,8 @@ function(lc_add_pouch_integration_target target_name)
     ${ARGN}
   )
   target_link_libraries(${target_name} PRIVATE lc_static)
+  target_compile_definitions(${target_name} PRIVATE
+    LC_POUCH_INTEGRATION_MULTIFILE=$<BOOL:${LOCKDC_ENABLE_POUCH_MULTIFILE}>)
   target_include_directories(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
   lc_configure_c_test_target(${target_name})
 endfunction()
@@ -98,6 +100,22 @@ if(LOCKDC_BUILD_POUCH_INTEGRATION_FUZZERS)
     lc_pouch_integration_lql_plan lc_pouch_integration_lifecycle
     lc_pouch_integration_outbox_dispatcher lc_pouch_integration_mutation_runner
     lc_pouch_integration_hang_probe lc_pouch_integration_success_probe)
+
+  add_test(NAME lc_pouch_integration_lql_plan_seed
+    COMMAND lc_pouch_integration_lql_plan
+      "${CMAKE_CURRENT_SOURCE_DIR}/corpus/pouch_lql_plan/lql_full_text_any")
+  add_test(NAME lc_pouch_integration_lifecycle_seed
+    COMMAND lc_pouch_integration_lifecycle
+      "${CMAKE_CURRENT_SOURCE_DIR}/corpus/pouch_lifecycle/maintenance.bin")
+  add_test(NAME lc_pouch_integration_outbox_dispatcher_seed
+    COMMAND lc_pouch_integration_outbox_dispatcher
+      "${CMAKE_CURRENT_SOURCE_DIR}/corpus/pouch_outbox_dispatcher/seed.bin")
+  set_tests_properties(
+    lc_pouch_integration_lql_plan_seed
+    lc_pouch_integration_lifecycle_seed
+    lc_pouch_integration_outbox_dispatcher_seed
+    PROPERTIES LABELS "fuzz;integration;offline" TIMEOUT 30
+    ENVIRONMENT "${LOCKDC_C_TEST_ENVIRONMENT}")
 
   add_test(NAME lc_pouch_integration_lql_plan_mutation_smoke
     COMMAND lc_pouch_integration_mutation_runner

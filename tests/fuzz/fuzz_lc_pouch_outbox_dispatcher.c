@@ -56,7 +56,7 @@ static void outbox_fuzz_run(const uint8_t *data, size_t size,
   payload = NULL;
   checkpoint = NULL;
   lc_error_init(&error);
-  (void)snprintf(endpoint, sizeof(endpoint), "pouch://%s", root);
+  (void)snprintf(endpoint, sizeof(endpoint), "pouch://%s/store", root);
   endpoints[0] = endpoint;
   lc_client_config_init(&client_config);
   client_config.endpoints = endpoints;

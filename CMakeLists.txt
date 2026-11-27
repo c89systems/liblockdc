@@ -1261,6 +1261,14 @@ if(LOCKDC_BUILD_TESTS)
             set_tests_properties(lockdc_bench_short_help PROPERTIES
                 ENVIRONMENT "${LOCKDC_C_TEST_ENVIRONMENT}")
         endif()
+
+        if(lc_pouch_container_dir)
+            add_test(NAME lockdc_bench_collections_smoke COMMAND lockdc_bench 2 collections)
+            set_tests_properties(lockdc_bench_collections_smoke PROPERTIES
+                LABELS "local;smoke"
+                TIMEOUT 30
+                ENVIRONMENT "${LOCKDC_C_TEST_ENVIRONMENT}")
+        endif()
     endif()
 
     if(TARGET lc_shared AND TARGET lc_static)

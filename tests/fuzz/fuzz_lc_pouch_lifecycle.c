@@ -6,6 +6,7 @@
 
 #include "../support/lc_test_tmp.h"
 #include "lc/lc.h"
+#include "lc_api_internal.h"
 #include "lc_pouch.h"
 
 #define FUZZ_POUCH_LIFECYCLE_TMP_PREFIX "/tmp/liblockdc-pouch-lifecycle-fuzz-"
@@ -98,11 +99,13 @@ static void lifecycle_material_from_input(const uint8_t *data, size_t size,
 
 static int lifecycle_open_client(const char *root, const lifecycle_mode *mode,
                                  lc_client **out, lc_error *error) {
+  const char *scheme =
+      LC_POUCH_INTEGRATION_MULTIFILE ? "pouch+multifile" : "pouch";
   char endpoint[768];
   const char *endpoints[1];
   lc_client_config config;
 
-  (void)snprintf(endpoint, sizeof(endpoint), "pouch://%s", root);
+  (void)snprintf(endpoint, sizeof(endpoint), "%s://%s", scheme, root);
   endpoints[0] = endpoint;
   lc_client_config_init(&config);
   config.endpoints = endpoints;
@@ -251,34 +254,26 @@ static int lifecycle_run_maintenance(const char *root, const char *ns,
                                      long retention_cutoff,
                                      const lifecycle_mode *mode,
                                      lc_error *error) {
-  lc_pouch *pouch;
-  lc_pouch_open_options open_options;
+  lc_client *client = NULL;
   lc_pouch_maintenance_options maintenance_options;
   lc_pouch_maintenance_result maintenance_result;
   int rc;
 
-  pouch = NULL;
-  memset(&open_options, 0, sizeof(open_options));
   memset(&maintenance_options, 0, sizeof(maintenance_options));
   memset(&maintenance_result, 0, sizeof(maintenance_result));
-  if (mode != NULL) {
-    open_options.crypto_key = mode->crypto_key;
-    open_options.compression = mode->compression;
-  }
-  rc = lc_pouch_open(root, NULL, &open_options, &pouch, error);
+  rc = lifecycle_open_client(root, mode, &client, error);
   if (rc == LC_OK) {
     maintenance_options.ns = ns;
     maintenance_options.force = force;
     maintenance_options.cleanup_only = cleanup_only;
     maintenance_options.terminal_reclaim = terminal_reclaim;
     maintenance_options.retention_updated_before_unix = retention_cutoff;
-    rc = lc_pouch_maintenance_run(pouch, &maintenance_options,
-                                  &maintenance_result, error);
+    rc = lc_pouch_maintenance_run(((lc_client_handle *)client)->pouch,
+                                  &maintenance_options, &maintenance_result,
+                                  error);
   }
   lc_pouch_maintenance_result_cleanup(NULL, &maintenance_result);
-  if (pouch != NULL) {
-    lc_pouch_close(pouch);
-  }
+  lc_client_close(client);
   return rc;
 }
 
@@ -454,7 +449,7 @@ static void lifecycle_run_input(const uint8_t *data, size_t size,
                                 const lifecycle_mode *mode) {
   char root_template[] = "/tmp/liblockdc-pouch-lifecycle-fuzz-XXXXXX";
   char root_path[sizeof(root_template)];
-  const char *root;
+  char root[sizeof(root_path) + sizeof("/store")];
   const char *stage;
   lc_client *client;
   lc_error error;
@@ -468,7 +463,7 @@ static void lifecycle_run_input(const uint8_t *data, size_t size,
                            FUZZ_POUCH_LIFECYCLE_TMP_PREFIX)) {
     return;
   }
-  root = root_path;
+  (void)snprintf(root, sizeof(root), "%s/store", root_path);
   stage = "open";
   client = NULL;
   knobs = size == 0U ? 0U : (unsigned int)data[0];
@@ -525,7 +520,7 @@ static void lifecycle_run_input(const uint8_t *data, size_t size,
     rc = lifecycle_run_maintenance(root, "life-retain", 0, 0, 0, 2147483647L,
                                    mode, &error);
   }
-  if (rc == LC_OK) {
+  if (rc == LC_OK && LC_POUCH_INTEGRATION_MULTIFILE) {
     unsigned int damage;
 
     damage = size > 1U ? (unsigned int)data[1] : knobs;
@@ -551,7 +546,7 @@ static void lifecycle_run_input(const uint8_t *data, size_t size,
   if (client != NULL) {
     client->close(client);
   }
-  lc_test_tmp_cleanup_path(root, FUZZ_POUCH_LIFECYCLE_TMP_PREFIX);
+  lc_test_tmp_cleanup_path(root_path, FUZZ_POUCH_LIFECYCLE_TMP_PREFIX);
   if (rc != LC_OK) {
     (void)fprintf(stderr,
                   "pouch lifecycle fuzz failed in %s mode at %s: rc=%d %s\n",
