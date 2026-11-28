@@ -150,6 +150,8 @@ set(lc_portability_lc_unit_collections
 # encoding/width, source-retirement, alias and durable-journal seams on every
 # optimized native/musl/QEMU runtime without repeating the full crash matrix.
 set(lc_portability_lc_unit_pouch_compression
+  test_plaintext_recode_bound_preserves_large_lengths
+  test_stream_bound_checks_only_the_active_codec
   test_stream_unit_output_sync_and_power_loss
   test_both_directions_preserve_shared_payloads
   test_encrypted_both_directions

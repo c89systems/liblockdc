@@ -2780,19 +2780,21 @@ int lc_pouch_crypto_writer_finish(lc_pouch_crypto_writer *out,
 
 static uint64_t lc_pouch_crypto_encoded_bound(uint64_t plain, int encrypted,
                                               int compressed) {
-  uint64_t encoded, frames;
-  if (plain > ((uint64_t)ULONG_MAX - 64U) / 2U)
-    return LC_U64_MAX;
-  encoded = compressed ? (uint64_t)compressBound((uLong)plain) : plain;
-  if (encrypted) {
-    frames = encoded <= LC_POUCH_FIRST_FRAME_PLAINTEXT_BYTES
-                 ? 1U
-                 : 1U + (encoded - LC_POUCH_FIRST_FRAME_PLAINTEXT_BYTES +
-                         LC_POUCH_FRAME_PLAINTEXT_BYTES - 1U) /
-                            LC_POUCH_FRAME_PLAINTEXT_BYTES;
-    if (frames > (LC_U64_MAX - encoded) / (8U + LC_POUCH_GCM_TAG_BYTES) - 1U)
+  uint64_t encoded = plain;
+  if (compressed) {
+    if (plain > ((uint64_t)ULONG_MAX - 64U) / 2U)
       return LC_U64_MAX;
-    encoded += (frames + 1U) * (8U + LC_POUCH_GCM_TAG_BYTES);
+    encoded = (uint64_t)compressBound((uLong)plain);
+  }
+  if (encrypted) {
+    const unsigned int overhead = 8U + LC_POUCH_GCM_TAG_BYTES;
+    uint64_t frames = 2U; /* First data frame and terminal frame. */
+    if (encoded > LC_POUCH_FIRST_FRAME_PLAINTEXT_BYTES)
+      frames += 1U + (encoded - LC_POUCH_FIRST_FRAME_PLAINTEXT_BYTES - 1U) /
+                         LC_POUCH_FRAME_PLAINTEXT_BYTES;
+    if (frames > (LC_U64_MAX - encoded) / overhead)
+      return LC_U64_MAX;
+    encoded += frames * overhead;
   }
   return encoded;
 }

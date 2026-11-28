@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pslog.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -19,6 +20,7 @@
 #include "../support/lc_test_tmp.h"
 #include "lc_api_internal.h"
 #include "lc_collection_internal.h"
+#include "lc_intcompat.h"
 #include "lc_pouch.h"
 #include "lc_pouch_crypto.h"
 #include "lc_pouch_namespace.h"
@@ -2817,8 +2819,82 @@ static void test_stream_unit_output_sync_and_power_loss(void **state) {
   free(watch);
 }
 
+static void test_plaintext_recode_bound_preserves_large_lengths(void **state) {
+  static const uint64_t sizes[] = {(uint64_t)INT32_MAX - 16U,
+                                   (uint64_t)UINT32_MAX + 1U};
+  static const char leaf[] = "seg-00000000000000000001.log";
+  lc_pouch_state_entry entry = {0};
+  lc_pouch_state_recode_bounds bounds;
+  lc_allocator allocator;
+  lc_error error = {0};
+  size_t i;
+  (void)state;
+
+  lc_allocator_init(&allocator);
+  entry.key = "value";
+  entry.content_type = "application/octet-stream";
+  entry.etag =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  entry.version = entry.index_seq = entry.lifetime = 1;
+  entry.found = entry.payload_span.present = 1;
+  entry.record_type = LC_POUCH_STATE_RECORD_STATE_PUT;
+  /* Supply the lengths of valid legacy plaintext records without bodies. */
+  for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+    entry.bytes = entry.cipher_bytes = entry.payload_span.payload_length =
+        sizes[i];
+    assert_int_equal(lc_pouch_state_record_recode_bound(
+                         &allocator, NULL, leaf, &entry, &bounds, &error),
+                     LC_OK);
+    assert_true(bounds.metadata_bytes > LC_POUCH_RECORD_HEADER_BYTES);
+    assert_true(bounds.record_bytes == sizes[i] + bounds.metadata_bytes);
+  }
+  entry.bytes = entry.cipher_bytes = entry.payload_span.payload_length =
+      (uint64_t)LC_I64_MAX;
+  assert_int_equal(lc_pouch_state_record_recode_bound(&allocator, NULL, leaf,
+                                                      &entry, &bounds, &error),
+                   LC_ERR_INVALID);
+  assert_true(!bounds.record_bytes && !bounds.metadata_bytes);
+  lc_error_cleanup(&error);
+}
+
+static void test_stream_bound_checks_only_the_active_codec(void **state) {
+  lc_pouch_crypto_open_options options = {0};
+  lc_pouch_crypto *crypto = NULL;
+  lc_error error = {0};
+  uint64_t past_zlib_bound = ((uint64_t)ULONG_MAX - 64U) / 2U + 1U;
+  uint64_t large = (uint64_t)UINT32_MAX + 1U;
+  uint64_t skipped, compressed, framed, overflow;
+  (void)state;
+
+  options.compression_enabled = 1;
+  assert_int_equal(lc_pouch_crypto_open(NULL, &options, &crypto, NULL, &error),
+                   LC_OK);
+  skipped = lc_pouch_crypto_stream_bound(crypto, past_zlib_bound, 0, NULL);
+  compressed = lc_pouch_crypto_stream_bound(crypto, past_zlib_bound, 1, NULL);
+  lc_pouch_crypto_close(crypto);
+  assert_true(skipped == past_zlib_bound);
+  assert_true(compressed == LC_U64_MAX);
+
+  options.compression_enabled = 0;
+  options.key_string =
+      "lc-pouch-key-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  assert_int_equal(lc_pouch_crypto_open(NULL, &options, &crypto, NULL, &error),
+                   LC_OK);
+  framed = lc_pouch_crypto_stream_bound(crypto, large, 1, NULL);
+  overflow = lc_pouch_crypto_stream_bound(crypto, LC_U64_MAX - 1, 1, NULL);
+  lc_pouch_crypto_close(crypto);
+  /* 4 GiB uses one 4 KiB frame, 65,536 subsequent frames and a terminal. */
+  assert_true(framed == large + 65538UL * 24UL);
+  assert_true(overflow == LC_U64_MAX);
+  lc_error_cleanup(&error);
+}
+
 int main(int argc, char **argv) {
   const struct CMUnitTest cases[] = {
+      cmocka_unit_test_setup_teardown(
+          test_plaintext_recode_bound_preserves_large_lengths, NULL, NULL),
+      cmocka_unit_test_setup_teardown(
+          test_stream_bound_checks_only_the_active_codec, NULL, NULL),
       cmocka_unit_test_setup_teardown(
           test_stream_unit_output_sync_and_power_loss, setup, teardown),
       cmocka_unit_test_setup_teardown(
